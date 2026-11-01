@@ -28,10 +28,53 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
+import org.kde.plasma.extras as PlasmaExtras
 import org.kde.kirigami as Kirigami
 
-Item {
+// Structured like Plasma's own applets (the Networks one in particular):
+// PlasmaExtras.Representation as the root, a PlasmaExtras.PlasmoidHeading header
+// carrying the title and the actions, and the scrollable content underneath.  It
+// keeps the same margins, typography and control sizes as the rest of the shell.
+PlasmaExtras.Representation {
     id: fullRoot
+
+    collapseMargins: true
+
+    header: PlasmaExtras.PlasmoidHeading {
+        contentItem: RowLayout {
+            spacing: Kirigami.Units.smallSpacing
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                text: "Sarvam Meter"
+                font.weight: Font.DemiBold
+                elide: Text.ElideRight
+            }
+
+            PlasmaComponents3.BusyIndicator {
+                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                running: fullRoot.busy
+                visible: running
+            }
+
+            // Asks the daemon to poll Sarvam and CLIProxyAPI again; a plain
+            // re-read would only show its cache until the next TTL tick.
+            PlasmaComponents3.ToolButton {
+                id: refreshButton
+                icon.name: "view-refresh"
+                enabled: fullRoot.hasMeter && !fullRoot.busy
+                onClicked: {
+                    if (fullRoot.hasMeter)
+                        fullRoot.meter.forceRefresh();
+                }
+
+                PlasmaComponents3.ToolTip {
+                    text: "Refresh now"
+                }
+            }
+        }
+    }
 
     // Assigned by main.qml; never assumed non-null.
     property var meter: null
@@ -62,6 +105,9 @@ Item {
 
     readonly property bool hasData: hasMeter ? meter.hasPayload : false
     readonly property bool offline: hasMeter ? meter.offline : false
+    // A daemon request is in flight: drives the header spinner and disables the
+    // refresh button.
+    readonly property bool busy: hasMeter ? meter.loading === true : false
     readonly property bool stale: hasMeter ? meter.stale : false
     readonly property bool quotaExhausted: hasMeter ? meter.quotaExhausted : false
     readonly property bool warning: hasMeter ? meter.compactWarning : false
@@ -119,9 +165,10 @@ Item {
             : Kirigami.Theme.positiveTextColor;
     }
 
-    ScrollView {
+    PlasmaComponents3.ScrollView {
         id: scrollView
-        anchors.fill: parent
+        Layout.fillWidth: true
+        Layout.fillHeight: true
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
@@ -141,12 +188,18 @@ Item {
                 opacity: fullRoot.sarvamConfigured ? 1.0 : 0.6
             }
 
-            PlasmaComponents3.Label {
+            // The same empty/error presentation the stock applets use.
+            PlasmaExtras.PlaceholderMessage {
                 Layout.fillWidth: true
+                Layout.topMargin: Kirigami.Units.gridUnit
                 visible: !fullRoot.hasData
-                text: "Waiting for the sarvam-meter daemon at the configured URL\u2026"
-                opacity: 0.7
-                wrapMode: Text.WordWrap
+                icon.name: fullRoot.offline ? "network-disconnect" : "view-refresh"
+                text: fullRoot.offline
+                    ? "Cannot reach the sarvam-meter daemon"
+                    : "Waiting for the daemon"
+                explanation: fullRoot.offline && fullRoot.errorText.length > 0
+                    ? fullRoot.errorText
+                    : "The widget reads the local sarvam-meter daemon; no status has arrived yet."
             }
 
             PlasmaComponents3.Label {
@@ -369,14 +422,9 @@ Item {
             // ==============================================================
             // (b) CLIProxyAPI
             // ==============================================================
-            Rectangle {
+            Kirigami.Separator {
                 Layout.fillWidth: true
                 Layout.topMargin: Kirigami.Units.smallSpacing
-                implicitHeight: 1
-                color: Qt.rgba(Kirigami.Theme.textColor.r,
-                               Kirigami.Theme.textColor.g,
-                               Kirigami.Theme.textColor.b,
-                               0.2)
             }
 
             PlasmaComponents3.Label {
@@ -581,14 +629,9 @@ Item {
             // ==============================================================
             // (c) Footer
             // ==============================================================
-            Rectangle {
+            Kirigami.Separator {
                 Layout.fillWidth: true
                 Layout.topMargin: Kirigami.Units.smallSpacing
-                implicitHeight: 1
-                color: Qt.rgba(Kirigami.Theme.textColor.r,
-                               Kirigami.Theme.textColor.g,
-                               Kirigami.Theme.textColor.b,
-                               0.2)
             }
 
             PlasmaComponents3.Label {
