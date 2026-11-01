@@ -335,6 +335,7 @@ four ways, all of them in `contents/ui/main.qml`:
 | `maxResponseChars` checked before `JSON.parse` | a huge or corrupted body blocking the GUI thread inside the parser |
 | `.slice()` on every delegate list | a pathological payload building thousands of delegates |
 | `Component.onDestruction: abortRequest("")` | a callback outliving the widget |
+| `clockTimer` (30 s, gated on having an `as_of`) | a stale balance reading looking live; the timer only bumps a tick that re-formats the age text |
 
 The settings page has the same treatment for its Test button: a 5 s timeout, and
 `abort()` both when a second test starts and when the page is destroyed.
