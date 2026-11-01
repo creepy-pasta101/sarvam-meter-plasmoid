@@ -140,10 +140,13 @@ jobs:
   rpm:
     name: Build RPM (Fedora)
     runs-on: ubuntu-latest
-    container: fedora:latest
+    # Pinned, not :latest: the dist tag and %{python3_sitelib} are baked into
+    # the package, so building on rawhide (fc44, python3.14) yields an RPM whose
+    # module lands in a directory Fedora 43's python3.13 never searches.
+    container: fedora:43
     steps:
       - name: Install build tools
-        run: dnf install -y --setopt=install_weak_deps=False rpm-build git tar gzip python3
+        run: dnf install -y --setopt=install_weak_deps=False rpm-build git tar gzip python3 python3-devel
 
       - uses: actions/checkout@v4
 

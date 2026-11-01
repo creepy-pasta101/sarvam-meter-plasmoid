@@ -36,6 +36,13 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildArch:      noarch
 
+# Needed for %{python3_sitelib}. Without it the fallback below asks the `python3`
+# on PATH, and in a container that is often a /usr/local Python (GitHub's image
+# has one), which produced a package installing to
+# /usr/local/lib/python3.14/site-packages -- a directory no system Python ever
+# imports from, so /usr/bin/sarvam-meter died with ModuleNotFoundError.
+BuildRequires:  python3-devel
+
 Requires:       python3 >= 3.9
 Requires:       plasma-workspace >= 6.0
 # Declared because the QML imports them directly. plasma-workspace pulls these in
@@ -86,6 +93,13 @@ configuration file.
 # Pure Python source and data files: there is nothing to build.
 
 %install
+# Refuse to build a package whose module would land where python3 never looks.
+case "%{python3_sitelib}" in
+  /usr/local/*|"")
+    echo "error: python3_sitelib is '%{python3_sitelib}' -- install python3-devel" >&2
+    exit 1
+    ;;
+esac
 install -d -m 0755 %{buildroot}%{python3_sitelib}/sarvam_meter
 install -m 0644 sarvam_meter/*.py %{buildroot}%{python3_sitelib}/sarvam_meter/
 

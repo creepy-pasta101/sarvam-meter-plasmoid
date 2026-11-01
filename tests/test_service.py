@@ -126,6 +126,39 @@ class ReleaseMustChangeTest(unittest.TestCase):
         self.assertIn('RELEASE="1.', self.ci)
 
 
+class PythonInstallPathTest(unittest.TestCase):
+    """The module must land where the system python3 imports from.
+
+    The artifact built in CI installed to /usr/local/lib/python3.14/site-packages
+    because %{python3_sitelib} was undefined (no python-rpm-macros in the bare
+    build container) and the fallback asked whichever `python3` was on PATH. No
+    Fedora system python searches /usr/local/lib/pythonX.Y/site-packages, so
+    /usr/bin/sarvam-meter died with ModuleNotFoundError on the target machine.
+    """
+
+    def setUp(self):
+        self.spec = read(SPEC)
+        self.ci = read(os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml"))
+        self.release = read(os.path.join(REPO_ROOT, ".github", "workflows", "release.yml"))
+
+    def test_it_build_requires_python3_devel(self):
+        self.assertRegex(self.spec, r"(?m)^BuildRequires:\s+python3-devel")
+
+    def test_the_build_refuses_a_usr_local_sitelib(self):
+        self.assertIn("/usr/local/*|", self.spec)
+        self.assertIn("install python3-devel", self.spec)
+
+    def test_the_build_containers_are_pinned_to_a_release(self):
+        # :latest is rawhide; the dist tag and the sitelib are baked into the
+        # package, so it must be built for the release the package is for.
+        for workflow in (self.ci, self.release):
+            self.assertNotIn("container: fedora:latest", workflow)
+            self.assertRegex(workflow, r"container: fedora:\d+")
+
+    def test_ci_installs_the_build_requirement(self):
+        self.assertIn("python3-devel", self.ci)
+
+
 class QmlDependenciesAreDeclaredTest(unittest.TestCase):
     """Every QML module the applet imports must be a declared dependency.
 
