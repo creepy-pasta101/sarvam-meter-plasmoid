@@ -31,12 +31,16 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 
 DEFAULT_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#: Minimal QML stand-ins for the Plasma modules, so the real files can load.
+STUB_DIR = os.path.join(DEFAULT_REPO, "scripts", "qml-stubs")
 
 #: A status payload with the full schema-2 shape, so the good case is realistic.
 GOOD_PAYLOAD = {
@@ -92,26 +96,6 @@ def transform_main_qml(source: str, daemon_url: str, refresh_seconds: int) -> st
     text = text.replace("PlasmoidItem {", "Item {", 1)
     text = text.replace("Plasmoid.configuration.", "harnessConfig.")
 
-    # Comment out the two representation blocks: they instantiate the other files
-    # and are irrelevant to the request lifecycle under test.
-    for key in ("compactRepresentation:", "fullRepresentation:"):
-        start = text.find("\n    " + key)
-        if start < 0:
-            continue
-        brace = text.find("{", start)
-        if brace < 0:
-            continue
-        depth, i = 0, brace
-        while i < len(text):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        end = i + 1
-        text = text[:start] + "\n    /* representation removed by the harness" + text[start:end] + " */" + text[end:]
 
     config = {
         "daemonUrl": daemon_url,
@@ -127,7 +111,14 @@ def transform_main_qml(source: str, daemon_url: str, refresh_seconds: int) -> st
         text = re.sub(r"(?m)^(\s*)%s:" % name,
                       r"\1property %s %s:" % (kind, name), text)
 
-    injection = "    property var harnessConfig: (%s)\n" % json.dumps(config)
+    # PlasmoidItem's two representation slots; declaring them lets the real
+    # CompactRepresentation.qml and FullRepresentation.qml load against the stub
+    # Plasma modules, so the harness exercises the whole widget, not a fragment.
+    injection = (
+        "    property var harnessConfig: (%s)\n"
+        "    property Item compactRepresentation: null\n"
+        "    property Item fullRepresentation: null\n"
+    ) % json.dumps(config)
     text = text.replace("Item {", "Item {\n" + injection, 1)
     return text
 
@@ -147,6 +138,7 @@ class HostileServer:
         self.sock.listen(8)
         self.sock.settimeout(0.5)
         self.port = self.sock.getsockname()[1]
+        self.requests = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
@@ -187,8 +179,18 @@ class HostileServer:
         try:
             conn.settimeout(30)
             try:
-                conn.recv(65536)
+                head = conn.recv(65536).decode("latin-1")
             except OSError:
+                return
+            request_line = head.split("\r\n", 1)[0].split()
+            if len(request_line) >= 2:
+                self.requests.append((request_line[0], request_line[1]))
+            if self.mode == "refresh-fail" and request_line[:1] == ["POST"]:
+                # Refuse the forced refresh; the cached GET must still work.
+                body = b'{"error": "nope"}'
+                conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\n"
+                             b"Content-Type: application/json\r\n"
+                             b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
                 return
             if self.mode == "hung":
                 # Accept the request and never answer.  The client must give up.
@@ -233,15 +235,20 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
 
     server = HostileServer(mode).start()
     try:
-        source = open(os.path.join(
-            repo, "plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui/main.qml"),
-            encoding="utf-8").read()
+        ui_dir = os.path.join(
+            repo, "plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui")
+        source = open(os.path.join(ui_dir, "main.qml"), encoding="utf-8").read()
         text = transform_main_qml(source, server.url, 60)
-        path = os.path.join("/tmp", "harness_main_%s.qml" % mode)
+        # The representations are referenced relative to main.qml, so the copy has
+        # to sit next to them.  Copy the whole directory to keep the repo clean.
+        work_dir = tempfile.mkdtemp(prefix="qml-harness-")
+        shutil.copytree(ui_dir, os.path.join(work_dir, "ui"))
+        path = os.path.join(work_dir, "ui", "main_harness.qml")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(text)
 
         engine = QQmlEngine()
+        engine.addImportPath(STUB_DIR)
         warnings = []
         engine.warnings.connect(lambda w: warnings.append(str(w.toString())))
 
@@ -305,6 +312,36 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
                 ok = (bool(re.match(r"^balance (2|3)h ago", freshness))
                       and freshness.endswith("not refreshed") and bool(old))
             return ok, "freshness line %r (old=%s)" % (freshness, old), samples
+        if mode == "refresh":
+            # The header's refresh button must make the daemon re-poll, i.e. a
+            # POST to /v1/refresh, not just another GET of the cache.
+            from PySide6.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(root, "forceRefresh", Qt.DirectConnection)
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.02)
+            seen = list(server.requests)
+            posts = [r for r in seen if r[0] == "POST"]
+            ok = bool(posts) and posts[0][1].endswith("/v1/refresh")
+            return ok, "daemon saw %r" % (seen,), samples
+        if mode == "refresh-fail":
+            from PySide6.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(root, "forceRefresh", Qt.DirectConnection)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.02)
+            seen = list(server.requests)
+            methods = [r[0] for r in seen]
+            payload = root.property("payload")
+            document = payload.toVariant() if hasattr(payload, "toVariant") else {}
+            ok = (methods[:2] == ["GET", "POST"] or methods[:2] == ["POST", "GET"])
+            ok = ok and "GET" in methods[1:]
+            ok = ok and not root.property("loading")
+            ok = ok and bool(document)
+            return ok, "methods %r, settled with payload=%s" % (
+                methods, bool(document)), samples
         if mode == "huge":
             ok = offline is True and "too large" in error
             return ok, "huge body rejected: error=%r" % error, samples
@@ -327,7 +364,8 @@ def main(argv=None) -> int:
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     failures = 0
-    modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance", "destroy")
+    modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance",
+             "refresh", "refresh-fail", "destroy")
     for mode in modes:
         ok, detail, samples = run_scenario(mode, args.repo, args.verbose)
         print("%-8s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))

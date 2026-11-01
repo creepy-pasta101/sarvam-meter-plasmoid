@@ -104,3 +104,6 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | The reported balance has not been refreshed for a while | `main.qml` `balanceFreshnessLine` + `clockTimer` | the footer says `balance 2h ago · not refreshed`, so a stale figure cannot be mistaken for a live one |
 | `balance_updated_at` is missing, unparsable, or in the future | `main.qml` `balanceAsOf` / `balanceAgeMs` | the freshness line is simply absent (or reads `just now` for a small negative age); nothing renders as `undefined` or `NaN` |
 | The daemon serves schema 1 (no dashboard block) | `main.qml` `balanceAsOf` guard | no freshness line at all |
+| Refresh is pressed while a request is already in flight | `main.qml` `startRequest()` single-flight guard | the click is ignored and the button is disabled while busy; nothing queues up |
+| The daemon refuses `/v1/refresh` (or is slow to re-poll) | `main.qml` `forceRefresh()` fallback | the widget falls back to one `GET /v1/status`, so the spinner stops and the last known numbers stay on screen |
+| No status has arrived yet | `FullRepresentation.qml` `PlasmaExtras.PlaceholderMessage` | the standard Plasma empty state: an icon, "Waiting for the daemon", and the reason |

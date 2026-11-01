@@ -180,13 +180,27 @@ PlasmoidItem {
             root.handleFailure(message);
     }
 
+    // The timer's entry point: re-read the daemon's cached status.
     function refresh() {
+        root.startRequest("GET", "/v1/status", false);
+    }
+
+    // The header's refresh button.  A plain GET would only re-read the daemon's
+    // cache (the dashboard is re-polled on its own 5-minute TTL), so the button
+    // asks the daemon to poll its sources now.  That call can take a while when
+    // the dashboard is slow, so a failure falls back to the cached status: the
+    // spinner always stops and the user always ends up with numbers on screen.
+    function forceRefresh() {
+        root.startRequest("POST", "/v1/refresh", true);
+    }
+
+    function startRequest(method, path, allowFallback) {
         // Single flight: while a request is outstanding, do nothing.  A daemon
         // that stops answering therefore cannot pile requests up.
         if (root.loading)
             return;
 
-        var url = root.daemonUrl + "/v1/status";
+        var url = root.daemonUrl + path;
         var xhr = null;
         try {
             xhr = new XMLHttpRequest();
@@ -207,6 +221,8 @@ PlasmoidItem {
             root.loading = false;
             if (message !== "") {
                 root.handleFailure(message);
+                if (allowFallback)
+                    root.startRequest("GET", "/v1/status", false);
                 return;
             }
             root.payload = parsed;
@@ -217,7 +233,7 @@ PlasmoidItem {
 
         try {
             // Third argument `true` = asynchronous.  Synchronous XHR is banned.
-            xhr.open("GET", url, true);
+            xhr.open(method, url, true);
             xhr.setRequestHeader("Accept", "application/json");
         } catch (e) {
             settle("cannot reach " + url);
