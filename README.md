@@ -76,6 +76,9 @@ when it does not, the label reads `local meter` and nothing else changes.
 - Optional dashboard source: authoritative org-wide spend, spend today and the top
   models by cost, with the widget showing which source each figure came from and
   falling back to the ledger when the dashboard is unreachable.
+- A popup built like Plasma's own applets (`PlasmaExtras.Representation` + a
+  `PlasmoidHeading` header), with a refresh button that makes the daemon
+  re-poll its sources and a spinner while it does.
 - Plasma 6.7 and 6.8 compatible QML, compact and full representations.
 - Python standard library only, no runtime dependencies; Python 3.9+.
 - Loopback-only binds, secret redaction, and an SSRF guard on remote URLs.
