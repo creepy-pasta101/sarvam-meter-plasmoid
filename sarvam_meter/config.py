@@ -42,6 +42,18 @@ DATA_DIR = os.path.expanduser(os.path.join("~", ".local", "share", "sarvam-meter
 #: The only supported config document version.
 SUPPORTED_VERSION = 1
 
+#: Default dashboard base URL (``dashboard.sarvam.ai`` 308-redirects here).
+DEFAULT_DASHBOARD_BASE_URL = "https://indus.sarvam.ai"
+
+#: Default session-file document value (kept with ``~`` for the JSON file).
+DEFAULT_SESSION_FILE = "~/.config/sarvam-meter/session.json"
+
+#: Dashboard API product scope (SPEC 17.1).
+DEFAULT_DASHBOARD_PRODUCT = "sarvam-api-platform"
+
+#: Minimum dashboard poll interval: bot-management friendly (SPEC 17.4).
+MIN_DASHBOARD_POLL_SECONDS = 60
+
 #: Accepted CLIProxyAPI management API versions.
 API_VERSIONS = ("v8", "v0")
 
@@ -93,6 +105,17 @@ class CliproxyConfig:
 
 
 @dataclass(frozen=True)
+class DashboardConfig:
+    """The Sarvam dashboard source (SPEC 17.4)."""
+
+    enabled: bool = False
+    base_url: str = DEFAULT_DASHBOARD_BASE_URL
+    session_file: str = DEFAULT_SESSION_FILE
+    poll_seconds: int = 300
+    product: str = DEFAULT_DASHBOARD_PRODUCT
+
+
+@dataclass(frozen=True)
 class Config:
     version: int = SUPPORTED_VERSION
     db_path: str = DEFAULT_DB_PATH
@@ -100,6 +123,7 @@ class Config:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     sarvam: SarvamConfig = field(default_factory=SarvamConfig)
     cliproxy: CliproxyConfig = field(default_factory=CliproxyConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
 
 
 def default_config_dict() -> dict:
@@ -140,6 +164,13 @@ def default_config_dict() -> dict:
             "quota_fetch_interval_seconds": 300,
             "include_api_key_usage": False,
             "allow_remote": False,
+        },
+        "dashboard": {
+            "enabled": False,
+            "base_url": "https://indus.sarvam.ai",
+            "session_file": "~/.config/sarvam-meter/session.json",
+            "poll_seconds": 300,
+            "product": "sarvam-api-platform",
         },
     }
 
@@ -229,6 +260,30 @@ def _require_url(value: Any, key: str) -> str:
     if not parts.hostname:
         raise ConfigError("%s: must include a host" % key)
     return text
+
+
+def _require_https_url(value: Any, key: str) -> str:
+    """A ``https://`` URL with a host and **no** userinfo (SPEC 17.4).
+
+    The dashboard is a remote host by design, so the loopback guard used for
+    ``cliproxy.base_url`` deliberately does not apply here.  Plain ``http://`` is
+    accepted for a loopback host only, so the source can be exercised against a
+    local fixture server without weakening anything that is reachable remotely.
+    """
+    text = _require_str(value, key).strip()
+    parts = urlsplit(text)
+    if parts.username is not None or parts.password is not None:
+        raise ConfigError("%s: credentials in the URL are not supported" % (key,))
+    if not parts.hostname:
+        raise ConfigError("%s: must include a host" % (key,))
+    if parts.scheme == "https":
+        return text
+    if parts.scheme == "http" and is_loopback_host(parts.hostname):
+        return text
+    raise ConfigError(
+        "%s: must be an https:// URL (http:// is allowed for a loopback host only)"
+        % (key,)
+    )
 
 
 def _require_rate_overrides(value: Any, key: str) -> Dict[str, Any]:
@@ -412,6 +467,25 @@ def _build_config(document: dict) -> Config:
         allow_remote=allow_remote,
     )
 
+    dashboard_raw = _require_dict(document.get("dashboard"), "dashboard")
+    session_file = _require_str(
+        dashboard_raw.get("session_file"), "dashboard.session_file"
+    )
+    session_file = os.path.expanduser(session_file.strip())
+    if not session_file:
+        raise ConfigError("dashboard.session_file: must not be empty")
+    dashboard = DashboardConfig(
+        enabled=_require_bool(dashboard_raw.get("enabled"), "dashboard.enabled"),
+        base_url=_require_https_url(dashboard_raw.get("base_url"), "dashboard.base_url"),
+        session_file=session_file,
+        poll_seconds=_require_int(
+            dashboard_raw.get("poll_seconds"),
+            "dashboard.poll_seconds",
+            MIN_DASHBOARD_POLL_SECONDS,
+        ),
+        product=_require_str(dashboard_raw.get("product"), "dashboard.product"),
+    )
+
     return Config(
         version=version,
         db_path=db_path,
@@ -419,6 +493,7 @@ def _build_config(document: dict) -> Config:
         proxy=proxy,
         sarvam=sarvam,
         cliproxy=cliproxy,
+        dashboard=dashboard,
     )
 
 
@@ -488,8 +563,13 @@ __all__ = [
     "ConfigError",
     "DATA_DIR",
     "DEFAULT_CONFIG_PATH",
+    "DEFAULT_DASHBOARD_BASE_URL",
+    "DEFAULT_DASHBOARD_PRODUCT",
     "DEFAULT_DB_PATH",
+    "DEFAULT_SESSION_FILE",
     "DaemonConfig",
+    "DashboardConfig",
+    "MIN_DASHBOARD_POLL_SECONDS",
     "ENV_CLIPROXY_KEY",
     "ENV_CONFIG_PATH",
     "ProxyConfig",
