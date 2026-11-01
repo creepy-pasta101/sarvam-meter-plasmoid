@@ -45,6 +45,7 @@ DASHBOARD_KEYS = {
     "spend",
     "by_model",
     "error",
+    "balance",
 }
 CLIPROXY_KEYS = {"configured", "reachable", "api_version", "worst_fraction", "accounts"}
 
