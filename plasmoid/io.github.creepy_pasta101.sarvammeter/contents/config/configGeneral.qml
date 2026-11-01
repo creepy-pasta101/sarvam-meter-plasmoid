@@ -80,6 +80,17 @@ KCM.SimpleKCM {
     property alias cfg_warnBelowPercent: warnBelowSpin.value
     property alias cfg_showApiBreakdown: breakdownSwitch.checked
 
+    // Plasma sets *two* initial properties per key: cfg_<key> and
+    // cfg_<key>Default. Without the Default one the dialog reports
+    // "Setting initial properties failed: SimpleKCM does not have a property
+    // called cfg_<key>Default" and the page never gets its values. They must
+    // match the <default> in main.xml; a test pins that.
+    property string cfg_commandDefault: "sarvam-meter"
+    property int cfg_refreshSecondsDefault: 60
+    property string cfg_compactModeDefault: "sarvam"
+    property int cfg_warnBelowPercentDefault: 20
+    property bool cfg_showApiBreakdownDefault: true
+
     // ---- "Test" button state: idle | pending | ok | fail ----
     property string testState: "idle"
     property string testMessage: ""

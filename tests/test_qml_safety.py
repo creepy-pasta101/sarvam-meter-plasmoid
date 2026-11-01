@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import unittest
+import xml.etree.ElementTree as ET
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = os.path.join(REPO_ROOT, "plasmoid", "io.github.creepy_pasta101.sarvammeter")
@@ -37,6 +38,11 @@ STUB_DIR = os.path.join(REPO_ROOT, "scripts", "qml-stubs")
 def read(path):
     with open(path, encoding="utf-8") as handle:
         return handle.read()
+
+
+def _local(tag):
+    """Element tag without its XML namespace (KConfigXT files carry one)."""
+    return tag.rsplit("}", 1)[-1]
 
 
 def code_of(source):
@@ -411,6 +417,8 @@ class SessionCaptureTest(unittest.TestCase):
 class ConfigSchemaTest(unittest.TestCase):
     def setUp(self):
         self.xml = read(MAIN_XML)
+        self.page = read(CONFIG_QML)
+        self.code = code_of(self.page)
 
     def test_the_command_key_replaced_the_daemon_url(self):
         self.assertIn('<entry name="command" type="String">', self.xml)
@@ -422,6 +430,60 @@ class ConfigSchemaTest(unittest.TestCase):
         for key in ("refreshSeconds", "compactMode", "warnBelowPercent", "showApiBreakdown"):
             self.assertIn('name="%s"' % key, self.xml)
 
+
+    # -- the cfg_<key> / cfg_<key>Default contract -----------------------
+
+    def config_entries(self):
+        """{name: default} from main.xml, namespaces stripped."""
+        tree = ET.parse(MAIN_XML)
+        entries = {}
+        for group in [c for c in tree.getroot() if _local(c.tag) == "group"]:
+            for entry in [e for e in group if _local(e.tag) == "entry"]:
+                default = next(
+                    (d for d in entry if _local(d.tag) == "default"), None)
+                entries[entry.get("name")] = (default.text or "").strip()
+        return entries
+
+    def declared_default(self, name):
+        """The literal on `property <type> cfg_<name>Default: <literal>`."""
+        match = re.search(
+            r"(?m)^\s*property\s+\w+\s+cfg_%sDefault\s*:\s*([^\n]+?)\s*$"
+            % re.escape(name), self.page)
+        if not match:
+            return None
+        literal = match.group(1).strip()
+        if len(literal) >= 2 and literal[0] == literal[-1] and literal[0] in "\"'":
+            literal = literal[1:-1]
+        return literal
+
+    def test_every_config_key_has_a_cfg_property_and_a_default(self):
+        """Plasma sets cfg_<key> *and* cfg_<key>Default as initial properties.
+
+        Missing either one is not a warning: the dialog prints "Setting initial
+        properties failed: SimpleKCM does not have a property called
+        cfg_<key>Default" and the page silently never receives its values, so
+        every control shows its hard-coded fallback.
+        """
+        entries = self.config_entries()
+        self.assertTrue(entries, "main.xml declares no entries")
+
+        for name, default in sorted(entries.items()):
+            self.assertIn("cfg_" + name, self.code,
+                          "main.xml declares %r but configGeneral.qml has no cfg_%s" % (name, name))
+            self.assertIn("cfg_" + name + "Default", self.code,
+                          "configGeneral.qml has no cfg_%sDefault" % (name,))
+            declared = self.declared_default(name)
+            self.assertIsNotNone(declared, "cfg_%sDefault is not a literal" % (name,))
+            self.assertEqual(
+                str(declared).lower(), default.lower(),
+                "cfg_%sDefault (%r) does not match main.xml <default> (%r)"
+                % (name, declared, default))
+
+    def test_the_settings_page_root_is_a_kcm(self):
+        # Plasma 6 loads widget config pages as KCMs; a plain Item root never
+        # gets its cfg_* properties set.
+        self.assertRegex(self.code, r"(?m)^KCM\.SimpleKCM\s*\{")
+        self.assertIn("import org.kde.kcmutils", self.page)
 
 class QmlStubTest(unittest.TestCase):
     """The harness needs a plasma5support stand-in to load the widget at all."""
