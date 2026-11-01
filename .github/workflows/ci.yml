@@ -89,7 +89,7 @@ jobs:
                   assert default is not None, "entry %s has no <default>" % entry.get("name")
                   entries[entry.get("name")] = (default.text or "").strip()
           expected = {
-              "daemonUrl": "http://127.0.0.1:8787",
+              "command": "sarvam-meter",
               "refreshSeconds": "60",
               "compactMode": "sarvam",
               "warnBelowPercent": "20",
