@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+#
+# systemd *user* unit for the sarvam-meter daemon (and its recording proxy).
+#
+# Install for the current user only (never system-wide):
+#     install -D -m 0644 packaging/sarvam-meter.service \
+#         ~/.config/systemd/user/sarvam-meter.service
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now sarvam-meter.service
+#
+# Logs: journalctl --user -u sarvam-meter.service -f
+
+[Unit]
+Description=Sarvam AI usage meter daemon and recording proxy
+Documentation=https://github.com/creepy-pasta101/sarvam-meter-plasmoid
+# This is a user unit: it does not order against the system network target.
+After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=SARVAM_METER_CONFIG=%h/.config/sarvam-meter/config.json
+ExecStart=/usr/bin/sarvam-meter serve --with-proxy
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+# The daemon binds loopback ports only and stores state in $HOME.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+{
+  "KPlugin": {
+    "Id": "io.github.creepy_pasta101.sarvammeter",
+    "Name": "Sarvam Meter",
+    "Description": "Sarvam AI and CLIProxyAPI usage and quota",
+    "Icon": "office-chart-bar",
+    "Authors": [
+      {
+        "Name": "Suhan G Paradkar",
+        "Email": "suhangp2002@gmail.com"
+      }
+    ],
+    "License": "MIT",
+    "Version": "0.1.0",
+    "Website": "https://github.com/creepy-pasta101/sarvam-meter-plasmoid"
+  },
+  "KPackageStructure": "Plasma/Applet",
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

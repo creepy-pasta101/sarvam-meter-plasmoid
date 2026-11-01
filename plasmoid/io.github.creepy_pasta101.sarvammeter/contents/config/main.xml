@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: MIT
+
+  KConfigXT schema for the Sarvam Meter plasmoid.
+  Every key declared here is readable from QML as Plasmoid.configuration.<key>
+  and is editable from the configuration dialog through the cfg_<key>
+  properties of contents/config/configGeneral.qml.
+-->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+    <kcfgfile name=""/>
+    <group name="General">
+        <entry name="daemonUrl" type="String">
+            <label>Base URL of the local sarvam-meter daemon, for example http://127.0.0.1:8787</label>
+            <default>http://127.0.0.1:8787</default>
+        </entry>
+        <entry name="refreshSeconds" type="Int">
+            <label>How often the widget polls the daemon, in seconds</label>
+            <default>60</default>
+            <min>5</min>
+        </entry>
+        <entry name="compactMode" type="String">
+            <label>Which value the compact representation shows: sarvam (Sarvam balance) or cliproxy (CLIProxyAPI quota)</label>
+            <default>sarvam</default>
+        </entry>
+        <entry name="warnBelowPercent" type="Int">
+            <label>Show a warning when the remaining balance or quota falls below this percentage</label>
+            <default>20</default>
+            <min>0</min>
+            <max>100</max>
+        </entry>
+        <entry name="showApiBreakdown" type="Bool">
+            <label>Show the per-API spend breakdown in the full representation</label>
+            <default>true</default>
+        </entry>
+    </group>
+</kcfg>

@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sarvam-meter"
+version = "0.1.0"
+description = "KDE Plasma 6 widget and local daemon that meter Sarvam AI credit usage and CLIProxyAPI OAuth quota"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Suhan G Paradkar", email = "suhangp2002@gmail.com" },
+]
+keywords = ["sarvam", "plasma", "kde", "quota", "metering", "cliproxyapi"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: X11 Applications :: KDE",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Monitoring",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/creepy-pasta101/sarvam-meter-plasmoid"
+Repository = "https://github.com/creepy-pasta101/sarvam-meter-plasmoid"
+Issues = "https://github.com/creepy-pasta101/sarvam-meter-plasmoid/issues"
+
+[project.scripts]
+sarvam-meter = "sarvam_meter.cli:main"
+
+[tool.setuptools]
+packages = ["sarvam_meter"]

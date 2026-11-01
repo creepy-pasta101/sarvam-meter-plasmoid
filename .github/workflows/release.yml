@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  SPEC_NAME: plasma-applet-sarvam-meter
+
+jobs:
+  rpm:
+    name: Build RPM (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build tools
+        run: dnf install -y --setopt=install_weak_deps=False rpm-build git tar gzip python3
+
+      - uses: actions/checkout@v4
+
+      - name: Build the source tarball and the RPM
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION=$(sed -n 's/^Version:[[:space:]]*//p' "packaging/${SPEC_NAME}.spec" | head -1 | tr -d ' ')
+          echo "Building ${SPEC_NAME}-${VERSION}"
+          mkdir -p rpmbuild/SOURCES rpmbuild/SPECS rpmbuild/BUILD rpmbuild/RPMS rpmbuild/SRPMS
+          git archive --format=tar.gz --prefix="${SPEC_NAME}-${VERSION}/" \
+              -o "rpmbuild/SOURCES/${SPEC_NAME}-${VERSION}.tar.gz" HEAD
+          cp "packaging/${SPEC_NAME}.spec" rpmbuild/SPECS/
+          rpmbuild -ba "rpmbuild/SPECS/${SPEC_NAME}.spec" \
+              --define "_topdir $PWD/rpmbuild" \
+              --define "_sourcedir $PWD/rpmbuild/SOURCES"
+          echo "--- produced packages ---"
+          ls -l rpmbuild/RPMS/noarch/ rpmbuild/SRPMS/ || true
+          shopt -s nullglob
+          RPMS=(rpmbuild/RPMS/noarch/*.rpm)
+          if [ ${#RPMS[@]} -eq 0 ]; then
+            echo "::error::rpmbuild produced no .rpm under rpmbuild/RPMS/noarch"
+            exit 1
+          fi
+          for rpm in "${RPMS[@]}"; do
+            echo "verifying $rpm"
+            rpm -qip "$rpm"
+            rpm -qlp "$rpm"
+          done
+
+      - name: Collect the release files
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp rpmbuild/RPMS/noarch/*.rpm release/
+          cp rpmbuild/SRPMS/*.src.rpm release/ || true
+          bash scripts/build-plasmoid.sh release
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Attach the artifacts to the release
+    needs: rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: release
+
+      - name: List the files to publish
+        run: ls -l release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

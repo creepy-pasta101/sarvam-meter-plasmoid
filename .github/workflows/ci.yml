@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: MIT
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  SPEC_NAME: plasma-applet-sarvam-meter
+
+jobs:
+  test:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the unit test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Byte-compile every module
+        run: python3 -m compileall -q sarvam_meter tests
+
+      - name: Validate the JSON documents
+        run: |
+          set -euo pipefail
+          python3 -m json.tool packaging/config.example.json > /dev/null
+          python3 -m json.tool plasmoid/io.github.creepy_pasta101.sarvammeter/metadata.json > /dev/null
+          echo "JSON OK"
+
+      - name: Validate the plasmoid package structure
+        run: |
+          set -euo pipefail
+          PLASMOID=plasmoid/io.github.creepy_pasta101.sarvammeter
+          python3 - "$PLASMOID" <<'PY'
+          import json, os, sys
+          root = sys.argv[1]
+          meta = json.load(open(os.path.join(root, "metadata.json"), encoding="utf-8"))
+          assert meta.get("KPackageStructure") == "Plasma/Applet", meta.get("KPackageStructure")
+          assert meta["KPlugin"]["Id"], "missing KPlugin.Id"
+          assert meta["KPlugin"].get("License"), "missing KPlugin.License"
+          for rel in (
+              "contents/ui/main.qml",
+              "contents/ui/CompactRepresentation.qml",
+              "contents/ui/FullRepresentation.qml",
+              "contents/ui/Bar.qml",
+              "contents/config/main.xml",
+              "contents/config/config.qml",
+              "contents/config/configGeneral.qml",
+          ):
+              path = os.path.join(root, rel)
+              assert os.path.isfile(path), "missing %s" % rel
+              assert os.path.getsize(path) > 0, "empty %s" % rel
+          print("plasmoid package structure OK")
+          PY
+
+      - name: Validate the KConfigXT defaults match the widget keys
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          tree = ET.parse("plasmoid/io.github.creepy_pasta101.sarvammeter/contents/config/main.xml")
+          entries = {}
+          for group in tree.getroot().findall("group"):
+              for entry in group.findall("entry"):
+                  default = entry.find("default")
+                  assert default is not None, "entry %s has no <default>" % entry.get("name")
+                  entries[entry.get("name")] = (default.text or "").strip()
+          expected = {
+              "daemonUrl": "http://127.0.0.1:8787",
+              "refreshSeconds": "60",
+              "compactMode": "sarvam",
+              "warnBelowPercent": "20",
+              "showApiBreakdown": "true",
+          }
+          assert entries == expected, "config keys/defaults drifted: %r" % (entries,)
+          print("KConfigXT defaults OK")
+          PY
+
+      - name: Check the version pins agree
+        run: |
+          set -euo pipefail
+          PYPROJECT=$(python3 -c 'import re;print(re.search(r"^version\s*=\s*\"([^\"]+)\"", open("pyproject.toml").read(), re.M).group(1))')
+          SPEC=$(sed -n 's/^Version:[[:space:]]*//p' "packaging/${SPEC_NAME}.spec" | head -1 | tr -d ' ')
+          PKG=$(python3 -c 'import sys;sys.path.insert(0,".");import sarvam_meter;print(sarvam_meter.__version__)')
+          echo "pyproject=$PYPROJECT spec=$SPEC package=$PKG"
+          test "$PYPROJECT" = "$SPEC"
+          test "$PYPROJECT" = "$PKG"
+
+  rpm:
+    name: Build RPM (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build tools
+        run: dnf install -y --setopt=install_weak_deps=False rpm-build git tar gzip python3
+
+      - uses: actions/checkout@v4
+
+      - name: Build the source tarball and the RPM
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION=$(sed -n 's/^Version:[[:space:]]*//p' "packaging/${SPEC_NAME}.spec" | head -1 | tr -d ' ')
+          echo "Building ${SPEC_NAME}-${VERSION}"
+          mkdir -p rpmbuild/SOURCES rpmbuild/SPECS rpmbuild/BUILD rpmbuild/RPMS rpmbuild/SRPMS
+          git archive --format=tar.gz --prefix="${SPEC_NAME}-${VERSION}/" \
+              -o "rpmbuild/SOURCES/${SPEC_NAME}-${VERSION}.tar.gz" HEAD
+          cp "packaging/${SPEC_NAME}.spec" rpmbuild/SPECS/
+          rpmbuild -ba "rpmbuild/SPECS/${SPEC_NAME}.spec" \
+              --define "_topdir $PWD/rpmbuild" \
+              --define "_sourcedir $PWD/rpmbuild/SOURCES"
+          echo "--- produced packages ---"
+          ls -l rpmbuild/RPMS/noarch/ rpmbuild/SRPMS/ || true
+          shopt -s nullglob
+          RPMS=(rpmbuild/RPMS/noarch/*.rpm)
+          if [ ${#RPMS[@]} -eq 0 ]; then
+            echo "::error::rpmbuild produced no .rpm under rpmbuild/RPMS/noarch"
+            exit 1
+          fi
+          for rpm in "${RPMS[@]}"; do
+            echo "verifying $rpm"
+            rpm -qip "$rpm"
+            rpm -qlp "$rpm"
+          done
+
+      - name: Collect the RPMs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp rpmbuild/RPMS/noarch/*.rpm artifacts/
+          cp rpmbuild/SRPMS/*.src.rpm artifacts/ || true
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fedora-rpm
+          path: artifacts/*.rpm
+          if-no-files-found: error
+
+  plasmoid:
+    name: Package the plasmoid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the .plasmoid archive
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          bash scripts/build-plasmoid.sh artifacts
+          shopt -s nullglob
+          PKGS=(artifacts/sarvam-meter-*.plasmoid)
+          if [ ${#PKGS[@]} -eq 0 ]; then
+            echo "::error::build-plasmoid.sh produced no .plasmoid under artifacts/"
+            exit 1
+          fi
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plasmoid-package
+          path: artifacts/*.plasmoid
+          if-no-files-found: error
