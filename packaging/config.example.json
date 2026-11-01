@@ -29,5 +29,12 @@
     "quota_fetch_interval_seconds": 300,
     "include_api_key_usage": false,
     "allow_remote": false
+  },
+  "dashboard": {
+    "enabled": false,
+    "base_url": "https://indus.sarvam.ai",
+    "session_file": "~/.config/sarvam-meter/session.json",
+    "poll_seconds": 300,
+    "product": "sarvam-api-platform"
   }
 }

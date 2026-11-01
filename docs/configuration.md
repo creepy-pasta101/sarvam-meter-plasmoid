@@ -10,6 +10,7 @@ change the file and restart the daemon.
 | Config | `$SARVAM_METER_CONFIG` if set, else `~/.config/sarvam-meter/config.json` |
 | Database | `db_path` from the config; default `~/.local/share/sarvam-meter/usage.db` |
 | Data directory | `~/.local/share/sarvam-meter/` (created on demand) |
+| Dashboard session | `dashboard.session_file`; default `~/.config/sarvam-meter/session.json` (mode `0600`, see [the session file](#the-dashboard-session-file)) |
 | Example config shipped in the package | `/usr/share/doc/plasma-applet-sarvam-meter/config.example.json` |
 
 `sarvam-meter init` writes the default document to the config path, creating
@@ -45,7 +46,10 @@ This is exactly what `sarvam-meter init` writes, and what
   "cliproxy": { "enabled": false, "base_url": "http://127.0.0.1:8317",
                 "management_key": "", "api_version": "v8", "quota_fetch": true,
                 "quota_fetch_interval_seconds": 300, "include_api_key_usage": false,
-                "allow_remote": false }
+                "allow_remote": false },
+  "dashboard": { "enabled": false, "base_url": "https://indus.sarvam.ai",
+                 "session_file": "~/.config/sarvam-meter/session.json",
+                 "poll_seconds": 300, "product": "sarvam-api-platform" }
 }
 ```
 
@@ -61,6 +65,7 @@ This is exactly what `sarvam-meter init` writes, and what
 | `proxy` | object | see below | The recording reverse proxy. |
 | `sarvam` | object | see below | Balance, currency, rate card overrides. |
 | `cliproxy` | object | see below | The CLIProxyAPI adapter. |
+| `dashboard` | object | see below | The Sarvam dashboard source (unsupported internal API; off by default). |
 
 Unknown top-level keys are ignored (a newer config opened by an older build must
 not fail). Missing keys take their defaults: the loaded document is deep-merged
@@ -138,6 +143,126 @@ export SARVAM_METER_CLIPROXY_KEY='<management key>'
 
 Details of what those endpoints return: [cliproxyapi.md](cliproxyapi.md).
 
+### `dashboard`
+
+The dashboard source reads the authoritative, organisation-wide spend figures from
+the Sarvam web dashboard using a session you captured from your own browser. It is
+**off by default**, it is **unsupported**, and local metering stays the fallback.
+Read [dashboard-scrape.md](dashboard-scrape.md) before you enable it.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Turn the dashboard source on. With it off, `sarvam.dashboard.configured` is `false`, `spend.source` stays `ledger`, and no request is ever made. |
+| `base_url` | string | `https://indus.sarvam.ai` | Dashboard origin. Must be `https://` with a host and **no** userinfo (no `user:pass@`). This is a remote host by design, so the loopback/SSRF guard that applies to `cliproxy.base_url` does **not** apply here. `https://dashboard.sarvam.ai` `308`-redirects to `https://indus.sarvam.ai`, so use the latter. |
+| `session_file` | string | `~/.config/sarvam-meter/session.json` | Where the captured session lives. `~` is expanded. It must be mode `0600`; `sarvam-meter doctor` checks this. |
+| `poll_seconds` | int | `300` | How often the daemon re-reads the dashboard, `>= 60`. The floor is deliberate: the dashboard sits behind bot management, and a minute-by-minute poll is exactly the traffic it exists to notice. |
+| `product` | string | `sarvam-api-platform` | Non-empty product filter sent as the `product` query parameter on both usage endpoints. |
+
+Example — enable it, poll every five minutes, and keep the session somewhere else:
+
+```json
+"dashboard": { "enabled": true, "base_url": "https://indus.sarvam.ai",
+               "session_file": "~/.config/sarvam-meter/session.json",
+               "poll_seconds": 300, "product": "sarvam-api-platform" }
+```
+
+Enabling it is three steps:
+
+```sh
+# 1. capture the session once, from your own signed-in browser
+sarvam-meter session set --cookie-file ~/.cache/sarvam-cookie.txt
+
+# 2. set "dashboard": {"enabled": true, ...} in the config, then
+systemctl --user restart sarvam-meter     # or: sarvam-meter serve
+
+# 3. confirm what the daemon sees
+sarvam-meter doctor                       # checks the session file and reachability
+sarvam-meter dashboard                    # one snapshot, --json for the raw shape
+```
+
+#### The dashboard session file
+
+`session_file` is a small JSON document holding the two headers the dashboard's own
+API expects:
+
+```json
+{"Cookie": "...", "Authorization": "Bearer ..."}
+```
+
+- **Only those two keys are accepted** (matched case-insensitively). Anything else
+  in the file is ignored.
+- **The file must be mode `0600`.** `sarvam-meter session set` writes it that way;
+  if you create it by hand, `chmod 600` it. `sarvam-meter doctor` reports the mode.
+- **Values are never shown.** They are never logged, never returned by
+  `GET /v1/config` (rendered `"***"`), never written into the status payload and
+  never into an error message. `sarvam-meter session show` prints the path, the
+  file mode and *which* headers are present — never a value.
+- **A missing or unreadable file is not fatal.** The snapshot comes back with
+  `error.code = "no_session"`, the widget shows one muted `dashboard: no_session`
+  line, and the balance and spend figures stay on the ledger.
+
+Capturing the session, from a browser where you are already signed in:
+
+1. Open `https://indus.sarvam.ai` and sign in.
+2. DevTools → Network, pick any request to that origin, and copy the whole `Cookie`
+   request header value.
+3. Save it where only you can read it, then hand it to the CLI:
+
+   ```sh
+   printf '%s' 'PASTE_THE_COOKIE_HEADER_HERE' > ~/.cache/sarvam-cookie.txt
+   chmod 600 ~/.cache/sarvam-cookie.txt
+   sarvam-meter session set --cookie-file ~/.cache/sarvam-cookie.txt
+   # or pass it directly:  sarvam-meter session set --cookie '...'
+   # and, if your session also carries one:  --authorization 'Bearer ...'
+   ```
+
+   `session set` writes `session_file` with mode `0600`. Delete the intermediate
+   cookie file afterwards.
+
+The session expires when the dashboard decides it does — typically after days, or
+immediately if you sign out or change your password. There is no refresh flow: when
+it expires the daemon gets `401`/`403`, records `unauthorized`, and you repeat step 3.
+
+#### Schema 2 in the status payload
+
+The dashboard source is why the status payload moved to `schema: 2`. Three things
+change for a reader of `GET /v1/status` (the full annotated shape is in
+[architecture.md](architecture.md#4-status-json-contract)):
+
+- `sarvam.spend` gains `source`: `"dashboard"` when a dashboard snapshot is
+  reachable, `"ledger"` otherwise.
+- `sarvam.balance` gains the same `source` field.
+- `sarvam.dashboard` is **always present** — `configured: false` when the section is
+  disabled — and carries the snapshot:
+
+```json
+"sarvam": {
+  "spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
+  "balance": {"known": true, "remaining": 365.77, "starting": 500.0,
+              "spent_total": 134.23, "set_at": "...", "source": "dashboard"},
+  "dashboard": {
+    "configured": true, "reachable": true, "as_of": "...",
+    "org_id": "...", "currency": "INR",
+    "window": {"start": "2026-10-20", "end": "2026-11-01"},
+    "spend": {"window": 134.23, "today": 12.3},
+    "by_model": [{"model": "saaras:v4", "cost": 74.05}],
+    "error": null
+  }
+}
+```
+
+With a reachable dashboard snapshot **and** a starting balance set, the arithmetic
+changes: `spent_total` becomes the dashboard's spend for the window (the date part of
+`balance.set_at` through today) and `remaining = max(0, starting - spent_total)`.
+Without a snapshot nothing changes from schema 1: the ledger numbers are reported
+with `source: "ledger"`. `spend.today` likewise comes from the dashboard when it is
+reachable and from the ledger otherwise.
+
+A dashboard that is configured but not reachable is not something you have to act
+on: `sarvam.dashboard.reachable` is `false`, `sarvam.dashboard.error` carries
+`{source, code, message}`, and every figure falls back to the ledger. The error codes
+are `no_session`, `unauthorized`, `bad_response`, `unreachable` and `http_error`.
+
 ## Validation rules
 
 Validation runs on load. Every failure raises `ConfigError` whose message names
@@ -153,7 +278,11 @@ the offending key, so you can fix it without reading source.
 | `sarvam.currency` is a 3-letter uppercase code | `ConfigError` naming the key |
 | `sarvam.starting_balance` is `null` or a finite number `>= 0` | `ConfigError` naming the key |
 | `proxy.upstream_base` and `cliproxy.base_url` are `http(s)://` URLs with a host | `ConfigError` naming the key |
+| `dashboard.base_url` is `https://` with a host and no userinfo | `ConfigError` naming `dashboard.base_url` |
+| `dashboard.poll_seconds >= 60` | `ConfigError` naming the key |
+| `dashboard.product` is a non-empty string | `ConfigError` naming the key |
 | SSRF guard: a non-loopback `cliproxy.base_url` requires `cliproxy.allow_remote: true`. Loopback is `127.0.0.0/8`, `::1`, `localhost` | `ConfigError` explaining that a remote URL needs `allow_remote` |
+| The SSRF guard does **not** apply to `dashboard.base_url` — the dashboard is a remote host by design. It is instead required to be `https://` with no userinfo, so credentials cannot be smuggled into the URL | `ConfigError` naming `dashboard.base_url` |
 | Unparseable JSON | `ConfigError("<path>: <reason>")` |
 
 What the user actually sees, per entry point:
@@ -252,3 +381,11 @@ The plasmoid has five settings of its own, independent of the daemon config
 The settings page has a **Test** button that issues an asynchronous
 `GET <daemonUrl>/v1/health` and reports OK or FAIL, so a wrong URL is caught
 before it becomes an offline widget.
+
+The dashboard source adds **no** widget setting. The widget reads
+`sarvam.spend.source` and `sarvam.dashboard` out of the payload and shows a muted
+`dashboard` or `local meter` hint beside the spend line, up to three by-model rows
+when `sarvam.dashboard.reachable` is true, and one `dashboard: <code>` line when
+`sarvam.dashboard.error` is set. If the daemon is older than schema 2 and sends no
+dashboard block at all, the widget renders the ledger presentation and says
+`local meter` — nothing is undefined and nothing errors.

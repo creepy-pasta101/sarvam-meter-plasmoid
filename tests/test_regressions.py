@@ -10,6 +10,7 @@ import dataclasses
 import http.client
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -104,6 +105,79 @@ class InMemoryLedgerTest(unittest.TestCase):
         self.assertEqual(status["sarvam"]["spend"]["today"], 12.5)
         self.assertTrue(status["sarvam"]["balance"]["known"])
         self.assertAlmostEqual(status["sarvam"]["balance"]["remaining"], 487.5, places=2)
+
+
+class DashboardSnapshotRegressionTest(unittest.TestCase):
+    """Schema 2: a bad dashboard snapshot must never break the widget contract."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sarvam-regress-dash-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.config = load_config(_write_config(self.tmp))
+        self.ledger = Ledger(self.config.db_path)
+        self.addCleanup(self.ledger.close)
+
+    def test_key_sets_survive_any_snapshot_shape(self):
+        expected_sarvam = {
+            "configured",
+            "currency",
+            "balance",
+            "spend",
+            "calls",
+            "by_api",
+            "rate_limits",
+            "quota_exhausted",
+            "quota_exhausted_at",
+            "untracked_calls",
+            "dashboard",
+        }
+        for dash in (None, "nope", [], 0, {"reachable": True}, {"error": "boom"}):
+            payload = build_status(
+                self.config,
+                self.ledger,
+                None,
+                None,
+                dashboard_snapshot=dash,
+            )
+            self.assertEqual(payload["schema"], 2)
+            self.assertEqual(set(payload["sarvam"]), expected_sarvam)
+            self.assertIn("dashboard", payload["sarvam"])
+            self.assertEqual(
+                set(payload["sarvam"]["balance"]),
+                {"known", "remaining", "starting", "spent_total", "set_at", "source"},
+            )
+
+    def test_a_broken_ledger_and_a_dashboard_snapshot_still_zero_the_money(self):
+        class Broken:
+            def __getattr__(self, name):
+                if name.startswith("__"):
+                    raise AttributeError(name)
+
+                def _fail(*_args, **_kwargs):
+                    raise RuntimeError("database is locked")
+
+                return _fail
+
+        payload = build_status(
+            self.config,
+            Broken(),
+            None,
+            None,
+            dashboard_snapshot={
+                "configured": True,
+                "reachable": True,
+                "spend": {"window": 10.0, "today": 1.0},
+                "by_model": [],
+                "error": None,
+            },
+        )
+        self.assertEqual(payload["errors"][0]["source"], "ledger")
+        # With no readable ledger there is no starting balance, so the money is
+        # the zeroed fallback and the source stays "ledger" (SPEC section 10's
+        # read-failed contract is unchanged by schema 2).
+        self.assertEqual(payload["sarvam"]["balance"]["source"], "ledger")
+        self.assertEqual(payload["sarvam"]["balance"]["spent_total"], 0.0)
+        self.assertFalse(payload["sarvam"]["balance"]["known"])
 
 
 class CostOverflowTest(unittest.TestCase):

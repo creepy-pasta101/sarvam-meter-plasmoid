@@ -13,7 +13,7 @@ Two independent servers, one config document, one database:
 
 | Process | Default bind | Purpose | Started by |
 | --- | --- | --- | --- |
-| daemon | `127.0.0.1:8787` | serves the status JSON the widget reads; caches the CLIProxyAPI snapshot | `sarvam-meter serve` |
+| daemon | `127.0.0.1:8787` | serves the status JSON the widget reads; caches the CLIProxyAPI and dashboard snapshots | `sarvam-meter serve` |
 | recording proxy | `127.0.0.1:8788` | reverse proxy for `https://api.sarvam.ai` that measures and prices each call | `sarvam-meter serve --with-proxy`, or `sarvam-meter proxy` |
 
 The proxy is disabled by default (`proxy.enabled: false`). The daemon and the
@@ -43,9 +43,10 @@ client --> proxy:8788 --> api.sarvam.ai
 | `sarvam_meter/audio.py` | `duration_seconds(data, content_type)` and `container_of(data)` — derives STT duration from WAV / FLAC / OGG / MP3 / MP4 bytes, because Sarvam's STT response carries no duration. |
 | `sarvam_meter/proxy.py` | The recording reverse proxy: `ProxyServer`, `classify`, `chat_usage`, `chat_stream_usage`, `tts_char_count`, `record_from_exchange`. Streaming relay, metering, error recording. |
 | `sarvam_meter/cliproxy.py` | CLIProxyAPI management-API adapter: `CliproxyClient`, `normalize_account`, `normalize_quota`, `worst_fraction`, `CliproxyError`. See [cliproxyapi.md](cliproxyapi.md). |
-| `sarvam_meter/status.py` | `build_status(config, ledger, cliproxy_snapshot=None, now=None)` — assembles the widget contract. Never raises. |
-| `sarvam_meter/daemon.py` | `ThreadingHTTPServer` on `daemon.host:daemon.port` serving `/v1/status`, `/v1/health`, `/v1/refresh`, `/v1/config`; owns the background CLIProxyAPI refresh thread and its lock. |
-| `sarvam_meter/cli.py` | `argparse` front end (`init`, `serve`, `status`, `balance set/show`, `record`, `proxy`, `doctor`), exit codes 0/1/2, and the human-readable `status` output. |
+| `sarvam_meter/dashboard.py` | Sarvam dashboard adapter: `DashboardClient` (injectable transport, session from a `0600` file), `load_session`, `parse_summary`, `parse_timeseries`, `DashboardError`, and a `snapshot()` that never raises. See [dashboard-scrape.md](dashboard-scrape.md) and §4a below. |
+| `sarvam_meter/status.py` | `build_status(config, ledger, cliproxy_snapshot=None, dashboard_snapshot=None, now=None)` — assembles the widget contract. Never raises. |
+| `sarvam_meter/daemon.py` | `ThreadingHTTPServer` on `daemon.host:daemon.port` serving `/v1/status`, `/v1/health`, `/v1/refresh`, `/v1/config`; owns the background CLIProxyAPI refresh thread and its lock, and the dashboard snapshot's TTL cache. |
+| `sarvam_meter/cli.py` | `argparse` front end (`init`, `serve`, `status`, `balance set/show`, `record`, `proxy`, `doctor`, `session set/show`, `dashboard`), exit codes 0/1/2, and the human-readable `status` output. |
 | `sarvam_meter/__main__.py` | `python3 -m sarvam_meter` shim into `cli.main()`. |
 
 Dependency direction is one way and shallow:
@@ -56,9 +57,10 @@ rates  --> (nobody)
 audio  --> (nobody)
 ledger --> (nobody)
 cliproxy --> (nobody)
+dashboard --> (nobody)
 proxy  --> config, rates, audio, ledger
 status --> config, ledger
-daemon --> config, ledger, cliproxy, status
+daemon --> config, ledger, cliproxy, dashboard, status
 cli    --> all of the above
 ```
 
@@ -116,28 +118,40 @@ Notes that matter for anyone reading the numbers:
 ## 4. Status JSON contract
 
 `GET /v1/status` on the daemon returns `build_status(...)`. This is the widget's
-contract: the shape is exact, the schema version is `1`, and fields may be added
-only inside objects marked extensible (`by_api[]` entries, `errors[]` entries,
+contract: the shape is exact, the schema version is `2`, and fields may be added
+only inside objects marked extensible (`by_api[]`, `by_model[]`, `errors[]` and
 `accounts[]` entries). This block is a complete, valid JSON document:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "generated_at": "2026-11-01T10:00:00+05:30",
   "stale": false,
   "errors": [{"source": "cliproxy", "code": "unreachable", "message": "..."}],
   "sarvam": {
     "configured": true,
     "currency": "INR",
-    "balance": {"known": true, "remaining": 412.6, "starting": 500.0,
-                "spent_total": 87.4, "set_at": "2026-10-20T09:00:00Z"},
-    "spend": {"today": 12.3, "month": 87.4},
+    "balance": {"known": true, "remaining": 365.77, "starting": 500.0,
+                "spent_total": 134.23, "set_at": "2026-10-20T09:00:00Z",
+                "source": "dashboard"},
+    "spend": {"today": 12.3, "month": 134.23, "source": "dashboard"},
     "calls": {"today": 42},
     "by_api": [{"api": "chat", "spend": 8.0, "calls": 20}],
     "rate_limits": {"count_24h": 3, "last_at": "2026-10-31T18:00:00Z"},
     "quota_exhausted": false,
     "quota_exhausted_at": null,
-    "untracked_calls": {"today": 0, "total": 0}
+    "untracked_calls": {"today": 0, "total": 0},
+    "dashboard": {
+      "configured": true, "reachable": true, "as_of": "2026-11-01T09:58:00+05:30",
+      "org_id": "019f37be-...", "currency": "INR",
+      "window": {"start": "2026-10-20", "end": "2026-11-01"},
+      "spend": {"window": 134.23, "today": 12.3},
+      "by_model": [{"model": "saaras:v4", "cost": 74.05},
+                   {"model": "glm5.3-flash", "cost": 53.39},
+                   {"model": "sarvam-105b", "cost": 6.64},
+                   {"model": "saaras:v3-realtime", "cost": 0.16}],
+      "error": null
+    }
   },
   "cliproxy": {
     "configured": false,
@@ -149,11 +163,15 @@ only inside objects marked extensible (`by_api[]` entries, `errors[]` entries,
 }
 ```
 
+Schema 1 remains readable: the widget treats a payload with no `spend.source` and
+no `sarvam.dashboard` as a ledger payload, so an older daemon still drives a newer
+widget.
+
 Annotation, field by field:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `schema` | int | Contract version. Always `1`. |
+| `schema` | int | Contract version. `2` when the build knows about the dashboard source; `1` payloads stay readable by the widget. |
 | `generated_at` | string | When the payload was built, in the daemon's local timezone with offset (`+05:30`). Displayed in the widget footer. |
 | `stale` | bool | `true` when the CLIProxyAPI snapshot is missing while `cliproxy.enabled` is `true`. The widget shows a stale notice and keeps the numbers it has. |
 | `errors` | array | Always present, possibly `[]`. Carries the CLIProxyAPI snapshot's errors when there are any. Each entry is `{source, code, message}`; sources seen are `cliproxy` and `ledger`. |
@@ -162,10 +180,13 @@ Annotation, field by field:
 | `sarvam.balance.known` | bool | `false` until a starting balance has been set. When false, `remaining`, `starting` and `set_at` are `null` and only `spent_total` is meaningful. |
 | `sarvam.balance.remaining` | number or null | `starting − spent_total`, 2 dp for display. |
 | `sarvam.balance.starting` | number or null | The figure you entered with `sarvam-meter balance set`. |
-| `sarvam.balance.spent_total` | number | All-time measured spend from the ledger, whether or not a starting balance is known. |
-| `sarvam.balance.set_at` | string or null | UTC ISO8601 of the last `balance set`. |
-| `sarvam.spend.today` | number | Measured spend since local midnight. |
-| `sarvam.spend.month` | number | Measured spend since local month start. |
+| `sarvam.balance.spent_total` | number | Spend inside the measured window: the dashboard's window spend when the dashboard is reachable and a starting balance is set, else the all-time measured spend from the ledger. |
+| `sarvam.balance.set_at` | string or null | UTC ISO8601 of the last `balance set`. Its date part is the start of the dashboard window. |
+| `sarvam.balance.source` | string | `dashboard` or `ledger` — which source produced `remaining`/`spent_total`. Schema-2 addition. |
+| `sarvam.spend.today` | number | Spend since local midnight: the dashboard's `spend.today` when reachable, else the ledger figure. |
+| `sarvam.spend.month` | number | Measured spend since local month start (ledger). |
+| `sarvam.spend.source` | string | `dashboard` or `ledger`. Drives the widget's muted hint. Schema-2 addition. |
+| `sarvam.dashboard` | object | Always present in schema 2; `configured: false` when `dashboard.enabled` is false. See below. |
 | `sarvam.calls.today` | int | Recorded events since local midnight. |
 | `sarvam.by_api` | array | `{api, spend, calls}` for the month, sorted by spend descending. The full representation draws a bar per top-3 entry. |
 | `sarvam.rate_limits.count_24h` | int | Number of events with upstream status `429` in the last 24 hours. |
@@ -178,6 +199,21 @@ Annotation, field by field:
 | `cliproxy.api_version` | string | `v8` or `v0`, echoed from the config so a mismatch is visible in the UI. |
 | `cliproxy.worst_fraction` | number or null | Minimum remaining fraction across all known account buckets, 4 dp. `null` when no fraction is known. This is what the compact representation shows when `compactMode` is `cliproxy`. |
 | `cliproxy.accounts` | array | Normalized accounts (shape below). |
+
+`sarvam.dashboard` is the raw snapshot from the adapter, minus the session:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `configured` | bool | `dashboard.enabled` from the config. |
+| `reachable` | bool | Whether the last snapshot got usable JSON back from the dashboard. |
+| `as_of` | string | When that snapshot was taken. |
+| `org_id` | string or null | The dashboard's own org identifier, as returned. |
+| `currency` | string | Normalised from the payload's lowercase `"inr"` to `"INR"`. |
+| `window` | object | `{start, end}`, both `YYYY-MM-DD`: the date part of `balance.set_at` and today. |
+| `spend.window` | number | Dashboard cost for that window, 2 dp. |
+| `spend.today` | number | Dashboard cost for today; `0.0` when only the today call failed. |
+| `by_model` | array | `{model, cost}` per model for the window, sorted by cost descending. The widget draws at most three. |
+| `error` | object or null | `null`, or `{source: "dashboard", code, message}`. Codes: `no_session`, `unauthorized`, `bad_response`, `unreachable`, `http_error`. |
 
 Each `cliproxy.accounts[]` entry is the normalized account from the adapter:
 
@@ -201,6 +237,87 @@ Rounding: money to 2 dp for display, quantities and fractions to 4 dp.
 `errors: [{"source": "ledger", "code": "read_failed", "message": ...}]` with the
 numeric fields zeroed, so the widget degrades to "unknown" instead of crashing.
 
+## 4a. The dashboard source
+
+The dashboard source is the second Sarvam reader: instead of measuring traffic on
+this machine, it asks Sarvam's own dashboard what the organisation spent. It is
+optional (`dashboard.enabled`, default `false`) and it never replaces local
+metering — the ledger stays the fallback for every number it cannot supply. The
+honest caveats are in [dashboard-scrape.md](dashboard-scrape.md); this section is
+the mechanical description.
+
+**Endpoints.** Two `GET`s, both requiring the signed-in session, both derived from
+the dashboard's own front-end traffic and **not** from any published API:
+
+```
+GET /api/dhan/org/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=model&product=sarvam-api-platform
+GET /api/dhan/org/usage/timeseries?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=product&product=sarvam-api-platform&granularity=auto
+```
+
+Unauthenticated they answer `401 application/json`; an unknown `/api/...` path
+answers `404` with the SPA shell, which is how the real paths were told apart from
+the invented ones. The shapes below were captured from a real signed-in session and
+committed as fixtures in `tests/fixtures/` — those files, not this prose, are the
+contract:
+
+```json
+// dhan_usage_summary_by_model.json  (group_by=model)
+{"org_id": "019f37be-...",
+ "range": {"start": "2026-10-02T18:30:00Z", "end": "2026-11-01T18:29:59Z"},
+ "group_by": ["model"], "currency": "inr",
+ "subtotal": "134.2312311905", "total_discount": "0",
+ "total_cost": "134.2312311905", "total_org_cost": "134.2312311905",
+ "usage": [{"unit": "token", "quantity": "13046343",
+            "breakdown": [{"unit": "cached_token", "quantity": "11296128"},
+                          {"unit": "input_token", "quantity": "1513846"},
+                          {"unit": "output_token", "quantity": "236369"}]},
+           {"unit": "second", "quantity": "9086.323125"}],
+ "groups": [{"model": "glm5.3-flash", "total_cost": "53.388129", "currency": "inr", "usage": [...]},
+            {"model": "saaras:v3-realtime", "total_cost": "0.1551666667", ...},
+            {"model": "saaras:v4", "total_cost": "74.0498055238", ...},
+            {"model": "sarvam-105b", "total_cost": "6.63813", ...}]}
+
+// dhan_usage_timeseries_by_product.json  (group_by=product)
+// same envelope plus "granularity", "available_granularities", groups[].product and
+// points: [{"timestamp", "subtotal", "total_discount", "total_cost", "event_count"}]
+```
+
+Two properties of those payloads drive the parser:
+
+- **Every number is a JSON string.** `parse_summary` / `parse_timeseries` convert
+them to `float`; a non-numeric string raises, it is never silently turned into `0`.
+- **`currency` arrives lowercase** (`"inr"`) and is normalised to `"INR"`.
+
+**Snapshot.** `DashboardClient.snapshot(since_date, today)` makes two calls — the
+window summary and today's summary — and never raises. A failure of the second keeps
+the window result, leaves `spend.today` at `0.0`, and records the error; a failure of
+the first yields `reachable: false` with an error and no numbers. The transport is
+injectable and defaults to `urllib` with an empty proxy map, certificate
+verification on and no redirect following, the same rules as `cliproxy.py`. Every
+call is a `GET`; the adapter has no write path at all.
+
+**TTL cache and refresh thread.** The daemon keeps the snapshot in memory with a TTL
+of `dashboard.poll_seconds` (default 300 s, minimum 60 s), refreshed by the same
+background-thread pattern as CLIProxyAPI: the thread wakes, and if the cached
+snapshot is older than the TTL it takes the lock, calls `snapshot()`, and replaces
+the cache. `GET /v1/status` only ever reads the cache, so a slow or hostile
+dashboard cannot delay a widget poll, and `POST /v1/refresh` refreshes both sources.
+
+**Balance arithmetic.** The dashboard reports spend, not a balance, so the widget's
+`remaining` is derived:
+
+```
+window.start = date part of balance.set_at          # e.g. 2026-10-20
+spent_total  = dashboard.spend.window               # spend since that date
+remaining    = max(0, balance.starting - spent_total)
+```
+
+The clamp matters: a top-up or a credit adjustment made after `balance set` can push
+measured spend above the starting figure, and a negative balance is not a thing the
+user can act on. When no starting balance is set, `balance.known` is `false` and the
+widget shows spend only, exactly as in schema 1. When the dashboard is unreachable,
+all of this is skipped and the ledger arithmetic applies unchanged.
+
 ## 5. Threading model
 
 Both servers are `ThreadingHTTPServer` instances with `SO_REUSEADDR` on and
@@ -218,6 +335,11 @@ cannot block the accept loop.
   lock; `GET /v1/status` only reads the cached snapshot, so a slow or hanging
   management API never delays a widget poll. `POST /v1/refresh` forces a re-poll
   (taking the same lock) and returns the new status.
+- **Dashboard TTL cache.** The dashboard snapshot is refreshed by the same thread
+  pattern with a TTL of `dashboard.poll_seconds`; a poll inside the TTL is served
+  from memory without touching the network. The dashboard is slow (a browser app's
+  backend, behind bot management), so the refresh must never happen on the request
+  path — and it does not.
 - **Proxy threads.** Each proxied request is one server thread that streams the
   request upstream, streams the response back, and records one ledger event on
   its own connection. Nothing is shared between requests except the `Config`
@@ -296,6 +418,15 @@ message and exit code 1.
 - **The CLIProxyAPI transport does not follow redirects** and keeps TLS
   verification on, so a compromised management endpoint cannot bounce the
   management key to a third party.
+- **The dashboard session is a credential, and is treated as one.** It lives in a
+  `0600` file (`dashboard.session_file`), is read per snapshot and never cached in
+  the payload, is never logged, is never returned by `/v1/config`, and never
+  appears in an error message or in `sarvam.dashboard.error` — the widget only ever
+  shows the error *code*. The adapter issues `GET` requests only, so no dashboard
+  write, purchase or settings call exists in the code at all.
+- **`dashboard.base_url` is exempt from the loopback guard by design** (the
+  dashboard is remote), so it is instead required to be `https://` with no
+  userinfo, which keeps credentials out of the URL.
 - **No third-party runtime dependencies**, which keeps the supply chain to
   CPython itself.
 - **The ledger holds no credentials** — only api names, models, quantities, costs

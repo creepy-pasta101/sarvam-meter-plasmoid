@@ -23,6 +23,7 @@ import socket
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from sarvam_meter import config as config_mod
 from sarvam_meter.cli import main
@@ -31,13 +32,14 @@ EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 
-#: The four checks ``doctor`` performs with the default config
-#: (``proxy.enabled`` and ``cliproxy.enabled`` are both false).
+#: The five checks ``doctor`` performs with the default config
+#: (``proxy.enabled``, ``cliproxy.enabled`` and ``dashboard.enabled`` are false).
 DOCTOR_CHECKS = (
     "config loads",
     "data dir writable",
     "db opens",
     "daemon port free",
+    "dashboard session",
 )
 
 
@@ -111,6 +113,8 @@ class CliTestCase(unittest.TestCase):
 
         self.config_path = os.path.join(self.tmp, "config.json")
         self.db_path = os.path.join(self.tmp, "usage.db")
+        # Never read or write the real ~/.config/sarvam-meter/session.json.
+        self.session_path = os.path.join(self.tmp, "session.json")
 
         saved = {}
         for name in ("SARVAM_METER_CONFIG", "SARVAM_METER_CLIPROXY_KEY"):
@@ -133,6 +137,7 @@ class CliTestCase(unittest.TestCase):
         document = config_mod.default_config_dict()
         document["db_path"] = self.db_path
         document["daemon"]["port"] = free_port()
+        document["dashboard"]["session_file"] = self.session_path
         for section, values in sections.items():
             document[section].update(values)
         with open(path, "w", encoding="utf-8") as handle:
@@ -184,6 +189,21 @@ class InitTest(CliTestCase):
         self.assertEqual(code, EXIT_OK, err)
         self.assertTrue(os.path.isfile(self.config_path))
         self.assertEqual(out.strip(), self.config_path)
+
+    def test_init_writes_exactly_the_packaged_example(self):
+        target = os.path.join(self.tmp, "packaged", "config.json")
+        self.assert_exit(["init", "--config", target], EXIT_OK)
+        example = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "packaging",
+            "config.example.json",
+        )
+        with open(target, "r", encoding="utf-8") as handle:
+            written = json.load(handle)
+        with open(example, "r", encoding="utf-8") as handle:
+            packaged = json.load(handle)
+        self.assertEqual(written, packaged)
+        self.assertEqual(written, config_mod.default_config_dict())
 
     def test_init_then_load_round_trips(self):
         target = os.path.join(self.tmp, "round", "config.json")
@@ -249,6 +269,7 @@ class StatusTest(CliTestCase):
         "quota_exhausted",
         "quota_exhausted_at",
         "untracked_calls",
+        "dashboard",
     }
     CLIPROXY_KEYS = {
         "configured",
@@ -258,7 +279,7 @@ class StatusTest(CliTestCase):
         "accounts",
     }
 
-    def test_status_json_has_the_schema_1_shape(self):
+    def test_status_json_has_the_schema_2_shape(self):
         self.write_config()
         self.assert_exit(["balance", "set", "500"], EXIT_OK)
 
@@ -266,7 +287,7 @@ class StatusTest(CliTestCase):
         payload = json.loads(out)  # must be parseable
 
         self.assertEqual(set(payload), self.TOP_KEYS)
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
         self.assertIsInstance(payload["generated_at"], str)
         self.assertIn("T", payload["generated_at"])
         self.assertIs(payload["stale"], False)
@@ -278,7 +299,12 @@ class StatusTest(CliTestCase):
         self.assertIs(sarvam["balance"]["known"], True)
         self.assertEqual(sarvam["balance"]["starting"], 500.0)
         self.assertEqual(sarvam["balance"]["remaining"], 500.0)
-        self.assertEqual(sarvam["spend"], {"today": 0.0, "month": 0.0})
+        self.assertEqual(
+            sarvam["spend"], {"today": 0.0, "month": 0.0, "source": "ledger"}
+        )
+        self.assertEqual(sarvam["balance"]["source"], "ledger")
+        self.assertFalse(sarvam["dashboard"]["configured"])
+        self.assertIsNone(sarvam["dashboard"]["error"])
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
         self.assertIs(sarvam["quota_exhausted"], False)
@@ -513,11 +539,284 @@ class DoctorTest(CliTestCase):
         out, _err = self.assert_exit(["doctor", "--config", missing], EXIT_RUNTIME)
 
         lines = [line for line in out.splitlines() if line.strip()]
-        # "config loads" plus the five checks it could not run.
-        self.assertEqual(len(lines), 6, out)
+        # "config loads" plus the seven checks it could not run.
+        self.assertEqual(len(lines), 8, out)
         for line in lines:
             self.assertTrue(line.startswith("FAIL "), line)
         self.assertIn("FAIL config loads", out)
+
+
+# ---------------------------------------------------------------------------
+# session
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_snapshot(**overrides):
+    snapshot = {
+        "configured": True,
+        "reachable": True,
+        "as_of": "2026-11-15T04:30:00Z",
+        "org_id": "019f37be-0000-7000-8000-000000000000",
+        "currency": "INR",
+        "window": {"start": "2026-10-20", "end": "2026-11-15"},
+        "spend": {"window": 134.23, "today": 12.3},
+        "by_model": [{"model": "saaras:v4", "cost": 74.05}],
+        "usage": [],
+        "error": None,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+class SessionTest(CliTestCase):
+    COOKIE = "session-cookie-VALUE-9f3a"
+    BEARER = "Bearer bearer-VALUE-77c1"
+
+    def test_session_set_writes_0600_inside_0700_and_never_prints_values(self):
+        nested = os.path.join(self.tmp, "cfgdir", "session.json")
+        self.write_config(dashboard={"enabled": True, "session_file": nested})
+
+        out, err = self.assert_exit(
+            ["session", "set", "--cookie", self.COOKIE, "--authorization", self.BEARER],
+            EXIT_OK,
+        )
+        self.assertIn(nested, out)
+        self.assertNotIn(self.COOKIE, out + err)
+        self.assertNotIn(self.BEARER, out + err)
+
+        self.assertTrue(os.path.isfile(nested))
+        self.assertEqual(os.stat(nested).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(nested)).st_mode & 0o777, 0o700)
+        with open(nested, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(
+            document, {"Cookie": self.COOKIE, "Authorization": self.BEARER}
+        )
+        # atomic write leaves no temporary file behind
+        self.assertEqual(
+            [n for n in os.listdir(os.path.dirname(nested)) if n.endswith(".tmp")
+             or n.startswith(".session-")],
+            [],
+        )
+
+    def test_session_set_reads_the_cookie_from_a_file(self):
+        cookie_file = os.path.join(self.tmp, "cookie.txt")
+        with open(cookie_file, "w", encoding="utf-8") as handle:
+            handle.write(self.COOKIE + "\n")
+        self.write_config(dashboard={"session_file": self.session_path})
+
+        self.assert_exit(["session", "set", "--cookie-file", cookie_file], EXIT_OK)
+        with open(self.session_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document, {"Cookie": self.COOKIE})
+
+    def test_session_set_refuses_a_newline_in_the_value(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        out, err = self.assert_exit(
+            ["session", "set", "--cookie", "a=1\nX-Injected: 1"], EXIT_CONFIG
+        )
+        self.assertEqual(out, "")
+        self.assertIn("newline", err)
+        self.assertFalse(os.path.exists(self.session_path))
+
+    def test_session_set_refuses_a_newline_in_the_authorization(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        _out, err = self.assert_exit(
+            ["session", "set", "--cookie", "a=1", "--authorization", "Bearer x\ny"],
+            EXIT_CONFIG,
+        )
+        self.assertIn("newline", err)
+        self.assertFalse(os.path.exists(self.session_path))
+
+    def test_session_set_requires_a_source(self):
+        self.write_config()
+        _out, err = self.assert_exit(["session", "set"], EXIT_CONFIG)
+        self.assertIn("required", err)
+
+    def test_session_set_refuses_an_empty_cookie(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        _out, err = self.assert_exit(["session", "set", "--cookie", "   "], EXIT_CONFIG)
+        self.assertIn("must not be empty", err)
+
+    def test_session_set_rejects_two_sources_at_once(self):
+        self.write_config()
+        _out, err = self.assert_exit(
+            ["session", "set", "--cookie", "a", "--cookie-file", "/tmp/x"], EXIT_CONFIG
+        )
+        self.assertIn("usage:", err)
+
+    def test_session_show_prints_path_mode_and_presence_but_no_value(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        self.assert_exit(["session", "set", "--cookie", self.COOKIE], EXIT_OK)
+
+        out, err = self.assert_exit(["session", "show"], EXIT_OK)
+        self.assertIn(self.session_path, out)
+        self.assertIn("0600", out)
+        self.assertIn("Cookie: present", out)
+        self.assertIn("Authorization: absent", out)
+        self.assertNotIn(self.COOKIE, out + err)
+
+    def test_session_show_reports_a_missing_file(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        out, _err = self.assert_exit(["session", "show"], EXIT_OK)
+        self.assertIn(self.session_path, out)
+        self.assertIn("missing", out)
+        self.assertIn("Cookie: absent", out)
+        self.assertIn("Authorization: absent", out)
+
+    def test_session_show_reports_a_corrupt_file_without_a_traceback(self):
+        self.write_config(dashboard={"session_file": self.session_path})
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        os.chmod(self.session_path, 0o600)
+        out, err = self.assert_exit(["session", "show"], EXIT_RUNTIME)
+        self.assertEqual(out, "")
+        self.assertIn("invalid JSON", err)
+
+
+# ---------------------------------------------------------------------------
+# dashboard
+# ---------------------------------------------------------------------------
+
+
+class DashboardCommandTest(CliTestCase):
+    def test_dashboard_reports_not_configured(self):
+        self.write_config()
+        out, err = self.assert_exit(["dashboard"], EXIT_OK)
+        self.assertIn("not configured", out)
+        self.assertEqual(err, "")
+
+    def test_dashboard_json_is_the_status_block(self):
+        self.write_config()
+        out, _err = self.assert_exit(["dashboard", "--json"], EXIT_OK)
+        block = json.loads(out)
+        self.assertFalse(block["configured"])
+        self.assertEqual(
+            set(block),
+            {
+                "configured",
+                "reachable",
+                "as_of",
+                "org_id",
+                "currency",
+                "window",
+                "spend",
+                "by_model",
+                "error",
+            },
+        )
+
+    def test_dashboard_prints_a_reachable_snapshot(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, _err = self.assert_exit(["dashboard"], EXIT_OK)
+        self.assertIn("reachable", out)
+        self.assertIn("134.23", out)
+        self.assertIn("saaras:v4", out)
+
+    def test_dashboard_exits_runtime_when_the_snapshot_has_an_error(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        failing = _dashboard_snapshot(
+            reachable=False,
+            spend={"window": 0.0, "today": 0.0},
+            by_model=[],
+            error={"source": "dashboard", "code": "no_session", "message": "no session"},
+        )
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot", return_value=failing
+        ):
+            out, _err = self.assert_exit(["dashboard"], EXIT_RUNTIME)
+        self.assertIn("unreachable", out)
+        self.assertIn("dashboard: no_session", out)
+
+
+# ---------------------------------------------------------------------------
+# doctor: dashboard checks
+# ---------------------------------------------------------------------------
+
+
+class DoctorDashboardTest(CliTestCase):
+    def _write_session(self, mode=0o600, document=None):
+        directory = os.path.dirname(self.session_path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            json.dump(document or {"Cookie": "a=1"}, handle)
+        os.chmod(self.session_path, mode)
+
+    def test_enabled_without_a_session_file_fails(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self.assertIn("FAIL dashboard session", out)
+        self.assertIn("FAIL dashboard reachable", out)
+
+    def test_a_good_session_file_passes_the_session_check(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        self._write_session(document={"Cookie": "a=1", "Authorization": "Bearer b"})
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, _err = self.assert_exit(["doctor"], EXIT_OK)
+        self.assertIn("OK   dashboard session", out)
+        self.assertIn("OK   dashboard reachable", out)
+        self.assertNotIn("FAIL", out)
+
+    def test_a_world_readable_session_file_fails(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        self._write_session(mode=0o644)
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self.assertIn("FAIL dashboard session", out)
+        self.assertIn("0644", out)
+
+    def test_unexpected_keys_fail_without_leaking_a_value(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        self._write_session(document={"Cookie": "a=1", "Password": "hunter2-SECRET"})
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self.assertIn("FAIL dashboard session", out)
+        self.assertIn("password", out.lower())
+        self.assertNotIn("hunter2-SECRET", out + err)
+
+    def test_a_corrupt_session_file_degrades_to_a_fail_line(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write("{{{")
+        os.chmod(self.session_path, 0o600)
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self.assertIn("FAIL dashboard session", out)
+
+    def test_a_raising_snapshot_degrades_to_a_fail_line(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        self._write_session()
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            side_effect=RuntimeError("kaboom"),
+        ):
+            out, err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self.assertIn("FAIL dashboard reachable", out)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_disabled_dashboard_adds_one_check_and_stays_ok(self):
+        self.write_config()
+        out, _err = self.assert_exit(["doctor"], EXIT_OK)
+        self.assertIn("OK   dashboard session", out)
+        self.assertNotIn("dashboard reachable", out)
+        self.assertNotIn("FAIL", out)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -67,9 +67,21 @@ SARVAM_KEYS = {
     "quota_exhausted",
     "quota_exhausted_at",
     "untracked_calls",
+    "dashboard",
 }
-BALANCE_KEYS = {"known", "remaining", "starting", "spent_total", "set_at"}
-SPEND_KEYS = {"today", "month"}
+BALANCE_KEYS = {"known", "remaining", "starting", "spent_total", "set_at", "source"}
+SPEND_KEYS = {"today", "month", "source"}
+DASHBOARD_KEYS = {
+    "configured",
+    "reachable",
+    "as_of",
+    "org_id",
+    "currency",
+    "window",
+    "spend",
+    "by_model",
+    "error",
+}
 CALLS_KEYS = {"today"}
 RATE_LIMIT_KEYS = {"count_24h", "last_at"}
 UNTRACKED_KEYS = {"today", "total"}
@@ -687,7 +699,7 @@ class StatusContractTest(ChainTestCase):
         payload = self.status_payload()
 
         self.assertEqual(set(payload), TOP_KEYS)
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
         self.assertIsInstance(payload["generated_at"], str)
         self.assertIsInstance(payload["stale"], bool)
         self.assertIsInstance(payload["errors"], list)
@@ -699,6 +711,7 @@ class StatusContractTest(ChainTestCase):
         self.assertEqual(set(sarvam["calls"]), CALLS_KEYS)
         self.assertEqual(set(sarvam["rate_limits"]), RATE_LIMIT_KEYS)
         self.assertEqual(set(sarvam["untracked_calls"]), UNTRACKED_KEYS)
+        self.assertEqual(set(sarvam["dashboard"]), DASHBOARD_KEYS)
         self.assertEqual(sarvam["currency"], "INR")
         self.assertIs(sarvam["configured"], True)
         self.assertTrue(sarvam["by_api"], "by_api should list the chat call")

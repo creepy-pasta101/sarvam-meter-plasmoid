@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Status payload builder -- the widget's data contract (SPEC section 10).
+"""Status payload builder -- the widget's data contract (SPEC sections 10 and 17.5).
 
 The JSON produced by :func:`build_status` is the contract between the daemon and
 the Plasma widget.  The shape is exact; only the objects explicitly marked
-extensible in the spec may grow new keys.
+extensible in the spec may grow new keys.  Schema 2 adds the dashboard source:
+``balance.source``/``spend.source`` and the ``sarvam.dashboard`` block.
 
 :func:`build_status` must never raise: a failing ledger read is reported inside
 ``errors`` with every number zeroed.
@@ -16,7 +17,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Lower bound used when a query has to cover "all time".
 EPOCH_ISO = "0001-01-01T00:00:00Z"
@@ -173,7 +174,9 @@ def _count_estimated(ledger: Any, config: Any, since_iso: Optional[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _empty_sarvam(configured: bool, currency: str) -> Dict[str, Any]:
+def _empty_sarvam(
+    configured: bool, currency: str, dashboard: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     return {
         "configured": configured,
         "currency": currency,
@@ -183,14 +186,31 @@ def _empty_sarvam(configured: bool, currency: str) -> Dict[str, Any]:
             "starting": None,
             "spent_total": 0.0,
             "set_at": None,
+            "source": "ledger",
         },
-        "spend": {"today": 0.0, "month": 0.0},
+        "spend": {"today": 0.0, "month": 0.0, "source": "ledger"},
         "calls": {"today": 0},
         "by_api": [],
         "rate_limits": {"count_24h": 0, "last_at": None},
         "quota_exhausted": False,
         "quota_exhausted_at": None,
         "untracked_calls": {"today": 0, "total": 0},
+        "dashboard": dashboard if dashboard is not None else _empty_dashboard(False),
+    }
+
+
+def _empty_dashboard(configured: bool) -> Dict[str, Any]:
+    """The ``sarvam.dashboard`` block with nothing known yet."""
+    return {
+        "configured": bool(configured),
+        "reachable": False,
+        "as_of": None,
+        "org_id": None,
+        "currency": "INR",
+        "window": {"start": None, "end": None},
+        "spend": {"window": 0.0, "today": 0.0},
+        "by_model": [],
+        "error": None,
     }
 
 
@@ -211,18 +231,113 @@ def _normalise_by_api(raw: Any) -> List[Dict[str, Any]]:
     return entries
 
 
+def _normalise_window(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"start": None, "end": None}
+    start = raw.get("start")
+    end = raw.get("end")
+    return {
+        "start": start if isinstance(start, str) else None,
+        "end": end if isinstance(end, str) else None,
+    }
+
+
+def _normalise_dashboard_spend(raw: Any) -> Dict[str, float]:
+    if not isinstance(raw, dict):
+        return {"window": 0.0, "today": 0.0}
+    return {
+        "window": money(raw.get("window")),
+        "today": money(raw.get("today")),
+    }
+
+
+def _normalise_by_model(raw: Any) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if not isinstance(raw, (list, tuple)):
+        return entries
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        model = item.get("model")
+        entries.append(
+            {
+                "model": str(model) if model is not None else "",
+                "cost": money(item.get("cost")),
+            }
+        )
+    return entries
+
+
+def _normalise_dashboard_error(raw: Any) -> Optional[Dict[str, str]]:
+    """One ``{"source","code","message"}`` entry, or ``None``.
+
+    Accepts the snapshot's singular ``error`` object (SPEC 17.3) and, defensively,
+    a list of them.  A session value can never reach this point: the snapshot
+    shape carries no credentials, and ``_scrub`` is applied as a second guard.
+    """
+    entry = raw
+    if isinstance(raw, (list, tuple)):
+        entry = raw[0] if raw else None
+    if not isinstance(entry, dict):
+        return None
+    scrubbed = _scrub(entry)
+    if not isinstance(scrubbed, dict):  # pragma: no cover - defensive
+        return None
+    return {
+        "source": str(scrubbed.get("source") or "dashboard"),
+        "code": str(scrubbed.get("code") or "error"),
+        "message": str(scrubbed.get("message") or ""),
+    }
+
+
+def _dashboard_block(config: Any, snapshot: Optional[dict]) -> Dict[str, Any]:
+    """The ``sarvam.dashboard`` object (always present, SPEC 17.5)."""
+    section = getattr(config, "dashboard", None)
+    configured = bool(getattr(section, "enabled", False))
+    block = _empty_dashboard(configured)
+    if not isinstance(snapshot, dict):
+        return block
+
+    block["configured"] = bool(snapshot.get("configured", configured))
+    block["reachable"] = bool(snapshot.get("reachable"))
+    as_of = snapshot.get("as_of")
+    block["as_of"] = as_of if isinstance(as_of, str) else None
+    org_id = snapshot.get("org_id")
+    block["org_id"] = org_id if isinstance(org_id, str) else None
+    currency = snapshot.get("currency")
+    block["currency"] = str(currency) if isinstance(currency, str) and currency else "INR"
+    block["window"] = _normalise_window(snapshot.get("window"))
+    block["spend"] = _normalise_dashboard_spend(snapshot.get("spend"))
+    block["by_model"] = _normalise_by_model(snapshot.get("by_model"))
+    error = _normalise_dashboard_error(snapshot.get("error"))
+    if error is None:
+        error = _normalise_dashboard_error(snapshot.get("errors"))
+    block["error"] = error
+    return block
+
+
 def _sarvam_block(
     config: Any,
     ledger: Any,
     now_utc: datetime,
     day_start_iso: str,
     month_start_iso: str,
+    dashboard: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, str]]]:
-    """Build the ``sarvam`` object, plus a ledger error entry when reads fail."""
+    """Build the ``sarvam`` object, plus a ledger error entry when reads fail.
+
+    Money sources follow SPEC 17.5: when the dashboard snapshot is reachable the
+    balance and ``spend.today`` come from the dashboard (``source: "dashboard"``),
+    otherwise from the ledger (``source: "ledger"``).
+    """
     sarvam_cfg = getattr(config, "sarvam", None)
     configured = bool(getattr(sarvam_cfg, "enabled", True))
     currency = str(getattr(sarvam_cfg, "currency", "INR") or "INR")
-    empty = _empty_sarvam(configured, currency)
+    dashboard_block = dashboard if isinstance(dashboard, dict) else _empty_dashboard(
+        bool(getattr(getattr(config, "dashboard", None), "enabled", False))
+    )
+    empty = _empty_sarvam(configured, currency, dashboard_block)
+    dashboard_reachable = bool(dashboard_block.get("reachable"))
 
     since_24h = _utc_iso(now_utc - timedelta(hours=24))
     try:
@@ -249,13 +364,25 @@ def _sarvam_block(
         starting_raw = _as_float(balance.get("starting"))
         set_at = balance.get("set_at")
 
+    source = "dashboard" if dashboard_reachable else "ledger"
+
     if starting_raw is not None:
+        if dashboard_reachable:
+            # The dashboard is authoritative for the window that started when the
+            # starting balance was set (SPEC 17.5).
+            dashboard_spend = dashboard_block.get("spend") or {}
+            measured = _as_float(dashboard_spend.get("window")) or 0.0
+            remaining = max(0.0, starting_raw - measured)
+        else:
+            measured = spend_total
+            remaining = starting_raw - measured
         balance_block = {
             "known": True,
-            "remaining": money(starting_raw - spend_total),
+            "remaining": money(remaining),
             "starting": money(starting_raw),
-            "spent_total": money(spend_total),
+            "spent_total": money(measured),
             "set_at": set_at if isinstance(set_at, str) else None,
+            "source": source,
         }
     else:
         balance_block = {
@@ -264,13 +391,30 @@ def _sarvam_block(
             "starting": None,
             "spent_total": money(spend_total),
             "set_at": None,
+            "source": source,
         }
+
+    if dashboard_reachable:
+        dashboard_spend = dashboard_block.get("spend") or {}
+        today_value = _as_float(dashboard_spend.get("today"))
+        if today_value is not None:
+            spend_today = today_value
+        # The ledger's month total is not comparable once the dashboard is the
+        # source: it only sees proxied calls.  Prefer the dashboard's own
+        # month-to-date figure when it is present.
+        month_value = _as_float(dashboard_spend.get("month"))
+        if month_value is not None:
+            spend_month = month_value
 
     block = {
         "configured": configured,
         "currency": currency,
         "balance": balance_block,
-        "spend": {"today": money(spend_today), "month": money(spend_month)},
+        "spend": {
+            "today": money(spend_today),
+            "month": money(spend_month),
+            "source": source,
+        },
         "calls": {"today": calls_today},
         "by_api": _normalise_by_api(by_api),
         "rate_limits": {
@@ -283,6 +427,7 @@ def _sarvam_block(
             "today": int(untracked_today),
             "total": int(untracked_total),
         },
+        "dashboard": dashboard_block,
     }
     return block, None
 
@@ -366,13 +511,24 @@ def build_status(
     ledger: Any,
     cliproxy_snapshot: Optional[dict] = None,
     now: Optional[datetime] = None,
+    dashboard_snapshot: Optional[dict] = None,
 ) -> dict:
-    """Build the status payload described by SPEC section 10.
+    """Build the status payload described by SPEC sections 10 and 17.5 (schema 2).
 
     Never raises: ledger failures surface as an ``errors`` entry with zeroed
     numbers, and any other unexpected failure degrades to a minimal payload.
+    ``dashboard_snapshot`` is the dict produced by the dashboard client's
+    ``snapshot()``; ``None`` means "no dashboard data" and leaves every money
+    figure on the ledger with ``source: "ledger"``.
     """
     snapshot = cliproxy_snapshot if isinstance(cliproxy_snapshot, dict) else None
+    dash_snapshot = dashboard_snapshot if isinstance(dashboard_snapshot, dict) else None
+    try:
+        dashboard_block = _dashboard_block(config, dash_snapshot)
+    except Exception:  # noqa: BLE001 - a malformed snapshot must not kill the payload
+        dashboard_block = _empty_dashboard(
+            bool(getattr(getattr(config, "dashboard", None), "enabled", False))
+        )
     try:
         generated_at, day_start_iso, month_start_iso, now_utc = _time_context(now)
     except Exception:  # noqa: BLE001 - a broken `now` must not kill the payload
@@ -387,13 +543,14 @@ def build_status(
 
     try:
         sarvam_block, ledger_error = _sarvam_block(
-            config, ledger, now_utc, day_start_iso, month_start_iso
+            config, ledger, now_utc, day_start_iso, month_start_iso, dashboard_block
         )
     except Exception as exc:  # noqa: BLE001
         sarvam_cfg = getattr(config, "sarvam", None)
         sarvam_block = _empty_sarvam(
             bool(getattr(sarvam_cfg, "enabled", True)),
             str(getattr(sarvam_cfg, "currency", "INR") or "INR"),
+            dashboard_block,
         )
         ledger_error = {
             "source": "ledger",

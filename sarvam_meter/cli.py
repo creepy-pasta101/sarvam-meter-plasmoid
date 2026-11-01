@@ -12,6 +12,7 @@ import math
 import os
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -301,6 +302,220 @@ def cmd_record(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# -- session file ------------------------------------------------------------
+
+#: The only header names the session file may contain (case-insensitive).
+SESSION_KEYS = ("cookie", "authorization")
+
+
+def _session_path(config: Any) -> str:
+    section = getattr(config, "dashboard", None)
+    return str(getattr(section, "session_file", "") or "")
+
+
+def _session_mode(path: str) -> Optional[int]:
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def _reject_newline(name: str, value: str) -> Optional[int]:
+    """Refuse header values that would smuggle a second header line."""
+    if "\n" in value or "\r" in value:
+        _err("%s must not contain a newline" % (name,))
+        return EXIT_CONFIG
+    return None
+
+
+def _write_session_file(path: str, headers: dict) -> None:
+    """Write *headers* atomically as ``0600`` inside a ``0700`` directory."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:  # pragma: no cover - e.g. a foreign filesystem
+            pass
+    payload = json.dumps(headers, indent=2) + "\n"
+    handle_fd, tmp_path = tempfile.mkstemp(prefix=".session-", dir=directory)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # pragma: no cover
+            pass
+        raise
+
+
+def cmd_session_set(args: argparse.Namespace) -> int:
+    cookie_file = getattr(args, "cookie_file", None)
+    cookie = getattr(args, "cookie", None)
+    if cookie_file:
+        try:
+            with open(os.path.expanduser(cookie_file), "r", encoding="utf-8") as handle:
+                cookie = handle.read()
+        except OSError as exc:
+            _err("cannot read cookie file %s: %s" % (cookie_file, exc.strerror or exc))
+            return EXIT_RUNTIME
+    if cookie is None:
+        _err("one of --cookie or --cookie-file is required")
+        return EXIT_CONFIG
+    cookie = cookie.strip()
+    if not cookie:
+        _err("cookie must not be empty")
+        return EXIT_CONFIG
+    refused = _reject_newline("cookie", cookie)
+    if refused is not None:
+        return refused
+
+    headers = {"Cookie": cookie}
+    authorization = getattr(args, "authorization", None)
+    if authorization is not None and str(authorization).strip():
+        authorization = str(authorization).strip()
+        refused = _reject_newline("authorization", authorization)
+        if refused is not None:
+            return refused
+        headers["Authorization"] = authorization
+
+    config = _load(args)
+    path = _session_path(config)
+    if not path:
+        _err("dashboard.session_file is not set")
+        return EXIT_CONFIG
+    _write_session_file(path, headers)
+    _out("Session written to %s (mode 0600)" % (path,))
+    return EXIT_OK
+
+
+def cmd_session_show(args: argparse.Namespace) -> int:
+    config = _load(args)
+    path = _session_path(config)
+    if not path:
+        _err("dashboard.session_file is not set")
+        return EXIT_CONFIG
+    mode = _session_mode(path)
+    if mode is None:
+        _out("Session file: %s" % (path,))
+        _out("Mode: missing")
+        _out("Cookie: absent")
+        _out("Authorization: absent")
+        return EXIT_OK
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except OSError as exc:
+        _err("cannot read %s: %s" % (path, exc.strerror or exc))
+        return EXIT_RUNTIME
+    except ValueError:
+        _err("cannot read %s: invalid JSON" % (path,))
+        return EXIT_RUNTIME
+    if not isinstance(document, dict):
+        _err("cannot read %s: not a JSON object" % (path,))
+        return EXIT_RUNTIME
+    present = {
+        str(key).strip().lower()
+        for key in document
+        if isinstance(key, str) and str(document.get(key) or "").strip()
+    }
+    _out("Session file: %s" % (path,))
+    _out("Mode: %04o" % (mode,))
+    for name in SESSION_KEYS:
+        _out("%s: %s" % (name.capitalize(), "present" if name in present else "absent"))
+    return EXIT_OK
+
+
+# -- dashboard ---------------------------------------------------------------
+
+
+def _dashboard_snapshot(config: Any, ledger: Any) -> dict:
+    """Poll the dashboard once (never raises; the caller reads ``error``)."""
+    try:
+        from .daemon import fetch_dashboard_snapshot
+
+        return fetch_dashboard_snapshot(config, ledger)
+    except Exception as exc:  # noqa: BLE001 - a command must never traceback
+        return {
+            "configured": bool(
+                getattr(getattr(config, "dashboard", None), "enabled", False)
+            ),
+            "reachable": False,
+            "as_of": None,
+            "org_id": None,
+            "currency": "INR",
+            "window": {"start": None, "end": None},
+            "spend": {"window": 0.0, "today": 0.0},
+            "by_model": [],
+            "error": {
+                "source": "dashboard",
+                "code": "unreachable",
+                "message": str(exc) or exc.__class__.__name__,
+            },
+        }
+
+
+def _dashboard_lines(block: dict, base_url: str) -> List[str]:
+    if not block.get("configured"):
+        return ["Dashboard  not configured"]
+    head = "Dashboard  %s  %s" % (
+        base_url or "-",
+        "reachable" if block.get("reachable") else "unreachable",
+    )
+    lines = [head]
+    if block.get("reachable"):
+        window = block.get("window") or {}
+        spend = block.get("spend") or {}
+        lines.append(
+            "%s %.2f spent %s..%s (%s %.2f today)"
+            % (
+                block.get("currency") or "INR",
+                float(spend.get("window") or 0.0),
+                window.get("start") or "-",
+                window.get("end") or "-",
+                block.get("currency") or "INR",
+                float(spend.get("today") or 0.0),
+            )
+        )
+        for entry in (block.get("by_model") or [])[:3]:
+            if isinstance(entry, dict):
+                lines.append(
+                    "  %s  %.2f"
+                    % (entry.get("model") or "-", float(entry.get("cost") or 0.0))
+                )
+    error = block.get("error")
+    if isinstance(error, dict):
+        lines.append("dashboard: %s" % (error.get("code") or "error",))
+    return lines
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    config = _load(args)
+    ledger = _open_ledger(config)
+    try:
+        snapshot = _dashboard_snapshot(config, ledger)
+        block = build_status(
+            config, ledger, None, dashboard_snapshot=snapshot
+        )["sarvam"]["dashboard"]
+    finally:
+        _close_ledger(ledger)
+
+    if getattr(args, "json", False):
+        _out(json.dumps(block, indent=2, sort_keys=False))
+    else:
+        section = getattr(config, "dashboard", None)
+        for line in _dashboard_lines(
+            block, str(getattr(section, "base_url", "") or "")
+        ):
+            _out(line)
+    if block.get("configured") and not block.get("reachable"):
+        return EXIT_RUNTIME
+    return EXIT_OK
+
+
 def _with_port(config: Any, port: Optional[int], section: str = "daemon") -> Any:
     """Return a config whose ``section`` port is overridden (frozen dataclasses)."""
     if port is None:
@@ -478,6 +693,62 @@ def _cliproxy_reachable(config: Any) -> Tuple[bool, str]:
     return False, detail or "unreachable"
 
 
+def _dashboard_session_check(config: Any) -> Tuple[bool, str]:
+    """``dashboard session``: the file exists, is ``0600`` and holds only headers.
+
+    A disabled source with no session file is not a failure -- there is nothing
+    to check yet -- but a missing file for an enabled source is.
+    """
+    section = getattr(config, "dashboard", None)
+    enabled = bool(getattr(section, "enabled", False))
+    path = str(getattr(section, "session_file", "") or "")
+    if not path:
+        return False, "dashboard.session_file is not set"
+    try:
+        if not os.path.isfile(path):
+            if not enabled:
+                return True, ""
+            return False, "no session file at %s" % (path,)
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            return False, "mode %04o, expected 0600" % (mode,)
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        if not isinstance(document, dict):
+            return False, "session file is not a JSON object"
+        unexpected = sorted(
+            str(key)
+            for key in document
+            if not isinstance(key, str) or key.strip().lower() not in SESSION_KEYS
+        )
+        if unexpected:
+            # Key *names* only; a value is never read out of the file.
+            return False, "unexpected keys: %s" % (", ".join(unexpected),)
+        return True, ""
+    except (OSError, ValueError) as exc:
+        return False, "cannot read session file (%s)" % (exc.__class__.__name__,)
+    except Exception as exc:  # noqa: BLE001 - a check must never traceback
+        return False, "cannot check session file (%s)" % (exc.__class__.__name__,)
+
+
+def _dashboard_reachable(config: Any) -> Tuple[bool, str]:
+    """``dashboard reachable``: one poll of the dashboard source."""
+    try:
+        snapshot = _dashboard_snapshot(config, None)
+    except Exception as exc:  # noqa: BLE001 - never traceback out of doctor
+        return False, str(exc) or exc.__class__.__name__
+    if not isinstance(snapshot, dict):
+        return False, "no snapshot"
+    if snapshot.get("reachable"):
+        return True, ""
+    error = snapshot.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "error")
+        message = str(error.get("message") or "")
+        return False, (code + (": " + message if message else ""))
+    return False, "unreachable"
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     results: List[bool] = []
 
@@ -491,6 +762,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "daemon port free",
             "proxy port free",
             "cliproxy reachable",
+            "dashboard session",
+            "dashboard reachable",
         ):
             results.append(_check(name, False, "not checked (no config)")[1])
         return EXIT_RUNTIME
@@ -529,6 +802,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if bool(getattr(cliproxy_cfg, "enabled", False)):
         ok, detail = _cliproxy_reachable(config)
         results.append(_check("cliproxy reachable", ok, detail)[1])
+
+    dashboard_cfg = getattr(config, "dashboard", None)
+    try:
+        ok, detail = _dashboard_session_check(config)
+    except Exception as exc:  # noqa: BLE001 - a check must never traceback
+        ok, detail = False, str(exc) or exc.__class__.__name__
+    results.append(_check("dashboard session", ok, detail)[1])
+
+    if bool(getattr(dashboard_cfg, "enabled", False)):
+        try:
+            ok, detail = _dashboard_reachable(config)
+        except Exception as exc:  # noqa: BLE001 - a check must never traceback
+            ok, detail = False, str(exc) or exc.__class__.__name__
+        results.append(_check("dashboard reachable", ok, detail)[1])
 
     return EXIT_OK if all(results) else EXIT_RUNTIME
 
@@ -581,6 +868,26 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--config", default=None, metavar="PATH")
     proxy.add_argument("--port", type=int, default=None, metavar="N")
     proxy.set_defaults(func=cmd_proxy)
+
+    session = subparsers.add_parser("session", help="manage the dashboard session")
+    session_sub = session.add_subparsers(dest="session_command", metavar="command")
+
+    session_set = session_sub.add_parser("set", help="write the dashboard session file")
+    source = session_set.add_mutually_exclusive_group(required=True)
+    source.add_argument("--cookie", default=None, metavar="VALUE")
+    source.add_argument("--cookie-file", default=None, dest="cookie_file", metavar="PATH")
+    session_set.add_argument("--authorization", default=None, metavar="VALUE")
+    session_set.add_argument("--config", default=None, metavar="PATH")
+    session_set.set_defaults(func=cmd_session_set)
+
+    session_show = session_sub.add_parser("show", help="show the session file state")
+    session_show.add_argument("--config", default=None, metavar="PATH")
+    session_show.set_defaults(func=cmd_session_show)
+
+    dashboard = subparsers.add_parser("dashboard", help="print the dashboard snapshot")
+    dashboard.add_argument("--config", default=None, metavar="PATH")
+    dashboard.add_argument("--json", action="store_true", dest="json")
+    dashboard.set_defaults(func=cmd_dashboard)
 
     doctor = subparsers.add_parser("doctor", help="check the installation")
     doctor.add_argument("--config", default=None, metavar="PATH")

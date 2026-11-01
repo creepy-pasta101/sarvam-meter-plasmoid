@@ -50,9 +50,24 @@ EXPECTED_DEFAULT = {
         "include_api_key_usage": False,
         "allow_remote": False,
     },
+    "dashboard": {
+        "enabled": False,
+        "base_url": "https://indus.sarvam.ai",
+        "session_file": "~/.config/sarvam-meter/session.json",
+        "poll_seconds": 300,
+        "product": "sarvam-api-platform",
+    },
 }
 
-TOP_LEVEL_ORDER = ["version", "db_path", "daemon", "proxy", "sarvam", "cliproxy"]
+TOP_LEVEL_ORDER = [
+    "version",
+    "db_path",
+    "daemon",
+    "proxy",
+    "sarvam",
+    "cliproxy",
+    "dashboard",
+]
 
 
 class ConfigTestBase(unittest.TestCase):
@@ -145,6 +160,12 @@ class WriteDefaultConfigTests(ConfigTestBase):
         self.assertEqual(config.sarvam.currency, "INR")
         self.assertIsNone(config.sarvam.starting_balance)
         self.assertEqual(config.cliproxy.api_version, "v8")
+        self.assertFalse(config.dashboard.enabled)
+        self.assertEqual(config.dashboard.base_url, "https://indus.sarvam.ai")
+        self.assertEqual(config.dashboard.poll_seconds, 300)
+        self.assertEqual(config.dashboard.product, "sarvam-api-platform")
+        self.assertNotIn("~", config.dashboard.session_file)
+        self.assertTrue(config.dashboard.session_file.endswith("session.json"))
 
     def test_overwrites_existing_file(self):
         target = os.path.join(self.tmpdir, "config.json")
@@ -342,6 +363,111 @@ class UrlValidationTests(ConfigTestBase):
             self.assertTrue(is_loopback_host(host), host)
         for host in ("api.sarvam.ai", "10.0.0.1", "8.8.8.8", "", None):
             self.assertFalse(is_loopback_host(host), host)
+
+
+class DashboardSectionTests(ConfigTestBase):
+    """SPEC 17.4: the dashboard section, its defaults and its validation."""
+
+    def test_defaults(self):
+        dashboard = self.load_document({}).dashboard
+        self.assertFalse(dashboard.enabled)
+        self.assertEqual(dashboard.base_url, "https://indus.sarvam.ai")
+        self.assertEqual(dashboard.poll_seconds, 300)
+        self.assertEqual(dashboard.product, "sarvam-api-platform")
+        self.assertTrue(dashboard.session_file.endswith("sarvam-meter/session.json"))
+
+    def test_base_url_must_be_https(self):
+        for bad in (
+            "http://indus.sarvam.ai",
+            "ftp://indus.sarvam.ai",
+            "indus.sarvam.ai",
+            "https://",
+        ):
+            self.assert_config_error({"dashboard": {"base_url": bad}}, "dashboard.base_url")
+
+    def test_base_url_rejects_userinfo(self):
+        for bad in (
+            "https://user:secret@indus.sarvam.ai",
+            "https://user@indus.sarvam.ai",
+        ):
+            error = self.assert_config_error(
+                {"dashboard": {"base_url": bad}}, "dashboard.base_url"
+            )
+            self.assertIn("credentials", str(error))
+            self.assertNotIn("secret", str(error))
+
+    def test_remote_host_is_accepted_without_allow_remote(self):
+        # The dashboard is remote by design: the loopback guard must not apply.
+        for url in ("https://indus.sarvam.ai", "https://dashboard.sarvam.ai"):
+            self.assertEqual(
+                self.load_document({"dashboard": {"base_url": url}}).dashboard.base_url,
+                url,
+            )
+
+    def test_https_loopback_is_also_accepted(self):
+        self.assertEqual(
+            self.load_document(
+                {"dashboard": {"base_url": "https://127.0.0.1:9443"}}
+            ).dashboard.base_url,
+            "https://127.0.0.1:9443",
+        )
+
+    def test_poll_seconds_minimum(self):
+        self.assert_config_error({"dashboard": {"poll_seconds": 59}}, "dashboard.poll_seconds")
+        self.assertEqual(
+            self.load_document(
+                {"dashboard": {"poll_seconds": 60}}
+            ).dashboard.poll_seconds,
+            60,
+        )
+        self.assert_config_error({"dashboard": {"poll_seconds": "300"}}, "dashboard.poll_seconds")
+
+    def test_product_must_be_a_non_empty_string(self):
+        self.assert_config_error({"dashboard": {"product": ""}}, "dashboard.product")
+        self.assert_config_error({"dashboard": {"product": 7}}, "dashboard.product")
+        self.assertEqual(
+            self.load_document({"dashboard": {"product": "other-product"}}).dashboard.product,
+            "other-product",
+        )
+
+    def test_session_file_is_tilde_expanded(self):
+        config = self.load_document({"dashboard": {"session_file": "~/sarvam/session.json"}})
+        self.assertNotIn("~", config.dashboard.session_file)
+        self.assertTrue(config.dashboard.session_file.endswith("sarvam/session.json"))
+        self.assert_config_error({"dashboard": {"session_file": ""}}, "dashboard.session_file")
+
+    def test_enabled_must_be_boolean(self):
+        self.assert_config_error({"dashboard": {"enabled": "yes"}}, "dashboard.enabled")
+        self.assertTrue(
+            self.load_document({"dashboard": {"enabled": True}}).dashboard.enabled
+        )
+
+
+class PackagedExampleTests(unittest.TestCase):
+    """``packaging/config.example.json`` is shipped documentation of the defaults."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.path = os.path.join(os.path.dirname(here), "packaging", "config.example.json")
+
+    def test_example_file_exists(self):
+        self.assertTrue(os.path.isfile(self.path), self.path)
+
+    def test_example_equals_the_default_document(self):
+        with open(self.path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document, default_config_dict())
+
+    def test_example_keeps_the_key_order(self):
+        with open(self.path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        document = json.loads(text)
+        self.assertEqual(list(document.keys()), list(default_config_dict().keys()))
+
+    def test_example_loads_as_a_valid_config(self):
+        config = load_config(self.path)
+        self.assertFalse(config.dashboard.enabled)
+        self.assertEqual(config.dashboard.base_url, "https://indus.sarvam.ai")
 
 
 class SecretOverrideTests(ConfigTestBase):

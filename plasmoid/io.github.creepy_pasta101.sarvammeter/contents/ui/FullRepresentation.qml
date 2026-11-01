@@ -2,10 +2,16 @@
 //
 // Sarvam Meter - full (popup) representation.
 //
-// ScrollView > ColumnLayout with three parts (SPEC.md section 13):
+// ScrollView > ColumnLayout with three parts (SPEC.md section 13, extended by
+// section 17.7):
 //   (a) Sarvam section  - remaining balance, or a "spend only" presentation when
-//                         balance.known is false, today/month spend, calls, and a
-//                         Bar per entry of the top 3 by_api entries.
+//                         balance.known is false, today/month spend with a muted
+//                         source hint ("dashboard" or "local meter"), calls, a
+//                         Bar per entry of the top 3 by_api entries, and - when
+//                         the dashboard snapshot is reachable - up to three
+//                         by_model rows with a Bar scaled against the largest of
+//                         them, plus one muted `dashboard: <code>` line when the
+//                         dashboard reported an error.
 //   (b) CLIProxyAPI     - one block per account, one Bar per bucket with the
 //                         window label, remaining fraction and reset time;
 //                         the literal text "unknown" when remaining_fraction is
@@ -13,7 +19,10 @@
 //   (c) footer          - generated_at plus the offline/stale notice.
 //
 // Everything is read through the `meter` model property and every access is
-// guarded, so a partial payload renders instead of throwing.
+// guarded, so a partial payload renders instead of throwing.  The dashboard rows
+// and the source hint are schema-2 additions (SPEC.md section 17.5); a schema-1
+// payload from an older daemon has none of them and simply renders the ledger
+// presentation, with no "undefined" text anywhere.
 
 import QtQuick
 import QtQuick.Controls
@@ -40,6 +49,13 @@ Item {
     readonly property string callsLine: hasMeter ? meter.callsLine : ""
     readonly property string footerText: hasMeter ? meter.footerText : ""
     readonly property string errorText: hasMeter ? meter.errorSummary : ""
+
+    // ---- schema 2: dashboard source (SPEC.md section 17.7) --------------
+    readonly property string spendSourceHint: hasMeter ? meter.spendSourceHint : ""
+    readonly property bool dashboardReachable: hasMeter ? meter.dashboardReachable : false
+    readonly property var dashboardModels: hasMeter ? meter.topModels : []
+    readonly property real dashboardMaxCost: hasMeter ? meter.topModelMaxCost : 0
+    readonly property string dashboardErrorLine: hasMeter ? meter.dashboardErrorLine : ""
 
     readonly property bool hasData: hasMeter ? meter.hasPayload : false
     readonly property bool offline: hasMeter ? meter.offline : false
@@ -149,11 +165,27 @@ Item {
                 elide: Text.ElideRight
             }
 
-            PlasmaComponents3.Label {
+            // Spend line plus the small muted source hint: "dashboard" when the
+            // figure came from the org-wide dashboard snapshot, "local meter"
+            // when it came from this machine's ledger.
+            RowLayout {
                 Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
                 visible: fullRoot.hasData
-                text: fullRoot.spendLine
-                elide: Text.ElideRight
+
+                PlasmaComponents3.Label {
+                    Layout.fillWidth: true
+                    text: fullRoot.spendLine
+                    elide: Text.ElideRight
+                }
+
+                PlasmaComponents3.Label {
+                    text: fullRoot.spendSourceHint
+                    visible: fullRoot.spendSourceHint.length > 0
+                    font: Kirigami.Theme.smallFont
+                    color: Kirigami.Theme.neutralTextColor
+                    opacity: 0.7
+                }
             }
 
             PlasmaComponents3.Label {
@@ -243,6 +275,92 @@ Item {
                         }
                     }
                 }
+            }
+
+            // ---- dashboard by_model rows (schema 2) ------------------
+            // Only when the snapshot is reachable, and only for the entries the
+            // daemon sent (up to three).  Each Bar is scaled against the largest
+            // cost in this list; a missing or zero maximum yields a zero bar.
+            ColumnLayout {
+                id: dashboardBreakdown
+                Layout.fillWidth: true
+                Layout.topMargin: Kirigami.Units.smallSpacing
+                spacing: Math.round(Kirigami.Units.smallSpacing / 2)
+                visible: fullRoot.hasData && fullRoot.dashboardReachable
+                         && fullRoot.dashboardModels.length > 0
+
+                PlasmaComponents3.Label {
+                    Layout.fillWidth: true
+                    text: "By model (dashboard)"
+                    font: Kirigami.Theme.smallFont
+                    color: Kirigami.Theme.neutralTextColor
+                    opacity: 0.7
+                    elide: Text.ElideRight
+                }
+
+                Repeater {
+                    model: fullRoot.dashboardModels
+
+                    delegate: ColumnLayout {
+                        id: modelRow
+
+                        readonly property string modelName: fullRoot.textOf(
+                            fullRoot.field(modelData, "model"), "unknown model")
+                        readonly property real modelCost: fullRoot.numberOr(
+                            fullRoot.field(modelData, "cost"), NaN)
+                        // Guarded share: no division by zero, no NaN, no bar that
+                        // reads as full when the scale is unknown.
+                        readonly property real share: {
+                            var largest = fullRoot.dashboardMaxCost;
+                            if (!(largest > 0))
+                                return 0;
+                            if (!isFinite(modelRow.modelCost) || modelRow.modelCost <= 0)
+                                return 0;
+                            return Math.max(0, Math.min(1, modelRow.modelCost / largest));
+                        }
+
+                        Layout.fillWidth: true
+                        spacing: Math.round(Kirigami.Units.smallSpacing / 2)
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Kirigami.Units.smallSpacing
+
+                            PlasmaComponents3.Label {
+                                Layout.fillWidth: true
+                                text: modelRow.modelName
+                                font: Kirigami.Theme.smallFont
+                                elide: Text.ElideRight
+                            }
+
+                            PlasmaComponents3.Label {
+                                text: isFinite(modelRow.modelCost)
+                                    ? fullRoot.money(modelRow.modelCost)
+                                    : "\u2014"
+                                font: Kirigami.Theme.smallFont
+                            }
+                        }
+
+                        Bar {
+                            Layout.fillWidth: true
+                            fraction: modelRow.share
+                            fillColor: Kirigami.Theme.highlightColor
+                        }
+                    }
+                }
+            }
+
+            // One muted line for a dashboard error.  Only the code is shown: a
+            // message could quote the upstream response, so it never reaches the
+            // UI.
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: fullRoot.dashboardErrorLine.length > 0
+                text: fullRoot.dashboardErrorLine
+                font: Kirigami.Theme.smallFont
+                color: Kirigami.Theme.neutralTextColor
+                opacity: 0.7
+                elide: Text.ElideRight
             }
 
             // ==============================================================

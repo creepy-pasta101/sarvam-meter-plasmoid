@@ -31,6 +31,34 @@ The second source is different, and it is real: CLIProxyAPI's management API
 exposes actual quota for the OAuth accounts it proxies, and the widget shows the
 remaining fraction per quota window per account.
 
+### The dashboard source (optional)
+
+The third source reads the numbers Sarvam's own dashboard shows, using a session
+you capture once from your browser. It adds what local metering structurally
+cannot know: the **authoritative, org-wide spend** — every call from every machine
+and every client, not just the traffic that happened to go through this proxy —
+plus the per-model cost breakdown for the window, and a balance derived from the
+dashboard's spend since the date you set your starting balance.
+
+It is opt-in, because it is honest about what it is: an unsupported internal
+endpoint behind Cloudflare bot management, reached with a session cookie that
+expires and that only you can renew. It polls every five minutes by default, it is
+read-only, and when it cannot reach the dashboard the widget says so on one muted
+line (`dashboard: unauthorized`, `dashboard: no_session`, and so on) and keeps
+showing the ledger numbers.
+
+To enable it: capture the cookie from a signed-in `https://indus.sarvam.ai`,
+`sarvam-meter session set --cookie-file <file>` (written `0600`), then set
+`"dashboard": {"enabled": true}` in the config and restart the daemon. Details:
+[docs/dashboard-scrape.md](docs/dashboard-scrape.md) and
+[docs/configuration.md](docs/configuration.md#dashboard).
+
+**Local metering remains the fallback and is never switched off.** The dashboard
+does not replace the recording proxy: it cannot see individual calls, it cannot
+price a request, and it stops working the day Sarvam changes a private endpoint or
+your session lapses. When it works, the widget labels the spend line `dashboard`;
+when it does not, the label reads `local meter` and nothing else changes.
+
 ## Features
 
 - Remaining Sarvam balance, spend today, spend this month, call count, from the
@@ -45,6 +73,9 @@ remaining fraction per quota window per account.
 - Flags calls it could not measure instead of silently reporting them as free.
 - CLIProxyAPI quota per OAuth account: remaining fraction per window, reset time,
   plan, plus a worst-account summary for the compact view.
+- Optional dashboard source: authoritative org-wide spend, spend today and the top
+  models by cost, with the widget showing which source each figure came from and
+  falling back to the ledger when the dashboard is unreachable.
 - Plasma 6.7 and 6.8 compatible QML, compact and full representations.
 - Python standard library only, no runtime dependencies; Python 3.9+.
 - Loopback-only binds, secret redaction, and an SSRF guard on remote URLs.
@@ -72,7 +103,8 @@ Two servers, two ports, one config file.
 
 - The **widget** does no network work beyond `GET` on the local daemon.
 - The **daemon** serves the status JSON, caches the CLIProxyAPI snapshot, and
-  re-polls it in a background thread.
+  re-polls it in a background thread. When the optional dashboard source is
+  enabled it caches that snapshot too, with a TTL of `dashboard.poll_seconds`.
 - The **proxy** is off by default. Nothing is metered until you enable it and
   point a client at it.
 
@@ -179,6 +211,8 @@ CLIProxyAPI is the only other integration to configure: enable it, set
 | `quota_exhausted` is true and the compact view shows `!` | Upstream returned `402`. Sarvam is refusing calls for lack of credits; the timestamp is kept in `quota_exhausted_at`. This is not the same as a `429`, which only increments `rate_limits.count_24h` and does not mark the account exhausted. |
 | Spend does not move after a chat call | The response carried no `usage` object (and the stream carried no usage chunk). The call is recorded with `estimated = 1`, `quantity = null`, `cost = 0` and counted in `untracked_calls`. When you stream, the stream itself must carry a usage chunk for the tokens to be counted. |
 | STT calls never reduce the balance | The uploaded audio duration could not be parsed, so the call is untracked in the same way. Duration is derived from WAV, FLAC, OGG, MP3 and MP4/M4A payloads only; anything else (or a malformed file) yields no measurement. |
+| The full view shows `dashboard: unauthorized` (or `no_session`) | The captured dashboard session expired or is missing. Re-capture the cookie from a signed-in browser and run `sarvam-meter session set --cookie-file <file>`; until then the widget shows ledger numbers, labelled `local meter`. `sarvam-meter doctor` reports the session file's mode and which headers are present. |
+| `dashboard: unreachable` or `dashboard: bad_response` | The dashboard did not answer, or answered with something that is not its usual JSON (a Cloudflare challenge, or a changed endpoint). Nothing to fix locally: the widget keeps the last good dashboard snapshot and falls back to the ledger on the next one. Raise `dashboard.poll_seconds` if it happens often. |
 | CLIProxyAPI section shows an error | `unauthorized` (401/403) means the management key is wrong or missing; `endpoint_missing` (404) means the configured `api_version` does not match the server; a per-account `no quota provider` (501) means that account has no quota provider behind it. All are non-fatal and appear in `errors`. |
 | Everything is zero but traffic works | The client is not going through the proxy. Only requests to `127.0.0.1:8788` are metered. |
 
@@ -194,10 +228,12 @@ CLIProxyAPI is the only other integration to configure: enable it, set
   add a rate override (see [docs/configuration.md](docs/configuration.md)).
 - **Sarvam's own view of your balance.** If you top up, change plan, or spend
   outside this machine, re-run `sarvam-meter balance set <amount>` with the number
-  the dashboard shows.
+  the dashboard shows — unless the dashboard source is enabled and reachable, in
+  which case the spend side of that figure comes from the dashboard itself.
 
 The ledger is a measurement tool, not a billing record. Sarvam's dashboard is the
-authority.
+authority, and with the optional dashboard source enabled the widget reads it
+directly; without it, the ledger is the best estimate this machine can make.
 
 ## Documentation
 
@@ -207,8 +243,10 @@ authority.
   overrides, validation, rate overrides, widget settings.
 - [docs/cliproxyapi.md](docs/cliproxyapi.md) — the CLIProxyAPI adapter and its
   endpoints.
-- [docs/edge-cases.md](docs/edge-cases.md) — the 22 contractual edge cases and
-  where each is handled.
+- [docs/dashboard-scrape.md](docs/dashboard-scrape.md) — the optional dashboard
+  source: the captured endpoints, the session file, and the caveats.
+- [docs/edge-cases.md](docs/edge-cases.md) — the 22 contractual edge cases, the
+  dashboard cases added by §17, and where each is handled.
 - [SPEC.md](SPEC.md) — the contract the implementation is written against.
 
 ## Licence

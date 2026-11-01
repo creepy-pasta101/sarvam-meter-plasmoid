@@ -1,0 +1,899 @@
+{
+  "available_granularities": [
+    "hour",
+    "3hour",
+    "6hour",
+    "12hour",
+    "day",
+    "week",
+    "month"
+  ],
+  "currency": "inr",
+  "granularity": "hour",
+  "group_by": [
+    "product"
+  ],
+  "groups": [
+    {
+      "currency": "inr",
+      "meter_count": 8,
+      "points": [
+        {
+          "event_count": 6,
+          "subtotal": "0.2213968021",
+          "timestamp": "2026-10-16T13:00:00Z",
+          "total_cost": "0.2213968021",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "27.1098125",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 2,
+          "subtotal": "0.1324087188",
+          "timestamp": "2026-10-17T09:00:00Z",
+          "total_cost": "0.1324087188",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "16.2133125",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 26,
+          "subtotal": "6.63813",
+          "timestamp": "2026-10-21T06:00:00Z",
+          "total_cost": "6.63813",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "420942",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "5400",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "426342",
+              "unit": "token"
+            }
+          ]
+        },
+        {
+          "event_count": 5,
+          "subtotal": "0.147",
+          "timestamp": "2026-10-26T13:00:00Z",
+          "total_cost": "0.147",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "18",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 1,
+          "subtotal": "0.0326666667",
+          "timestamp": "2026-10-26T14:00:00Z",
+          "total_cost": "0.0326666667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "4",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 1,
+          "subtotal": "0.0816666667",
+          "timestamp": "2026-10-27T16:00:00Z",
+          "total_cost": "0.0816666667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "10",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 11,
+          "subtotal": "2.0498333334",
+          "timestamp": "2026-10-28T15:00:00Z",
+          "total_cost": "2.0498333334",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "251",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 34,
+          "subtotal": "6.1495000003",
+          "timestamp": "2026-10-28T16:00:00Z",
+          "total_cost": "6.1495000003",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "753",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 14,
+          "subtotal": "2.7440000001",
+          "timestamp": "2026-10-29T12:00:00Z",
+          "total_cost": "2.7440000001",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "336",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 13,
+          "subtotal": "1.8865000001",
+          "timestamp": "2026-10-29T13:00:00Z",
+          "total_cost": "1.8865000001",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "231",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 5,
+          "subtotal": "0.651941",
+          "timestamp": "2026-10-30T13:00:00Z",
+          "total_cost": "0.651941",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "22076",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "787",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "22863",
+              "unit": "token"
+            },
+            {
+              "quantity": "39",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 9,
+          "subtotal": "0.2776666667",
+          "timestamp": "2026-10-30T14:00:00Z",
+          "total_cost": "0.2776666667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "34",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 6,
+          "subtotal": "0.2041666667",
+          "timestamp": "2026-10-30T15:00:00Z",
+          "total_cost": "0.2041666667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "25",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 12,
+          "subtotal": "0.4978365",
+          "timestamp": "2026-10-30T16:00:00Z",
+          "total_cost": "0.4978365",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "17664",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "25389",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "2465",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "45518",
+              "unit": "token"
+            }
+          ]
+        },
+        {
+          "event_count": 18,
+          "subtotal": "0.764775",
+          "timestamp": "2026-10-30T17:00:00Z",
+          "total_cost": "0.764775",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "105984",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "29430",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "2278",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "137692",
+              "unit": "token"
+            }
+          ]
+        },
+        {
+          "event_count": 8,
+          "subtotal": "0.147873",
+          "timestamp": "2026-10-31T03:00:00Z",
+          "total_cost": "0.147873",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "28",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "11",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "39",
+              "unit": "token"
+            },
+            {
+              "quantity": "18",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 98,
+          "subtotal": "11.367437667",
+          "timestamp": "2026-10-31T06:00:00Z",
+          "total_cost": "11.367437667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "459264",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "112526",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "29278",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "601068",
+              "unit": "token"
+            },
+            {
+              "quantity": "904",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 94,
+          "subtotal": "14.7624268339",
+          "timestamp": "2026-10-31T07:00:00Z",
+          "total_cost": "14.7624268339",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "238464",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "50361",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "16768",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "305593",
+              "unit": "token"
+            },
+            {
+              "quantity": "1559",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 12,
+          "subtotal": "2.1533263334",
+          "timestamp": "2026-10-31T08:00:00Z",
+          "total_cost": "2.1533263334",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "52992",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "9848",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "757",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "63597",
+              "unit": "token"
+            },
+            {
+              "quantity": "227",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 100,
+          "subtotal": "14.4439728338",
+          "timestamp": "2026-10-31T09:00:00Z",
+          "total_cost": "14.4439728338",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "211968",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "95817",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "16582",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "324367",
+              "unit": "token"
+            },
+            {
+              "quantity": "1454",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 2,
+          "subtotal": "0.3348333333",
+          "timestamp": "2026-10-31T10:00:00Z",
+          "total_cost": "0.3348333333",
+          "total_discount": "0",
+          "usage": [
+            {
+              "quantity": "41",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 9,
+          "subtotal": "0.8628281667",
+          "timestamp": "2026-10-31T12:00:00Z",
+          "total_cost": "0.8628281667",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "21469",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "574",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "22043",
+              "unit": "token"
+            },
+            {
+              "quantity": "67",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 74,
+          "subtotal": "10.7978033337",
+          "timestamp": "2026-10-31T13:00:00Z",
+          "total_cost": "10.7978033337",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "114816",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "57790",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "10617",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "183223",
+              "unit": "token"
+            },
+            {
+              "quantity": "1133",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 66,
+          "subtotal": "9.7135070003",
+          "timestamp": "2026-10-31T15:00:00Z",
+          "total_cost": "9.7135070003",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "123648",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "43772",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "7477",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "174897",
+              "unit": "token"
+            },
+            {
+              "quantity": "1038",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 199,
+          "subtotal": "32.2421355",
+          "timestamp": "2026-11-01T02:00:00Z",
+          "total_cost": "32.2421355",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "7948800",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "529663",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "115993",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "8594456",
+              "unit": "token"
+            }
+          ]
+        },
+        {
+          "event_count": 27,
+          "subtotal": "6.9557265",
+          "timestamp": "2026-11-01T03:00:00Z",
+          "total_cost": "6.9557265",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "1960704",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "70869",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "24383",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "2055956",
+              "unit": "token"
+            }
+          ]
+        },
+        {
+          "event_count": 27,
+          "subtotal": "4.3014778335",
+          "timestamp": "2026-11-01T04:00:00Z",
+          "total_cost": "4.3014778335",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "26496",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "21787",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "2284",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "50567",
+              "unit": "token"
+            },
+            {
+              "quantity": "470",
+              "unit": "second"
+            }
+          ]
+        },
+        {
+          "event_count": 21,
+          "subtotal": "3.6683948335",
+          "timestamp": "2026-11-01T05:00:00Z",
+          "total_cost": "3.6683948335",
+          "total_discount": "0",
+          "usage": [
+            {
+              "breakdown": [
+                {
+                  "quantity": "35328",
+                  "unit": "cached_token"
+                },
+                {
+                  "quantity": "2079",
+                  "unit": "input_token"
+                },
+                {
+                  "quantity": "715",
+                  "unit": "output_token"
+                }
+              ],
+              "quantity": "38122",
+              "unit": "token"
+            },
+            {
+              "quantity": "431",
+              "unit": "second"
+            }
+          ]
+        }
+      ],
+      "product": "sarvam-api-platform",
+      "subtotal": "134.2312311907",
+      "total_cost": "134.2312311907",
+      "total_discount": "0",
+      "usage": [
+        {
+          "breakdown": [
+            {
+              "quantity": "11296128",
+              "unit": "cached_token"
+            },
+            {
+              "quantity": "1513846",
+              "unit": "input_token"
+            },
+            {
+              "quantity": "236369",
+              "unit": "output_token"
+            }
+          ],
+          "quantity": "13046343",
+          "unit": "token"
+        },
+        {
+          "quantity": "9086.323125",
+          "unit": "second"
+        }
+      ]
+    }
+  ],
+  "org_id": "019f37be-0185-7fcb-9063-5392bd2f4e63",
+  "points": [
+    {
+      "event_count": 6,
+      "subtotal": "0.2213968021",
+      "timestamp": "2026-10-16T13:00:00Z",
+      "total_cost": "0.2213968021",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 2,
+      "subtotal": "0.1324087188",
+      "timestamp": "2026-10-17T09:00:00Z",
+      "total_cost": "0.1324087188",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 26,
+      "subtotal": "6.63813",
+      "timestamp": "2026-10-21T06:00:00Z",
+      "total_cost": "6.63813",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 5,
+      "subtotal": "0.147",
+      "timestamp": "2026-10-26T13:00:00Z",
+      "total_cost": "0.147",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 1,
+      "subtotal": "0.0326666667",
+      "timestamp": "2026-10-26T14:00:00Z",
+      "total_cost": "0.0326666667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 1,
+      "subtotal": "0.0816666667",
+      "timestamp": "2026-10-27T16:00:00Z",
+      "total_cost": "0.0816666667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 11,
+      "subtotal": "2.0498333334",
+      "timestamp": "2026-10-28T15:00:00Z",
+      "total_cost": "2.0498333334",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 34,
+      "subtotal": "6.1495000003",
+      "timestamp": "2026-10-28T16:00:00Z",
+      "total_cost": "6.1495000003",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 14,
+      "subtotal": "2.7440000001",
+      "timestamp": "2026-10-29T12:00:00Z",
+      "total_cost": "2.7440000001",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 13,
+      "subtotal": "1.8865000001",
+      "timestamp": "2026-10-29T13:00:00Z",
+      "total_cost": "1.8865000001",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 5,
+      "subtotal": "0.651941",
+      "timestamp": "2026-10-30T13:00:00Z",
+      "total_cost": "0.651941",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 9,
+      "subtotal": "0.2776666667",
+      "timestamp": "2026-10-30T14:00:00Z",
+      "total_cost": "0.2776666667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 6,
+      "subtotal": "0.2041666667",
+      "timestamp": "2026-10-30T15:00:00Z",
+      "total_cost": "0.2041666667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 12,
+      "subtotal": "0.4978365",
+      "timestamp": "2026-10-30T16:00:00Z",
+      "total_cost": "0.4978365",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 18,
+      "subtotal": "0.764775",
+      "timestamp": "2026-10-30T17:00:00Z",
+      "total_cost": "0.764775",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 8,
+      "subtotal": "0.147873",
+      "timestamp": "2026-10-31T03:00:00Z",
+      "total_cost": "0.147873",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 98,
+      "subtotal": "11.367437667",
+      "timestamp": "2026-10-31T06:00:00Z",
+      "total_cost": "11.367437667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 94,
+      "subtotal": "14.7624268339",
+      "timestamp": "2026-10-31T07:00:00Z",
+      "total_cost": "14.7624268339",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 12,
+      "subtotal": "2.1533263334",
+      "timestamp": "2026-10-31T08:00:00Z",
+      "total_cost": "2.1533263334",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 100,
+      "subtotal": "14.4439728338",
+      "timestamp": "2026-10-31T09:00:00Z",
+      "total_cost": "14.4439728338",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 2,
+      "subtotal": "0.3348333333",
+      "timestamp": "2026-10-31T10:00:00Z",
+      "total_cost": "0.3348333333",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 9,
+      "subtotal": "0.8628281667",
+      "timestamp": "2026-10-31T12:00:00Z",
+      "total_cost": "0.8628281667",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 74,
+      "subtotal": "10.7978033337",
+      "timestamp": "2026-10-31T13:00:00Z",
+      "total_cost": "10.7978033337",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 66,
+      "subtotal": "9.7135070003",
+      "timestamp": "2026-10-31T15:00:00Z",
+      "total_cost": "9.7135070003",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 199,
+      "subtotal": "32.2421355",
+      "timestamp": "2026-11-01T02:00:00Z",
+      "total_cost": "32.2421355",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 27,
+      "subtotal": "6.9557265",
+      "timestamp": "2026-11-01T03:00:00Z",
+      "total_cost": "6.9557265",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 27,
+      "subtotal": "4.3014778335",
+      "timestamp": "2026-11-01T04:00:00Z",
+      "total_cost": "4.3014778335",
+      "total_discount": "0"
+    },
+    {
+      "event_count": 21,
+      "subtotal": "3.6683948335",
+      "timestamp": "2026-11-01T05:00:00Z",
+      "total_cost": "3.6683948335",
+      "total_discount": "0"
+    }
+  ],
+  "range": {
+    "end": "2026-11-01T18:29:59Z",
+    "start": "2026-10-02T18:30:00Z"
+  },
+  "subtotal": "134.2312311907",
+  "total_cost": "134.2312311907",
+  "total_discount": "0",
+  "total_org_cost": "134.2312311905",
+  "usage": [
+    {
+      "breakdown": [
+        {
+          "quantity": "11296128",
+          "unit": "cached_token"
+        },
+        {
+          "quantity": "1513846",
+          "unit": "input_token"
+        },
+        {
+          "quantity": "236369",
+          "unit": "output_token"
+        }
+      ],
+      "quantity": "13046343",
+      "unit": "token"
+    },
+    {
+      "quantity": "9086.323125",
+      "unit": "second"
+    }
+  ]
+}

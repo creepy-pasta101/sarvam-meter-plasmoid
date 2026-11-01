@@ -9,7 +9,11 @@
 //
 // Defensive-parsing contract: the payload may be missing keys, contain nulls or
 // arrive malformed.  Every access below goes through a typeof/null guard, so a
-// bad payload can never throw a TypeError into the QML engine.
+// bad payload can never throw a TypeError into the QML engine.  That includes the
+// schema-2 dashboard additions (SPEC.md sections 17.5 and 17.7): a schema-1
+// payload from an older daemon carries no `sarvam.dashboard` and no
+// `spend.source`, and both degrade silently to the ledger presentation instead of
+// rendering "undefined".
 
 import QtQuick
 import org.kde.plasma.plasmoid
@@ -281,6 +285,14 @@ PlasmoidItem {
         return (typeof c === "object" && c !== null) ? c : {};
     }
 
+    // Schema 2: the dashboard snapshot.  Always present from a schema-2 daemon
+    // (`configured: false` when disabled); absent entirely from a schema-1
+    // payload, where this falls back to {} and every read below stays quiet.
+    readonly property var dashboardObject: {
+        var d = root.sarvamObject.dashboard;
+        return (typeof d === "object" && d !== null) ? d : {};
+    }
+
     readonly property var cliproxyObject: {
         if (!root.hasPayload)
             return {};
@@ -300,6 +312,36 @@ PlasmoidItem {
                 out.push(entry);
         }
         return out;
+    }
+
+    // Dashboard per-model spend (schema 2).  Empty for a schema-1 payload, for a
+    // disabled or unreachable dashboard, and for a missing/odd by_model value.
+    readonly property var byModelList: root.asArray(root.dashboardObject.by_model)
+
+    // Top three by_model entries, as given (the daemon sorts cost descending).
+    readonly property var topModels: {
+        var list = root.byModelList;
+        var out = [];
+        for (var i = 0; i < list.length && out.length < 3; i++) {
+            var entry = list[i];
+            if (typeof entry === "object" && entry !== null)
+                out.push(entry);
+        }
+        return out;
+    }
+
+    // The Bar scale for those rows: the largest cost among the rows actually
+    // drawn.  0 means "nothing to scale against", which the delegate renders as a
+    // zero-width bar instead of dividing by zero.
+    readonly property real topModelMaxCost: {
+        var list = root.topModels;
+        var largest = 0;
+        for (var i = 0; i < list.length; i++) {
+            var value = root.numberOr(list[i].cost, 0);
+            if (value > largest)
+                largest = value;
+        }
+        return largest;
     }
 
     readonly property var accountsList: root.asArray(root.cliproxyObject.accounts)
@@ -330,6 +372,53 @@ PlasmoidItem {
     readonly property real remaining: root.numberOr(root.balanceObject.remaining, NaN)
     readonly property real todaySpend: root.numberOr(root.spendObject.today, NaN)
     readonly property real monthSpend: root.numberOr(root.spendObject.month, NaN)
+
+    // Schema 2: which source the balance and spend figures come from.  A schema-1
+    // payload has no `spend.source`, and an older daemon's numbers are ledger
+    // numbers, so the fallback is "ledger" — never an empty or undefined hint.
+    readonly property string spendSource: {
+        var s = root.spendObject.source;
+        if (typeof s === "undefined" || s === null)
+            return "ledger";
+        return String(s) === "dashboard" ? "dashboard" : "ledger";
+    }
+
+    // The small muted hint next to the spend line (SPEC.md section 17.7).
+    readonly property string spendSourceHint: root.spendSource === "dashboard" ? "dashboard" : "local meter"
+
+    readonly property bool dashboardConfigured: root.dashboardObject.configured === true
+    readonly property bool dashboardReachable: root.dashboardObject.reachable === true
+
+    // True only for a non-empty error object.  `error` is null when the last
+    // snapshot was clean, and absent altogether on a schema-1 payload.
+    readonly property bool dashboardHasError: {
+        var e = root.dashboardObject.error;
+        if (typeof e !== "object" || e === null)
+            return false;
+        if (Array.isArray(e))
+            return false;
+        try {
+            return Object.keys(e).length > 0;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    // Only the code is ever shown: the message may quote the upstream response,
+    // so it stays out of the UI entirely.
+    readonly property string dashboardErrorCode: {
+        if (!root.dashboardHasError)
+            return "";
+        var code = root.dashboardObject.error.code;
+        if (typeof code === "string" && code.length > 0)
+            return code;
+        return "error";
+    }
+
+    readonly property string dashboardErrorLine: {
+        var code = root.dashboardErrorCode;
+        return code.length > 0 ? ("dashboard: " + code) : "";
+    }
 
     readonly property int todayCalls: {
         var n = root.numberOr(root.callsObject.today, NaN);

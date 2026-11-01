@@ -1,8 +1,8 @@
 # Edge cases
 
 The 22 cases in SPEC.md §15, with the module that owns each one and what the user
-actually sees. This table is the review artifact: check the named module for the
-named behaviour.
+actually sees, followed by the cases the dashboard source (SPEC.md §17) adds. This
+table is the review artifact: check the named module for the named behaviour.
 
 Reading the columns:
 
@@ -37,11 +37,35 @@ Reading the columns:
 | 21 | "Today" is the local calendar day, "month" is the local calendar month | `sarvam_meter/ledger.py` `local_day_start_iso` / `local_month_start_iso` compute the boundary in local time with `zoneinfo` and return UTC ISO8601 for string comparison against `events.ts`; `sarvam_meter/status.py` uses them for `spend.today`, `spend.month`, `calls.today`, `by_api`. | Spend rolls over at your local midnight, not at UTC midnight, and the month changes on the local 1st — matching the dashboard's calendar. |
 | 22 | Plasma 6.8: no deprecated QML APIs, no `PlasmaCore.Units`, no custom contextual actions | `plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui/*.qml`: `PlasmoidItem` root, `Kirigami.Units` for spacing, Plasma 6 components, `XMLHttpRequest` only (no synchronous XHR), no `PlasmaComponents2`, no contextual actions, `metadata.json` declares `X-Plasma-API-Minimum-Version: 6.0`. | The widget loads and renders on Plasma 6.7 and 6.8 without deprecation warnings and without a migration break. |
 
+## Cases added by the dashboard source (schema 2)
+
+The dashboard source (SPEC.md §17) adds a second Sarvam reader, and with it a new
+class of failure: a source that can be configured, reachable in principle, and
+still return nothing usable. Each case below degrades to the ledger rather than to
+a wrong number. The widget side lives in
+`plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui/main.qml` and
+`FullRepresentation.qml`; the daemon side in `sarvam_meter/dashboard.py`,
+`sarvam_meter/status.py` and `sarvam_meter/daemon.py`.
+
+| case | where it is handled | what the user sees |
+| --- | --- | --- |
+| Session expired: the dashboard answers `401`/`403` | `sarvam_meter/dashboard.py` `snapshot` maps `401`/`403` to `DashboardError(code="unauthorized")` and never raises; `status.py` leaves `sarvam.dashboard.reachable: false` and `spend.source`/`balance.source` at `"ledger"`; QML `dashboardErrorLine` renders the code only. | One muted `dashboard: unauthorized` line in the full representation, and the balance and spend figures are the ledger's, with the hint reading `local meter`. No dialog, no empty widget, and no session value anywhere on screen. |
+| Session file missing or unreadable | `sarvam_meter/dashboard.py` `load_session` raises `DashboardError(code="no_session")`, which `snapshot` records as `error.code`; `sarvam-meter doctor` marks the `dashboard session` check `FAIL`. | `dashboard: no_session` on one muted line, ledger numbers elsewhere, and `doctor` names the file and the reason (missing, wrong mode, unexpected keys) — never a value. |
+| Dashboard unreachable (DNS, TLS, timeout, Cloudflare challenge) | `sarvam_meter/dashboard.py` `snapshot` maps a transport failure to `unreachable` and a challenge or non-JSON body to `bad_response`; the daemon keeps the previous snapshot in its TTL cache and `GET /v1/status` never blocks on the refresh. | The last dashboard numbers stay on screen with their `as_of` time; if there was never a good snapshot, the ledger numbers show with `local meter`. The error line names `unreachable` or `bad_response`, and the daemon does not retry in a tight loop — the next attempt waits for `dashboard.poll_seconds`. |
+| A number in the payload is not numeric (`"53.38x"`, `null`, a number where a string was expected) | `sarvam_meter/dashboard.py` `parse_summary` / `parse_timeseries` raise on a non-numeric string instead of coercing it to `0`, and `snapshot` turns that into `error.code = "bad_response"` with no figures; QML reads every cost through `numberOr(..., NaN)` and renders an em dash rather than `NaN`. | The snapshot is treated as failed, so no partially parsed figure is shown at all — a wrong number is worse than an absent one. The error line reads `dashboard: bad_response`. |
+| An older daemon serves schema 1 (no `sarvam.dashboard`, no `spend.source`) | `plasmoid/.../ui/main.qml`: `dashboardObject` falls back to `{}` when the key is absent, `spendSource` falls back to `"ledger"`, `topModels` and `topModelMaxCost` fall back to `[]`/`0`, and `dashboardHasError` is `false` for a missing `error`. `FullRepresentation.qml` hides the by-model block and the error line. | The widget renders exactly the schema-1 presentation: no by-model rows, no dashboard error line, and the spend hint reads `local meter`. Nothing renders as `undefined`, and no binding throws. |
+| Dashboard reachable but `by_model` is missing, empty, or all costs are `0` | `plasmoid/.../ui/main.qml` `byModelList` / `topModels` (guarded `asArray`, at most three entries) and `topModelMaxCost` (a `0` maximum); `FullRepresentation.qml` delegate `share` returns `0` when the maximum is not `> 0`. | The by-model block is hidden when there is nothing to draw. With zero costs the rows still show an em-dash cost and a zero-width `Bar` — never a divide-by-zero, and never a bar that reads as full. |
+
 ## Notes for reviewers
 
 - Cases 1, 2, 19 and 22 live in the QML and daemon units; cases 3–8, 16, 17, 20
   and 21 in the Python units. This document does not change any of them — it only
   states where the spec says each is handled.
+- The dashboard cases are a separate table because they are not in §15: they come
+  from §17, which was added after 0.1.0. Every one of them ends the same way — the
+  ledger numbers stay on screen and the dashboard's problem is reduced to a single
+  muted line naming an error code. No case in that table shows a figure the daemon
+  did not actually receive.
 - Case 18 has a known gap in the spec: the same guard is described for
   `proxy.upstream_base`, but `ProxyConfig` has no `allow_remote` field and the
   shipped `upstream_base` default is itself non-loopback, so only
