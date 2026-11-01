@@ -189,6 +189,37 @@ class CompactRepresentationTest(unittest.TestCase):
         )
         self.assertIn("import org.kde.plasma.plasmoid", self.compact)
 
+    def test_the_item_asks_for_the_width_its_content_needs(self):
+        # A three-digit balance plus the badge is wider than the default slot;
+        # an item handed less than it needs paints over its neighbour.
+        self.assertRegex(
+            self.compact, r"naturalWidth:\s*Math\.ceil\(valueMetrics\.implicitWidth\)")
+        self.assertRegex(
+            self.compact, r"implicitWidth:\s*Math\.max\([\s\S]{0,160}naturalWidth")
+        # ... but capped, so a silly value cannot eat the panel.
+        self.assertRegex(self.compact, r"maximumCompactWidth")
+        self.assertRegex(self.compact, r"Math\.min\(compactRoot\.maximumCompactWidth")
+
+    def test_the_label_elides_instead_of_overflowing(self):
+        # fillWidth + minimumWidth 0 turns a squeeze into an ellipsis rather
+        # than an overlap.
+        self.assertRegex(self.compact, r"Layout\.fillWidth:\s*true")
+        self.assertRegex(self.compact, r"Layout\.minimumWidth:\s*0")
+        self.assertRegex(self.compact, r"elide:\s*Text\.ElideRight")
+
+    def test_the_badge_cannot_be_squashed(self):
+        self.assertRegex(self.compact, r"Layout\.minimumWidth:\s*compactRoot\.badgeWidth")
+        self.assertRegex(self.compact, r"Layout\.maximumWidth:\s*compactRoot\.badgeWidth")
+
+    def test_the_measurement_has_no_forward_reference(self):
+        # Reading a child id from a property that implicitWidth needs threw
+        # "Cannot read property 'contentWidth' of undefined" while the component
+        # was being built.
+        self.assertIn("id: valueMetrics", self.compact)
+        measure = self.compact.index("id: valueMetrics")
+        first_use = self.compact.index("valueMetrics.implicitWidth")
+        self.assertLess(measure, first_use)
+
     def test_only_the_left_button_is_taken(self):
         # Right-click must still reach the panel for the context menu.
         self.assertRegex(self.compact, r"acceptedButtons:\s*Qt\.LeftButton")

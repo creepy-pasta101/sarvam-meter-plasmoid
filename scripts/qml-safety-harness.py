@@ -16,6 +16,7 @@ that misbehaves in each of the ways a real one can:
   fresh-balance  a valid payload whose balance was updated 10 minutes ago
   old-balance    a valid payload whose balance was updated 2 hours ago
   click          the panel item is clicked (the popup must expand)
+  panel-width    the panel item widens for a long value plus the badge
   refresh        the header's refresh button is pressed (POST /v1/refresh)
   refresh-fail   the daemon refuses /v1/refresh, so the widget falls back to GET
   destroy        the widget is removed while a request is in flight
@@ -346,6 +347,71 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
                 ok = (bool(re.match(r"^balance (2|3)h ago", freshness))
                       and freshness.endswith("not refreshed") and bool(old))
             return ok, "freshness line %r (old=%s)" % (freshness, old), samples
+        if mode == "panel-width":
+            # A three-digit balance plus the offline badge must make the item ask
+            # for more room; if it does not, its children overflow the item and
+            # paint over the neighbouring applet.
+            from PySide6.QtCore import Property, QObject, Signal
+
+            class MeterStub(QObject):
+                valueChanged = Signal()
+                badgeChanged = Signal()
+
+                def __init__(self):
+                    super().__init__()
+                    self._value = ""
+                    self._badge = False
+
+                def _get_value(self):
+                    return self._value
+
+                def _set_value(self, value):
+                    self._value = str(value)
+                    self.valueChanged.emit()
+
+                def _get_badge(self):
+                    return self._badge
+
+                def _set_badge(self, value):
+                    self._badge = bool(value)
+                    self.badgeChanged.emit()
+
+                # A NOTIFY signal is required, or QML reads the value once and
+                # never re-evaluates the binding.
+                compactValue = Property(str, _get_value, _set_value,
+                                        notify=valueChanged)
+                compactWarning = Property(bool, lambda self: False)
+                showBadge = Property(bool, _get_badge, _set_badge,
+                                     notify=badgeChanged)
+
+            compact_component = QQmlComponent(
+                engine, QUrl.fromLocalFile(os.path.join(work_dir, "ui", "CompactRepresentation.qml")))
+            compact = compact_component.create()
+            if compact is None:
+                return False, "compact representation failed: %s" % (
+                    compact_component.errorString(),), samples
+
+            meter = MeterStub()
+            compact.setProperty("meter", meter)
+
+            def width_for(value, badge):
+                meter.compactValue = value
+                meter.showBadge = badge
+                for _ in range(6):
+                    app.processEvents()
+                    time.sleep(0.01)
+                return float(compact.property("implicitWidth") or 0)
+
+            short = width_for("\u20b99", False)
+            long_with_badge = width_for("\u20b91234", True)
+            long_without_badge = width_for("\u20b91234", False)
+            capped = width_for("\u20b9" + "9" * 60, True)
+            maximum = float(compact.property("maximumCompactWidth") or 0)
+
+            ok = (long_with_badge > long_without_badge > short
+                  and maximum > 0 and capped <= maximum + 1)
+            return ok, ("widths short=%.0f long=%.0f long+badge=%.0f capped=%.0f max=%.0f"
+                        % (short, long_without_badge, long_with_badge, capped, maximum)), samples
         if mode == "click":
             # Clicking the panel item must expand the popup: the compact
             # representation owns that gesture, not Plasma.  It is loaded
@@ -417,7 +483,7 @@ def main(argv=None) -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     failures = 0
     modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance",
-             "click", "refresh", "refresh-fail", "destroy")
+             "click", "panel-width", "refresh", "refresh-fail", "destroy")
     for mode in modes:
         ok, detail, samples = run_scenario(mode, args.repo, args.verbose)
         print("%-8s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))

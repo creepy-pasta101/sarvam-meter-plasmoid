@@ -114,4 +114,5 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | QtWebEngine is not installed | `configGeneral.qml` `Loader.status === Loader.Error` | the sheet is replaced by a message naming `qt6-qtwebengine` and the CLI fallback; the rest of the page is untouched |
 | The webview collects no cookies (sign-in failed, or the flow changed) | `SessionCapture.qml` manual fallback | the sheet still accepts a pasted Cookie header, so capture is never a dead end |
 | The user has never captured a session | `POST`/`GET /v1/session`, `dashboard` `no_session` | the widget shows spend only, `doctor` calls it "not configured" and names the command |
+| A three-digit balance plus the offline badge in a panel | `CompactRepresentation.qml` `naturalWidth` | the item asks for the width it needs (measured with a hidden `Text`), capped at 14 grid units; if the panel clamps anyway the number elides instead of painting over the neighbouring applet |
 | The unit is enabled before any config exists | `ExecStartPre=... init --if-missing` | a default config is written at 0600 on first start; an edited one is never overwritten |

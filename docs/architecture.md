@@ -346,6 +346,19 @@ numbers. Both paths go through `startRequest()`, so the timeout, the watchdog,
 the single-flight guard and the size cap apply to the button exactly as they do
 to the timer.
 
+## 4b2. Panel sizing
+
+The compact representation does not let QtQuick size it from a Layout: the panel
+asks the item for its `implicitWidth`. That width is computed from a hidden `Text`
+measuring the value at the theme font, plus the badge slot (only while the badge is
+shown) plus a small padding, capped at 14 grid units. The measuring `Text` is
+declared *before* the properties that read it, because `implicitWidth` is evaluated
+while the component is still being built and a forward reference to a child id
+throws at that point. The label itself gets `Layout.fillWidth: true` and
+`Layout.minimumWidth: 0`, so a panel that clamps the item makes the number elide
+rather than overflow its bounds, and the badge is pinned to its width so it cannot
+be squashed.
+
 ## 4c. Plasmashell safety
 
 The applet is not a separate process: it is QML running on plasmashell's GUI
