@@ -11,7 +11,7 @@
 #   rpmbuild -ba packaging/plasma-applet-sarvam-meter.spec \
 #       --define "_topdir $PWD/rpmbuild" \
 #       --define "_sourcedir $PWD/rpmbuild/SOURCES" \
-#       --define "sarvam_release 1.$(date -u +%Y%m%d%H%M%S).git$(git rev-parse --short HEAD)"
+#       --define "sarvam_release 1.<utc-timestamp>.git<short-sha>"
 #
 # The tarball's single top-level directory is %{name}-%{version}/, which is
 # exactly what the %setup below expects.

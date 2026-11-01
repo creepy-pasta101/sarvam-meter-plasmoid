@@ -126,6 +126,24 @@ class ReleaseMustChangeTest(unittest.TestCase):
         self.assertIn('RELEASE="1.', self.ci)
 
 
+class SpecMacroSafetyTest(unittest.TestCase):
+    """Comments in a spec are still macro-expanded.
+
+    A comment containing `%Y%m%d` (as a shell date snippet does) makes rpmbuild
+    fail with "%S: argument expected", so keep the timestamp out of the prose.
+    """
+
+    def test_no_stray_percent_in_comments(self):
+        spec = read(SPEC)
+        for number, line in enumerate(spec.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                # %% is the escape; %{...}/%name are intentional macros.
+                stripped = re.sub(r"%%|%\{[^}]*\}|%[a-zA-Z_]+", "", line)
+                self.assertNotIn("%", stripped,
+                                 "line %d: a comment carries an rpm macro "
+                                 "rpmbuild will try to expand: %r" % (number, line))
+
+
 class ConfigPageCheckTest(unittest.TestCase):
     """`doctor` must be able to say which config page Plasma will load.
 
