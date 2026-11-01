@@ -21,7 +21,13 @@ from unittest import mock
 import dataclasses
 
 from sarvam_meter import config as config_mod
-from sarvam_meter.daemon import Daemon, make_server, sanitized_config
+from sarvam_meter.daemon import (
+    Daemon,
+    _dashboard_dates,
+    fetch_dashboard_snapshot,
+    make_server,
+    sanitized_config,
+)
 from sarvam_meter.ledger import Ledger
 
 SECRET = "mgmt-key-do-not-leak-1234"
@@ -95,11 +101,13 @@ class StatusRouteTest(DaemonTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
         self.assertEqual(headers["cache-control"], "no-store")
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
         self.assertEqual(
             set(payload.keys()),
             {"schema", "generated_at", "stale", "errors", "sarvam", "cliproxy"},
         )
+        self.assertIn("dashboard", payload["sarvam"])
+        self.assertFalse(payload["sarvam"]["dashboard"]["configured"])
         self.assertFalse(payload["stale"])
         self.assertEqual(payload["errors"], [])
 
@@ -117,7 +125,7 @@ class StatusRouteTest(DaemonTestCase):
     def test_status_accepts_trailing_slash(self):
         status, _headers, payload = self.json_body("GET", "/v1/status/")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
 
 
 class NotFoundTest(DaemonTestCase):
@@ -181,7 +189,7 @@ class RefreshRouteTest(DaemonTestCase):
         status, headers, payload = self.json_body("POST", "/v1/refresh")
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
         self.assertFalse(payload["cliproxy"]["configured"])
         self.assertFalse(payload["stale"])
 
@@ -335,7 +343,10 @@ class BrokenLedgerTest(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(payload["errors"][0]["source"], "ledger")
         self.assertEqual(payload["errors"][0]["code"], "read_failed")
-        self.assertEqual(payload["sarvam"]["spend"], {"today": 0.0, "month": 0.0})
+        self.assertEqual(
+            payload["sarvam"]["spend"],
+            {"today": 0.0, "month": 0.0, "source": "ledger"},
+        )
 
 
 class ServerFlagsTest(unittest.TestCase):
@@ -372,6 +383,179 @@ class ServerFlagsTest(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(response.status, 200)
+
+
+# ---------------------------------------------------------------------------
+# the dashboard snapshot: TTL cache, refresh, and a non-blocking status
+# ---------------------------------------------------------------------------
+
+
+def dashboard_snapshot(**overrides):
+    snapshot = {
+        "configured": True,
+        "reachable": True,
+        "as_of": "2026-11-15T04:30:00Z",
+        "org_id": "019f37be-0000-7000-8000-000000000000",
+        "currency": "INR",
+        "window": {"start": "2026-10-20", "end": "2026-11-15"},
+        "spend": {"window": 134.23, "today": 12.3},
+        "by_model": [{"model": "saaras:v4", "cost": 74.05}],
+        "usage": [],
+        "error": None,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+class DashboardCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sarvam-daemon-dashboard-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.config = ephemeral_port(
+            make_config(
+                self.tmp,
+                dashboard={
+                    "enabled": True,
+                    "poll_seconds": 60,
+                    "session_file": os.path.join(self.tmp, "session.json"),
+                },
+            )
+        )
+        self.daemon = Daemon(self.config, logger=lambda _line: None)
+        self.addCleanup(self.daemon.shutdown)
+
+    def test_ttl_follows_poll_seconds(self):
+        self.assertEqual(self.daemon.dashboard_ttl, 60)
+        other = make_config(
+            self.tmp, dashboard={"enabled": True, "poll_seconds": 900}
+        )
+        self.assertEqual(Daemon(other, logger=lambda _line: None).dashboard_ttl, 900)
+
+    def test_nothing_is_cached_before_the_first_refresh(self):
+        self.assertIsNone(self.daemon.dashboard_snapshot)
+        self.assertFalse(self.daemon.dashboard_snapshot_is_fresh())
+
+    def test_refresh_dashboard_caches_and_stamps_the_snapshot(self):
+        snapshot = dashboard_snapshot()
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot", return_value=snapshot
+        ) as fetch:
+            returned = self.daemon.refresh_dashboard()
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIs(returned, snapshot)
+        self.assertIs(self.daemon.dashboard_snapshot, snapshot)
+        self.assertTrue(self.daemon.dashboard_snapshot_is_fresh())
+
+    def test_status_never_fetches_and_uses_the_cached_snapshot(self):
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=dashboard_snapshot(),
+        ) as fetch:
+            # No refresh yet: status must not block on a fetch.
+            payload = self.daemon.status()
+            self.assertEqual(fetch.call_count, 0)
+            self.assertTrue(payload["sarvam"]["dashboard"]["configured"])
+            self.assertFalse(payload["sarvam"]["dashboard"]["reachable"])
+            self.assertEqual(payload["sarvam"]["spend"]["source"], "ledger")
+
+            self.daemon.refresh_dashboard()
+            payload = self.daemon.status()
+        self.assertEqual(fetch.call_count, 1)
+        self.assertTrue(payload["sarvam"]["dashboard"]["reachable"])
+        self.assertEqual(payload["sarvam"]["spend"]["source"], "dashboard")
+        self.assertEqual(payload["sarvam"]["dashboard"]["by_model"][0]["cost"], 74.05)
+
+    def test_disabled_dashboard_starts_no_thread(self):
+        config = ephemeral_port(make_config(self.tmp))
+        daemon = Daemon(config, logger=lambda _line: None)
+        self.addCleanup(daemon.shutdown)
+        daemon.start()
+        self.assertIsNone(daemon._dashboard_thread)
+        self.assertFalse(daemon.status()["sarvam"]["dashboard"]["configured"])
+
+    def test_refresh_route_refreshes_both_sources(self):
+        port = self.daemon.start()
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=dashboard_snapshot(),
+        ) as dash_fetch, mock.patch(
+            "sarvam_meter.daemon.fetch_cliproxy_snapshot",
+            return_value={"configured": False, "reachable": False, "errors": []},
+        ) as proxy_fetch:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                connection.request("POST", "/v1/refresh")
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertGreaterEqual(proxy_fetch.call_count, 1)
+        self.assertGreaterEqual(dash_fetch.call_count, 1)
+        self.assertTrue(payload["sarvam"]["dashboard"]["reachable"])
+
+    def test_config_route_exposes_the_dashboard_section_without_secrets(self):
+        document = sanitized_config(self.config)
+        self.assertEqual(
+            set(document["dashboard"]),
+            {"enabled", "base_url", "session_file", "poll_seconds", "product"},
+        )
+        self.assertTrue(document["dashboard"]["enabled"])
+        self.assertEqual(document["dashboard"]["poll_seconds"], 60)
+
+
+class DashboardFetchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sarvam-daemon-dashfetch-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_disabled_source_returns_a_configured_false_snapshot(self):
+        config = make_config(self.tmp)
+        snapshot = fetch_dashboard_snapshot(config, None)
+        self.assertFalse(snapshot["configured"])
+        self.assertFalse(snapshot["reachable"])
+        self.assertIsNone(snapshot["error"])
+
+    def test_a_missing_session_becomes_an_error_not_an_exception(self):
+        config = make_config(
+            self.tmp,
+            dashboard={
+                "enabled": True,
+                "session_file": os.path.join(self.tmp, "absent.json"),
+            },
+        )
+        snapshot = fetch_dashboard_snapshot(config, None)
+        self.assertIsInstance(snapshot, dict)
+        self.assertTrue(snapshot["configured"])
+        self.assertFalse(snapshot["reachable"])
+        self.assertIsInstance(snapshot["error"], dict)
+        self.assertEqual(snapshot["error"]["source"], "dashboard")
+        self.assertTrue(snapshot["error"]["code"])
+
+    def test_the_window_starts_at_the_balance_set_date(self):
+        class FixedLedger:
+            def get_balance(self):
+                return {"starting": 500.0, "set_at": "2026-10-20T09:00:00Z"}
+
+        since, today = _dashboard_dates(FixedLedger())
+        self.assertEqual(since, "2026-10-20")
+        self.assertRegex(today, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertLessEqual(since, today)
+
+    def test_a_broken_ledger_still_yields_dates(self):
+        class Boom:
+            def get_balance(self):
+                raise RuntimeError("database is locked")
+
+        since, today = _dashboard_dates(Boom())
+        self.assertRegex(since, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertTrue(since.endswith("-01"), since)
+        self.assertRegex(today, r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_no_ledger_still_yields_dates(self):
+        since, today = _dashboard_dates(None)
+        self.assertRegex(since, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(today, r"^\d{4}-\d{2}-\d{2}$")
 
 
 if __name__ == "__main__":  # pragma: no cover
