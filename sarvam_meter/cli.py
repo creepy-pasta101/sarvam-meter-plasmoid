@@ -191,8 +191,14 @@ def render_status(status: dict) -> List[str]:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    path = write_default_config(_config_path(args))
-    _out(path)
+    path = _config_path(args)
+    # --if-missing is what the systemd unit's ExecStartPre runs: it must never
+    # overwrite a config the user has edited.
+    if getattr(args, "if_missing", False) and os.path.isfile(path):
+        _err("config already present at %s" % (path,))
+        return EXIT_OK
+    written = write_default_config(path)
+    _out(written)
     return EXIT_OK
 
 
@@ -532,6 +538,19 @@ def _with_port(config: Any, port: Optional[int], section: str = "daemon") -> Any
         return config
 
 
+def should_start_proxy(args: Any, config: Any) -> bool:
+    """True when `serve` should also run the recording proxy.
+
+    The config is authoritative: `proxy.enabled` turns the proxy on even without
+    `--with-proxy`, so the packaged systemd unit can just run `serve` and the
+    user's setting (or the settings page) decides.  The flag still forces it on,
+    which keeps `serve --with-proxy` working for a one-off run.
+    """
+    if bool(getattr(args, "with_proxy", False)):
+        return True
+    return bool(getattr(getattr(config, "proxy", None), "enabled", False))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from .daemon import Daemon
 
@@ -539,7 +558,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ledger = _open_ledger(config)
     proxy = None
     proxy_port = None
-    if getattr(args, "with_proxy", False):
+    if should_start_proxy(args, config):
         from .proxy import ProxyServer
 
         proxy = ProxyServer(config, ledger)
@@ -905,6 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = subparsers.add_parser("init", help="write the default config")
     init.add_argument("--config", default=None, metavar="PATH")
+    init.add_argument("--if-missing", action="store_true", dest="if_missing",
+                      help="do nothing when the config already exists")
     init.set_defaults(func=cmd_init)
 
     return parser
