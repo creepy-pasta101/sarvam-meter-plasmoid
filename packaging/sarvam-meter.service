@@ -1,32 +1,42 @@
 # SPDX-License-Identifier: MIT
 #
-# systemd *user* unit for the sarvam-meter daemon (and its recording proxy).
+# systemd *user* unit for the sarvam-meter daemon.
 #
-# Install for the current user only (never system-wide):
-#     install -D -m 0644 packaging/sarvam-meter.service \
-#         ~/.config/systemd/user/sarvam-meter.service
+# The RPM installs this to /usr/lib/systemd/user/sarvam-meter.service. Enable it
+# for the current user only (never system-wide):
+#
 #     systemctl --user daemon-reload
 #     systemctl --user enable --now sarvam-meter.service
+#     journalctl --user -u sarvam-meter.service -f
 #
-# Logs: journalctl --user -u sarvam-meter.service -f
+# To keep it running while you are logged out:
+#
+#     loginctl enable-linger "$USER"
+#
+# The recording proxy is not forced on here: `proxy.enabled` in
+# ~/.config/sarvam-meter/config.json decides, and the settings page can toggle
+# it. `--with-proxy` on the command line still overrides that.
 
 [Unit]
-Description=Sarvam AI usage meter daemon and recording proxy
+Description=Sarvam AI usage meter daemon
 Documentation=https://github.com/creepy-pasta101/sarvam-meter-plasmoid
-# This is a user unit: it does not order against the system network target.
-After=default.target
+# A user unit: it does not order against the system network target.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment=SARVAM_METER_CONFIG=%h/.config/sarvam-meter/config.json
-ExecStart=/usr/bin/sarvam-meter serve --with-proxy
+Environment=PYTHONUNBUFFERED=1
+# Create a default config on first start only; never overwrite an edited one.
+ExecStartPre=/usr/bin/sarvam-meter init --if-missing
+ExecStart=/usr/bin/sarvam-meter serve
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
-# The daemon binds loopback ports only and stores state in $HOME.
+# The daemon binds loopback ports only and stores its state under $HOME.
 NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=default.target
