@@ -398,6 +398,8 @@ class TestLoadSession(unittest.TestCase):
             load_session(os.path.join(self.tmpdir, "absent.json"))
         self.assertEqual(caught.exception.code, "no_session")
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores permission bits, so the failure cannot be reproduced")
     def test_unreadable_file_is_no_session(self):
         self.write({"Cookie": COOKIE}, mode=0o000)
         with self.assertRaises(DashboardError) as caught:
@@ -421,6 +423,8 @@ class TestLoadSession(unittest.TestCase):
             load_session("")
         self.assertEqual(caught.exception.code, "no_session")
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores permission bits, so the failure cannot be reproduced")
     def test_error_message_never_echoes_a_value(self):
         self.write({"Cookie": COOKIE, "Authorization": BEARER})
         os.chmod(self.path, 0o000)
