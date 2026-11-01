@@ -20,7 +20,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 from . import client as client_module
 from .client import ClientError
-from .config import ConfigError, load_config, write_default_config
+from .config import (ConfigError, load_config, resolve_config_path,
+                     write_default_config)
 from .ledger import Ledger
 from .rates import UNITS, cost_for, rate_card, rate_known
 from .status import build_status
@@ -193,13 +194,18 @@ def render_status(status: dict) -> List[str]:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    path = _config_path(args)
-    # --if-missing is what the systemd unit's ExecStartPre runs: it must never
-    # overwrite a config the user has edited.
-    if getattr(args, "if_missing", False) and os.path.isfile(path):
-        _err("config already present at %s" % (path,))
-        return EXIT_OK
-    written = write_default_config(path)
+    explicit = _config_path(args)
+    # --if-missing is what the systemd unit's ExecStartPre runs, so it must never
+    # overwrite a config the user has edited -- and it must never crash either:
+    # `explicit` is None when --config was not passed, and the file that matters
+    # is the one write_default_config would resolve.  (This is exactly the bug
+    # that made `systemctl --user enable --now sarvam-meter` fail.)
+    if getattr(args, "if_missing", False):
+        resolved = resolve_config_path(explicit)
+        if os.path.isfile(resolved):
+            _err("config already present at %s" % (resolved,))
+            return EXIT_OK
+    written = write_default_config(explicit)
     _out(written)
     return EXIT_OK
 

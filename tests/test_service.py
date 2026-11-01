@@ -120,6 +120,55 @@ class InitIfMissingTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.path))
         self.assertEqual(oct(os.stat(self.path).st_mode & 0o777), "0o600")
 
+    def test_it_works_without_a_config_argument(self):
+        """The systemd unit passes no --config: this is the exact invocation.
+
+        `_config_path()` returns None when the flag is absent, and an
+        `os.path.isfile(None)` in the --if-missing branch made
+        `systemctl --user enable --now sarvam-meter` fail with a TypeError before
+        the daemon ever started.  Every other test here passes --config, which is
+        why CI missed it.
+        """
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        env = dict(os.environ)
+        env["HOME"] = home
+        env.pop("SARVAM_METER_CONFIG", None)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "sarvam_meter.cli", "init", "--if-missing"],
+            cwd=REPO_ROOT, capture_output=True, text=True, env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = os.path.join(home, ".config", "sarvam-meter", "config.json")
+        self.assertTrue(os.path.isfile(expected), result.stdout)
+        self.assertEqual(oct(os.stat(expected).st_mode & 0o777), "0o600")
+
+        # And a second start (every service restart) is a quiet no-op.
+        again = subprocess.run(
+            [sys.executable, "-m", "sarvam_meter.cli", "init", "--if-missing"],
+            cwd=REPO_ROOT, capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("already present", again.stderr)
+
+    def test_it_honours_the_env_config_path(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        env = dict(os.environ)
+        env["HOME"] = home
+        alt = os.path.join(home, "alt.json")
+        env["SARVAM_METER_CONFIG"] = alt
+
+        result = subprocess.run(
+            [sys.executable, "-m", "sarvam_meter.cli", "init", "--if-missing"],
+            cwd=REPO_ROOT, capture_output=True, text=True, env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(alt))
+
     def test_it_leaves_an_edited_config_alone(self):
         edited = config_mod.default_config_dict()
         edited["dashboard"]["poll_seconds"] = 900

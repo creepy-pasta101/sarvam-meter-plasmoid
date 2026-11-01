@@ -168,6 +168,17 @@ def default_config_dict() -> dict:
 # --------------------------------------------------------------------------
 
 
+def resolve_config_path(path: Optional[str] = None) -> str:
+    """The config file that would actually be used for *path*.
+
+    Explicit argument, then ``$SARVAM_METER_CONFIG``, then the default.  Callers
+    that need to *look at* the file (rather than load or write it) must use this:
+    passing a bare ``--config`` value around gives ``None`` when the flag was not
+    given, and ``os.path.isfile(None)`` raises TypeError.
+    """
+    return _resolve_path(path)
+
+
 def _resolve_path(path: Optional[str]) -> str:
     if path is not None and str(path).strip():
         return os.path.expanduser(str(path))
@@ -546,6 +557,7 @@ __all__ = [
     "DEFAULT_SESSION_FILE",
     "DaemonConfig",
     "DashboardConfig",
+    "resolve_config_path",
     "MIN_DASHBOARD_POLL_SECONDS",
     "MAX_DASHBOARD_POLL_SECONDS",
     "ENV_CLIPROXY_KEY",
