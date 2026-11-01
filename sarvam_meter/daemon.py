@@ -8,14 +8,15 @@ method       path            behaviour
 ===========  ==============  ==============================================
 GET          /v1/status      status payload, ``Cache-Control: no-store``
 GET          /v1/health      ``{"ok": true, "version": ..., "uptime_seconds": N}``
-POST         /v1/refresh     force a cliproxy re-poll, return the new status
+POST         /v1/refresh     force a cliproxy *and* dashboard re-poll
 GET          /v1/config      sanitised config, secrets redacted
 anything     anything else   ``404`` ``not_found`` / ``405`` ``method_not_allowed``
 ===========  ==============  ==============================================
 
-The cliproxy snapshot is refreshed on a background thread behind a lock; a slow
-or unreachable CLIProxyAPI never delays ``/v1/status``, which always answers
-from the cached snapshot.
+Both source snapshots (CLIProxyAPI and the Sarvam dashboard) are refreshed on
+background threads behind locks; a slow or unreachable source never delays
+``/v1/status``, which always answers from the cached snapshots.  The dashboard
+snapshot additionally has a TTL of ``dashboard.poll_seconds``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -119,6 +121,10 @@ def sanitized_config(config: Any) -> dict:
                 "allow_remote",
             ],
         ),
+        "dashboard": _section(
+            getattr(config, "dashboard", None),
+            ["enabled", "base_url", "session_file", "poll_seconds", "product"],
+        ),
     }
     return _redact_tree(document)
 
@@ -184,6 +190,126 @@ def fetch_cliproxy_snapshot(config: Any) -> dict:
     merged.setdefault("accounts", [])
     merged.setdefault("reachable", False)
     merged.setdefault("api_version", base["api_version"])
+    return merged
+
+
+#: Default window used when no starting balance has been set yet.
+def _dashboard_dates(ledger: Any) -> Tuple[str, str]:
+    """Return ``(since_date, today)`` as ``YYYY-MM-DD`` strings.
+
+    ``since_date`` is the date part of ``balance.set_at`` (SPEC 17.5): the window
+    the dashboard is asked about starts when the starting balance was recorded.
+    Without a balance (or without a readable ledger) the window falls back to the
+    first day of the current month, so the daemon still has a bounded query.
+    """
+    now = datetime.now(timezone.utc).astimezone()
+    today = now.strftime("%Y-%m-%d")
+    set_at = None
+    try:
+        balance = ledger.get_balance() if ledger is not None else None
+        if isinstance(balance, dict):
+            candidate = balance.get("set_at")
+            if isinstance(candidate, str):
+                set_at = candidate
+    except Exception:  # noqa: BLE001 - a broken ledger must not break the refresh
+        set_at = None
+    if set_at:
+        head = set_at.strip()[:10]
+        try:
+            datetime.strptime(head, "%Y-%m-%d")
+        except ValueError:
+            head = ""
+        if head and head <= today:
+            return head, today
+    return now.replace(day=1).strftime("%Y-%m-%d"), today
+
+
+def _empty_dashboard_snapshot(configured: bool) -> dict:
+    return {
+        "configured": bool(configured),
+        "reachable": False,
+        "as_of": None,
+        "org_id": None,
+        "currency": "INR",
+        "window": {"start": None, "end": None},
+        "spend": {"window": 0.0, "today": 0.0},
+        "by_model": [],
+        "usage": [],
+        "error": None,
+    }
+
+
+def fetch_dashboard_snapshot(config: Any, ledger: Any = None) -> dict:
+    """Poll the Sarvam dashboard once and return its snapshot dict.
+
+    Never raises.  A disabled source, a missing session file, an unreachable
+    dashboard or a bad response all become a snapshot with ``error`` set, so the
+    caller can pass the result straight to :func:`build_status`.  Session values
+    never appear in the returned dict or in an error message.
+    """
+    section = getattr(config, "dashboard", None)
+    configured = bool(getattr(section, "enabled", False))
+    base = _empty_dashboard_snapshot(configured)
+    if not configured:
+        return base
+    since_date, today = _dashboard_dates(ledger)
+    base["window"] = {"start": since_date, "end": today}
+    try:
+        # Imported lazily, exactly like the cliproxy client: ``dashboard.py`` is
+        # owned by another unit and may legitimately be absent.
+        from .dashboard import DashboardClient, DashboardError, load_session
+    except Exception as exc:  # noqa: BLE001 - no dashboard module: report, do not raise
+        base["error"] = {
+            "source": "dashboard",
+            "code": "unreachable",
+            "message": str(exc) or exc.__class__.__name__,
+        }
+        return base
+
+    try:
+        session = load_session(str(getattr(section, "session_file", "") or ""))
+        client = DashboardClient(
+            str(getattr(section, "base_url", "")),
+            session,
+            timeout=float(
+                getattr(
+                    getattr(config, "daemon", None), "request_timeout_seconds", 10
+                )
+                or 10
+            ),
+            product=str(
+                getattr(section, "product", "sarvam-api-platform")
+                or "sarvam-api-platform"
+            ),
+        )
+        snapshot = client.snapshot(since_date=since_date, today=today)
+    except DashboardError as exc:
+        base["error"] = {
+            "source": "dashboard",
+            "code": str(getattr(exc, "code", None) or "unreachable"),
+            "message": str(exc) or exc.__class__.__name__,
+        }
+        return base
+    except Exception as exc:  # noqa: BLE001 - never raise out of a refresh
+        base["error"] = {
+            "source": "dashboard",
+            "code": "unreachable",
+            "message": str(exc) or exc.__class__.__name__,
+        }
+        return base
+    if not isinstance(snapshot, dict):
+        base["error"] = {
+            "source": "dashboard",
+            "code": "bad_response",
+            "message": "dashboard snapshot was not an object",
+        }
+        return base
+    merged = _empty_dashboard_snapshot(True)
+    merged.update(snapshot)
+    merged["configured"] = bool(snapshot.get("configured", True))
+    merged["reachable"] = bool(snapshot.get("reachable"))
+    if not isinstance(merged.get("window"), dict):
+        merged["window"] = base["window"]
     return merged
 
 
@@ -314,6 +440,7 @@ class _Handler(BaseHTTPRequestHandler):
             return 200, self.daemon.health()
         if path == REFRESH_PATH:
             self.daemon.refresh_cliproxy()
+            self.daemon.refresh_dashboard()
             return 200, self.daemon.status()
         if path == CONFIG_PATH:
             return 200, self.daemon.config_payload()
@@ -321,7 +448,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class Daemon:
-    """Owns the HTTP server, the cached cliproxy snapshot and the ledger handle."""
+    """Owns the HTTP server, the cached snapshots and the ledger handle."""
 
     def __init__(
         self,
@@ -335,11 +462,15 @@ class Daemon:
         self._snapshot: Optional[dict] = None
         self._snapshot_at: Optional[float] = None
         self._refresh_lock = threading.Lock()
+        self._dashboard_snapshot: Optional[dict] = None
+        self._dashboard_at: Optional[float] = None
+        self._dashboard_lock = threading.Lock()
         self._stop = threading.Event()
         self._serving = threading.Event()
         self._server: Optional[_ThreadingServer] = None
         self._thread: Optional[threading.Thread] = None
         self._refresh_thread: Optional[threading.Thread] = None
+        self._dashboard_thread: Optional[threading.Thread] = None
         if ledger is None:
             ledger = self._open_ledger()
         self.ledger = ledger
@@ -389,6 +520,7 @@ class Daemon:
         """Bind the socket, start the background threads, return the port."""
         server = self._ensure_server()
         self._start_refresh_thread()
+        self._start_dashboard_thread()
         if self._thread is None or not self._thread.is_alive():
             self._serving.set()
             self._thread = threading.Thread(
@@ -403,6 +535,7 @@ class Daemon:
         """Blocking serve loop (binds on first use)."""
         server = self._ensure_server()
         self._start_refresh_thread()
+        self._start_dashboard_thread()
         self._serving.set()
         server.serve_forever()
 
@@ -420,11 +553,12 @@ class Daemon:
             except Exception:  # pragma: no cover
                 pass
         current = threading.current_thread()
-        for thread in (self._thread, self._refresh_thread):
+        for thread in (self._thread, self._refresh_thread, self._dashboard_thread):
             if thread is not None and thread is not current and thread.is_alive():
                 thread.join(timeout=5.0)
         self._thread = None
         self._refresh_thread = None
+        self._dashboard_thread = None
 
     # -- cliproxy snapshot ----------------------------------------------
     def _start_refresh_thread(self) -> None:
@@ -470,10 +604,77 @@ class Daemon:
         """The cached snapshot (``None`` until the first successful poll)."""
         return self._snapshot
 
+    # -- dashboard snapshot (TTL cache) ----------------------------------
+    @property
+    def dashboard_ttl(self) -> int:
+        """Seconds a cached dashboard snapshot stays fresh (``dashboard.poll_seconds``)."""
+        section = getattr(self.config, "dashboard", None)
+        try:
+            ttl = int(getattr(section, "poll_seconds", 300) or 300)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            ttl = 300
+        return ttl if ttl >= 1 else 1
+
+    def _start_dashboard_thread(self) -> None:
+        if not bool(getattr(getattr(self.config, "dashboard", None), "enabled", False)):
+            return
+        if self._dashboard_thread is not None and self._dashboard_thread.is_alive():
+            return
+        self._stop.clear()
+        self._dashboard_thread = threading.Thread(
+            target=self._dashboard_refresh_loop,
+            name="sarvam-meter-dashboard",
+            daemon=True,
+        )
+        self._dashboard_thread.start()
+
+    def _dashboard_refresh_loop(self) -> None:
+        interval = self.dashboard_ttl
+        while not self._stop.is_set():
+            try:
+                self.refresh_dashboard()
+            except Exception as exc:  # noqa: BLE001 - keep the thread alive
+                self._emit("sarvam-meter: dashboard refresh failed (%s)" % (exc,))
+            if self._stop.wait(interval):
+                break
+
+    def refresh_dashboard(self) -> dict:
+        """Poll the dashboard and cache its snapshot (serialised by a lock)."""
+        with self._dashboard_lock:
+            snapshot = self._fetch_dashboard_snapshot()
+            self._dashboard_snapshot = snapshot
+            self._dashboard_at = time.time()
+        return snapshot
+
+    def _fetch_dashboard_snapshot(self) -> dict:
+        return fetch_dashboard_snapshot(self.config, self.ledger)
+
+    @property
+    def dashboard_snapshot(self) -> Optional[dict]:
+        """The cached dashboard snapshot; never triggers a fetch (never blocks)."""
+        return self._dashboard_snapshot
+
+    def dashboard_snapshot_is_fresh(self) -> bool:
+        """True while the cached dashboard snapshot is younger than its TTL."""
+        snapshot = self._dashboard_snapshot
+        at = self._dashboard_at
+        if snapshot is None or at is None:
+            return False
+        return (time.time() - at) < self.dashboard_ttl
+
     # -- payloads --------------------------------------------------------
     def status(self) -> dict:
-        """Current status payload, built from the cached snapshot."""
-        return build_status(self.config, self.ledger, self._snapshot)
+        """Current status payload, built from the cached snapshots.
+
+        Never blocks: both sources are served from their caches, which the
+        background threads keep warm.
+        """
+        return build_status(
+            self.config,
+            self.ledger,
+            self._snapshot,
+            dashboard_snapshot=self._dashboard_snapshot,
+        )
 
     def health(self) -> dict:
         uptime = max(0.0, time.time() - self._started_at)
