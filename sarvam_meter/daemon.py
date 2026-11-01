@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Local HTTP daemon serving the widget's status JSON (SPEC section 11).
 
-Routes (nothing else exists, and nothing can mutate state):
+Routes (nothing else exists):
 
 ===========  ==============  ==============================================
 method       path            behaviour
@@ -10,8 +10,14 @@ GET          /v1/status      status payload, ``Cache-Control: no-store``
 GET          /v1/health      ``{"ok": true, "version": ..., "uptime_seconds": N}``
 POST         /v1/refresh     force a cliproxy *and* dashboard re-poll
 GET          /v1/config      sanitised config, secrets redacted
+POST         /v1/config      rewrite the *writable* subset of the config
 anything     anything else   ``404`` ``not_found`` / ``405`` ``method_not_allowed``
 ===========  ==============  ==============================================
+
+``POST /v1/config`` is the one mutating route: it is what the plasmoid's
+settings page calls.  Only the keys listed in :data:`WRITABLE_SECTIONS` may be
+changed, values are validated by the same rules :func:`config.load_config`
+uses, and the file is replaced atomically at mode ``0600``.
 
 Both source snapshots (CLIProxyAPI and the Sarvam dashboard) are refreshed on
 background threads behind locks; a slow or unreachable source never delays
@@ -21,8 +27,12 @@ snapshot additionally has a TTL of ``dashboard.poll_seconds``.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +40,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    ENV_CONFIG_PATH,
+    ConfigError,
+    default_config_dict,
+    load_config,
+)
 from .status import build_status
 
 try:  # pragma: no cover - U1 owns __init__.py
@@ -42,17 +59,34 @@ HEALTH_PATH = "/v1/health"
 REFRESH_PATH = "/v1/refresh"
 CONFIG_PATH = "/v1/config"
 
-#: path -> the single method it accepts
+#: path -> the methods it accepts
 ROUTES = {
-    STATUS_PATH: "GET",
-    HEALTH_PATH: "GET",
-    REFRESH_PATH: "POST",
-    CONFIG_PATH: "GET",
+    STATUS_PATH: ("GET",),
+    HEALTH_PATH: ("GET",),
+    REFRESH_PATH: ("POST",),
+    CONFIG_PATH: ("GET", "POST"),
 }
+
+#: Sections and keys ``POST /v1/config`` may change.  Everything else in the
+#: document (``cliproxy.management_key``, ``sarvam.*``, ``daemon.port``, ...) is
+#: deliberately not writable over HTTP.
+WRITABLE_SECTIONS: Dict[str, Tuple[str, ...]] = {
+    "dashboard": ("enabled", "base_url", "poll_seconds", "session_file"),
+    "cliproxy": ("enabled", "base_url", "api_version"),
+    "proxy": ("enabled",),
+    "daemon": ("refresh_seconds",),
+}
+
+#: Sections that exist in the config document but are read-only over HTTP.  A
+#: key sent inside one of these is named in full (``sarvam.starting_balance is
+#: not writable``), so the settings page can point at the offending row.
+READ_ONLY_SECTIONS = frozenset(["sarvam"])
 
 CONTENT_TYPE = "application/json; charset=utf-8"
 #: Upper bound on how much of a request body is drained and discarded.
 MAX_DRAIN_BYTES = 1 * 1024 * 1024
+#: Upper bound on a ``POST /v1/config`` body (a settings document is tiny).
+MAX_CONFIG_BODY_BYTES = 64 * 1024
 
 _SECRET_KEYS = frozenset(
     [
@@ -85,6 +119,36 @@ def _redact_tree(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact_tree(item) for item in value]
     return value
+
+
+class ConfigUpdateError(Exception):
+    """A ``POST /v1/config`` request was rejected and **nothing** was written."""
+
+    code = "invalid_config"
+
+    def __init__(self, message: str, code: str = "invalid_config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _invalid_config(message: str) -> dict:
+    """The ``400`` body shape for a rejected config update."""
+    return {"error": {"message": message, "code": "invalid_config"}}
+
+
+def resolve_config_path(path: Optional[str] = None) -> str:
+    """The config file the daemon reads and writes.
+
+    Same resolution order as :func:`config.load_config` -- explicit path, then
+    ``$SARVAM_METER_CONFIG``, then ``~/.config/sarvam-meter/config.json`` -- so
+    the write endpoint edits the file the daemon was started from.
+    """
+    if path is not None and str(path).strip():
+        return os.path.expanduser(str(path))
+    env_path = os.environ.get(ENV_CONFIG_PATH, "")
+    if env_path.strip():
+        return os.path.expanduser(env_path.strip())
+    return DEFAULT_CONFIG_PATH
 
 
 def _section(obj: Any, names: List[str]) -> Dict[str, Any]:
@@ -127,6 +191,144 @@ def sanitized_config(config: Any) -> dict:
         ),
     }
     return _redact_tree(document)
+
+
+# --------------------------------------------------------------------------
+# writable-subset updates (POST /v1/config)
+# --------------------------------------------------------------------------
+
+
+def merge_writable_subset(document: dict, subset: dict) -> dict:
+    """Return a deep copy of *document* with *subset* merged over it.
+
+    Every writable value is a scalar, so a per-section update is exactly the
+    right merge: keys the request does not mention keep their current value and
+    no section is ever replaced wholesale.
+    """
+    merged = copy.deepcopy(document)
+    for section, values in subset.items():
+        current = merged.get(section)
+        if not isinstance(current, dict):
+            current = {}
+        else:
+            current = dict(current)
+        current.update(copy.deepcopy(values))
+        merged[section] = current
+    return merged
+
+
+def check_writable_subset(subset: Any) -> dict:
+    """Reject any section or key that is not in :data:`WRITABLE_SECTIONS`.
+
+    The whole request is rejected on the first offending key -- nothing is ever
+    applied partially -- and the message names the key.
+    """
+    if not isinstance(subset, dict):
+        raise ConfigUpdateError("request body must be a JSON object")
+    for section in sorted(subset, key=lambda item: str(item)):
+        if not isinstance(section, str):
+            raise ConfigUpdateError("%s is not writable" % (section,))
+        values = subset[section]
+        if section not in WRITABLE_SECTIONS:
+            if section in READ_ONLY_SECTIONS and isinstance(values, dict) and values:
+                key = sorted(values, key=lambda item: str(item))[0]
+                raise ConfigUpdateError("%s.%s is not writable" % (section, key))
+            raise ConfigUpdateError("%s is not writable" % (section,))
+        if not isinstance(values, dict):
+            raise ConfigUpdateError("%s: must be a JSON object" % (section,))
+        allowed = WRITABLE_SECTIONS[section]
+        for key in sorted(values, key=lambda item: str(item)):
+            if not isinstance(key, str) or key not in allowed:
+                raise ConfigUpdateError("%s.%s is not writable" % (section, key))
+    return subset
+
+
+def decode_config_request(request: Any) -> dict:
+    """Decode a request body (``dict``, ``bytes`` or ``str``) to a dict.
+
+    A malformed body produces a fixed message: the body is never echoed back,
+    so a value the caller sent (a key, a session path) cannot bounce out of an
+    error response.
+    """
+    if isinstance(request, dict):
+        return request
+    if isinstance(request, (bytes, bytearray)):
+        try:
+            request = bytes(request).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ConfigUpdateError("request body must be UTF-8 encoded JSON") from None
+    if isinstance(request, str):
+        if not request.strip():
+            raise ConfigUpdateError("request body must be a JSON object")
+        try:
+            request = json.loads(request)
+        except ValueError:
+            raise ConfigUpdateError("request body is not valid JSON") from None
+    if not isinstance(request, dict):
+        raise ConfigUpdateError("request body must be a JSON object")
+    return request
+
+
+def write_config_atomic(path: str, document: dict) -> None:
+    """Write *document* to *path* atomically, with mode ``0600``.
+
+    The temporary file lives in the target's own directory so the final step is
+    a rename (``os.replace``), never a copy; it is chmodded to ``0600`` before a
+    single byte is written, and it is fsynced before the rename.  A crash
+    mid-write therefore leaves either the old file or the new one, never a
+    truncated or world-readable one.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    payload = json.dumps(document, indent=2) + "\n"
+    handle_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".tmp")
+    try:
+        os.fchmod(handle_fd, 0o600)
+        handle = os.fdopen(handle_fd, "w", encoding="utf-8")
+    except BaseException:
+        try:
+            os.close(handle_fd)
+        except OSError:  # pragma: no cover
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # pragma: no cover
+            pass
+        raise
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # pragma: no cover
+            pass
+        raise
+
+
+def validate_config_document(document: dict) -> Any:
+    """Run *document* through :func:`config.load_config` without touching the
+    real file, and return the resulting :class:`Config`.
+
+    The document is written to a throwaway directory (mode ``0700``, file
+    ``0600``) and loaded from there, so the validation rules are exactly
+    ``load_config``'s -- the same merge over
+    :func:`config.default_config_dict`, the same bounds -- while a rejected
+    document never reaches the live config file.  The scratch copy holds
+    whatever the real file holds (including ``cliproxy.management_key``), so it
+    is deleted before returning, success or not, and is never world-readable.
+    """
+    scratch = tempfile.mkdtemp(prefix="sarvam-meter-config-")
+    try:
+        probe = os.path.join(scratch, "config.json")
+        write_config_atomic(probe, document)
+        return load_config(probe)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _make_cliproxy_client(config: Any) -> Any:
@@ -386,27 +588,30 @@ class _Handler(BaseHTTPRequestHandler):
         self._dispatch("OPTIONS")
 
     # -- plumbing --------------------------------------------------------
-    def _drain_body(self) -> None:
-        """Consume any request body so it cannot poison the next request."""
+    def _read_body(self) -> bytes:
+        """Read the request body (bounded), so it cannot poison the next request."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             length = 0
         remaining = max(0, min(length, MAX_DRAIN_BYTES))
+        chunks: List[bytes] = []
         while remaining > 0:
             chunk = self.rfile.read(min(65536, remaining))
             if not chunk:
                 break
+            chunks.append(chunk)
             remaining -= len(chunk)
+        return b"".join(chunks)
 
     def _dispatch(self, method: str) -> None:
         started = time.time()
         path = urlsplit(self.path).path or "/"
         if len(path) > 1 and path.endswith("/"):
             path = path.rstrip("/") or "/"
-        self._drain_body()
+        body = self._read_body()
         try:
-            status_code, payload = self._route(method.upper(), path)
+            status_code, payload = self._route(method.upper(), path, body)
         except Exception as exc:  # noqa: BLE001 - never leak a traceback
             status_code = 500
             payload = {
@@ -432,14 +637,14 @@ class _Handler(BaseHTTPRequestHandler):
             pass
         self.daemon._log(method.upper(), path, status_code, time.time() - started)
 
-    def _route(self, method: str, path: str) -> Tuple[int, dict]:
+    def _route(self, method: str, path: str, body: bytes = b"") -> Tuple[int, dict]:
         allowed = ROUTES.get(path)
         if allowed is None:
             return 404, {"error": {"message": "not found", "code": "not_found"}}
         # HEAD is answered wherever GET is, without a body (the writer skips it).
-        if method == "HEAD" and allowed == "GET":
+        if method == "HEAD" and "GET" in allowed:
             method = "GET"
-        if method != allowed:
+        if method not in allowed:
             return 405, {
                 "error": {"message": "method not allowed", "code": "method_not_allowed"}
             }
@@ -452,8 +657,25 @@ class _Handler(BaseHTTPRequestHandler):
             self.daemon.refresh_dashboard()
             return 200, self.daemon.status()
         if path == CONFIG_PATH:
+            if method == "POST":
+                return self._config_update(body)
             return 200, self.daemon.config_payload()
         return 404, {"error": {"message": "not found", "code": "not_found"}}  # pragma: no cover
+
+    def _config_update(self, body: bytes) -> Tuple[int, dict]:
+        """``POST /v1/config``: apply a writable-subset update, return the config.
+
+        A rejection is a ``400`` naming the offending key and changes nothing on
+        disk; a success is the same sanitised document ``GET /v1/config`` serves.
+        The request body is never echoed back.
+        """
+        if len(body) > MAX_CONFIG_BODY_BYTES:
+            return 400, _invalid_config("request body is too large")
+        try:
+            payload = self.daemon.apply_config(body)
+        except ConfigUpdateError as exc:
+            return 400, {"error": {"message": str(exc), "code": exc.code}}
+        return 200, payload
 
 
 class Daemon:
@@ -464,8 +686,11 @@ class Daemon:
         config: Any,
         ledger: Any = None,
         logger: Optional[Callable[[str], Any]] = None,
+        config_path: Optional[str] = None,
     ) -> None:
         self.config = config
+        #: The file ``POST /v1/config`` rewrites (and reloads from).
+        self.config_path = resolve_config_path(config_path)
         self.logger = logger
         self._started_at = time.time()
         self._snapshot: Optional[dict] = None
@@ -474,6 +699,10 @@ class Daemon:
         self._dashboard_snapshot: Optional[dict] = None
         self._dashboard_at: Optional[float] = None
         self._dashboard_lock = threading.Lock()
+        #: Held across the whole read-modify-write of a config update.
+        self._config_lock = threading.Lock()
+        #: Bumped on every config swap; a fetch that straddles a swap is dropped.
+        self._config_generation = 0
         self._stop = threading.Event()
         self._serving = threading.Event()
         self._server: Optional[_ThreadingServer] = None
@@ -584,16 +813,18 @@ class Daemon:
         self._refresh_thread.start()
 
     def _refresh_loop(self) -> None:
-        section = getattr(self.config, "cliproxy", None)
-        interval = int(getattr(section, "quota_fetch_interval_seconds", 300) or 300)
-        if interval < 1:
-            interval = 1
         while not self._stop.is_set():
+            # Re-read the current config every cycle: a new interval (or a
+            # disabled source) takes effect without restarting the daemon.
+            section = getattr(self.config, "cliproxy", None)
             if bool(getattr(section, "quota_fetch", True)):
                 try:
                     self.refresh_cliproxy()
                 except Exception as exc:  # noqa: BLE001 - keep the thread alive
                     self._emit("sarvam-meter: cliproxy refresh failed (%s)" % (exc,))
+            interval = int(getattr(section, "quota_fetch_interval_seconds", 300) or 300)
+            if interval < 1:
+                interval = 1
             if self._stop.wait(interval):
                 break
 
@@ -638,21 +869,32 @@ class Daemon:
         self._dashboard_thread.start()
 
     def _dashboard_refresh_loop(self) -> None:
-        interval = self.dashboard_ttl
         while not self._stop.is_set():
+            if not bool(getattr(getattr(self.config, "dashboard", None), "enabled", False)):
+                # Disabled by a settings update: stop polling until re-enabled.
+                return
             try:
                 self.refresh_dashboard()
             except Exception as exc:  # noqa: BLE001 - keep the thread alive
                 self._emit("sarvam-meter: dashboard refresh failed (%s)" % (exc,))
-            if self._stop.wait(interval):
+            # ``dashboard_ttl`` reads the *current* config, so a new
+            # ``dashboard.poll_seconds`` applies from the next wait onward.
+            if self._stop.wait(self.dashboard_ttl):
                 break
 
     def refresh_dashboard(self) -> dict:
-        """Poll the dashboard and cache its snapshot (serialised by a lock)."""
+        """Poll the dashboard and cache its snapshot (serialised by a lock).
+
+        A fetch that straddles a config update (the generation changed while it
+        was in flight) is returned to the caller but *not* cached: it was made
+        with the old settings and must not outlive them.
+        """
         with self._dashboard_lock:
+            generation = self._config_generation
             snapshot = self._fetch_dashboard_snapshot()
-            self._dashboard_snapshot = snapshot
-            self._dashboard_at = time.time()
+            if generation == self._config_generation:
+                self._dashboard_snapshot = snapshot
+                self._dashboard_at = time.time()
         return snapshot
 
     def _fetch_dashboard_snapshot(self) -> dict:
@@ -696,6 +938,86 @@ class Daemon:
     def config_payload(self) -> dict:
         """Read-only, sanitised config."""
         return sanitized_config(self.config)
+
+    # -- config writes (the plasmoid's settings page) ---------------------
+    def _read_config_document(self) -> dict:
+        """The config document currently on disk (defaults when it is absent)."""
+        path = self.config_path
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            # The daemon can run from an in-memory config; the first successful
+            # update then creates the file from the documented defaults.
+            return default_config_dict()
+        except OSError as exc:
+            raise ConfigUpdateError(
+                "cannot read config %s: %s" % (path, exc.strerror or exc)
+            ) from None
+        except ValueError:
+            raise ConfigUpdateError("invalid JSON in %s" % (path,)) from None
+        if not isinstance(document, dict):
+            raise ConfigUpdateError("config %s: top level must be a JSON object" % (path,))
+        return document
+
+    def apply_config(self, request: Any) -> dict:
+        """Validate, persist and reload a partial config update.
+
+        *request* is the request body: a ``dict``, or its raw ``bytes``/``str``
+        JSON.  Only :data:`WRITABLE_SECTIONS` may appear in it; the subset is
+        merged over the document on disk and the result is validated by the same
+        rules ``load_config`` applies.  On success the file is replaced
+        atomically at mode ``0600``, the in-memory config is swapped in one
+        assignment, the cached dashboard snapshot is dropped, and the sanitised
+        config is returned.
+
+        Raises :class:`ConfigUpdateError` for any rejection -- in which case the
+        config file is left byte-identical and nothing in memory changes.
+        """
+        subset = check_writable_subset(decode_config_request(request))
+        with self._config_lock:
+            document = self._read_config_document()
+            merged = merge_writable_subset(document, subset)
+            try:
+                validate_config_document(merged)
+            except ConfigError as exc:
+                raise ConfigUpdateError(str(exc)) from None
+            write_config_atomic(self.config_path, merged)
+            try:
+                reloaded = load_config(self.config_path)
+            except ConfigError as exc:  # pragma: no cover - just validated
+                raise ConfigUpdateError(str(exc)) from None
+            self._install_config(reloaded)
+        self._emit(
+            "sarvam-meter: config updated (%s)"
+            % (
+                ", ".join(
+                    "%s.%s" % (section, key)
+                    for section in sorted(subset)
+                    for key in sorted(subset[section])
+                )
+                or "no changes",
+            )
+        )
+        return self.config_payload()
+
+    def _install_config(self, config: Any) -> None:
+        """Swap in a validated config and invalidate everything derived from it.
+
+        ``self.config`` is rebound in a single assignment, so a reader on another
+        thread sees either the whole old config or the whole new one.  The cached
+        dashboard snapshot was fetched with the old settings and is dropped; the
+        generation bump also stops an in-flight fetch from re-caching itself.
+        """
+        self.config = config
+        self._config_generation += 1
+        self._dashboard_snapshot = None
+        self._dashboard_at = None
+        if self._serving.is_set() and not self._stop.is_set():
+            # A source this update enabled starts polling without a restart.
+            # Only a daemon that is actually serving owns background threads.
+            self._start_refresh_thread()
+            self._start_dashboard_thread()
 
     # -- logging ---------------------------------------------------------
     def _emit(self, line: str) -> None:

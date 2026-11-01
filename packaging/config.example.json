@@ -31,7 +31,7 @@
     "allow_remote": false
   },
   "dashboard": {
-    "enabled": false,
+    "enabled": true,
     "base_url": "https://indus.sarvam.ai",
     "session_file": "~/.config/sarvam-meter/session.json",
     "poll_seconds": 300,

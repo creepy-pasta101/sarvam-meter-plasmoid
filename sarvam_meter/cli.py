@@ -557,7 +557,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         threading.Thread(
             target=proxy.serve_forever, name="sarvam-meter-proxy", daemon=True
         ).start()
-    daemon = Daemon(config, ledger=ledger)
+    # Pass the resolved path too: the widget's settings page writes through
+    # POST /v1/config, and that must edit the file this process actually loaded.
+    daemon = Daemon(config, ledger=ledger, config_path=_config_path(args))
     try:
         port = daemon.start()
     except OSError as exc:
@@ -630,7 +632,10 @@ def cmd_proxy(args: argparse.Namespace) -> int:
 
 def _check(name: str, ok: bool, detail: str = "") -> Tuple[str, bool]:
     if ok:
-        _out("OK   %s" % (name,))
+        # A passing check may still have something worth saying, e.g. "not
+        # configured (run: ...)" -- dropping it would hide the one command the
+        # user needs on a fresh install.
+        _out("OK   %s%s" % (name, (": " + detail) if detail else ""))
     else:
         _out("FAIL %s%s" % (name, (": " + detail) if detail else ""))
     return name, ok
@@ -696,8 +701,10 @@ def _cliproxy_reachable(config: Any) -> Tuple[bool, str]:
 def _dashboard_session_check(config: Any) -> Tuple[bool, str]:
     """``dashboard session``: the file exists, is ``0600`` and holds only headers.
 
-    A disabled source with no session file is not a failure -- there is nothing
-    to check yet -- but a missing file for an enabled source is.
+    Scraping is the default source now, so "no session captured yet" is a setup
+    step, not a fault: doctor reports it as OK with the command to run.  A file
+    that exists but is loose-permissioned, unreadable or carries unexpected keys
+    *is* a failure, because that one is silently unsafe or broken.
     """
     section = getattr(config, "dashboard", None)
     enabled = bool(getattr(section, "enabled", False))
@@ -706,9 +713,9 @@ def _dashboard_session_check(config: Any) -> Tuple[bool, str]:
         return False, "dashboard.session_file is not set"
     try:
         if not os.path.isfile(path):
-            if not enabled:
-                return True, ""
-            return False, "no session file at %s" % (path,)
+            # Not configured yet.  `doctor` exists to tell you what to fix, and
+            # this one has a one-line fix that the message names.
+            return True, "not configured (run: sarvam-meter session set --cookie-file PATH)"
         mode = stat.S_IMODE(os.stat(path).st_mode)
         if mode & 0o077:
             return False, "mode %04o, expected 0600" % (mode,)
@@ -745,6 +752,9 @@ def _dashboard_reachable(config: Any) -> Tuple[bool, str]:
     if isinstance(error, dict):
         code = str(error.get("code") or "error")
         message = str(error.get("message") or "")
+        if code == "no_session":
+            # Same setup step as above; not a fault.
+            return True, "not configured (no session file)"
         return False, (code + (": " + message if message else ""))
     return False, "unreachable"
 

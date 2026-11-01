@@ -211,7 +211,7 @@ class DashboardEndToEndTest(unittest.TestCase):
             connection.close()
         self.assertNotIn("SuperSecretCookieValue", config_blob)
 
-    def test_a_401_falls_back_to_the_ledger(self):
+    def test_a_401_falls_back_to_the_ledger_spend_without_a_balance(self):
         _FakeDashboard.unauthorised = True
         status = self._refresh_and_status()
         sarvam = status["sarvam"]
@@ -219,12 +219,15 @@ class DashboardEndToEndTest(unittest.TestCase):
         self.assertEqual(sarvam["dashboard"]["error"]["code"], "unauthorized")
         self.assertEqual(sarvam["spend"]["source"], "ledger")
         self.assertEqual(sarvam["balance"]["source"], "ledger")
-        # the ledger's own numbers are still shown
+        # the ledger's own spend is still shown
         self.assertAlmostEqual(sarvam["spend"]["today"], 1.0, places=2)
-        # no reported balance either, so the ledger's own arithmetic applies
-        self.assertEqual(sarvam["balance"]["source"], "ledger")
-        self.assertAlmostEqual(sarvam["balance"]["remaining"], 499.0, places=2)
+        self.assertAlmostEqual(sarvam["balance"]["spent_total"], 1.0, places=2)
+        # ... but no balance was reported, so none is claimed: 500 - 1 is not
+        # invented, and the starting balance is not presented as a "left" figure.
         self.assertFalse(sarvam["dashboard"]["balance"]["known"])
+        self.assertFalse(sarvam["balance"]["known"])
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertIsNone(sarvam["balance"]["starting"])
 
 
 class SessionCliTest(unittest.TestCase):

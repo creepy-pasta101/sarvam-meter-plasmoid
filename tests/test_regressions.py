@@ -40,6 +40,9 @@ from sarvam_meter.status import build_status  # noqa: E402
 def _write_config(directory, **overrides):
     document = default_config_dict()
     document["db_path"] = os.path.join(directory, "usage.db")
+    # The dashboard is on by default; keep its session file inside the throwaway
+    # directory so a daemon started from this config never polls the real one.
+    document["dashboard"]["session_file"] = os.path.join(directory, "session.json")
     for section, values in overrides.items():
         document.setdefault(section, {}).update(values)
     path = os.path.join(directory, "config.json")
@@ -103,8 +106,11 @@ class InMemoryLedgerTest(unittest.TestCase):
             ledger.close()
         self.assertEqual(status["errors"], [])
         self.assertEqual(status["sarvam"]["spend"]["today"], 12.5)
-        self.assertTrue(status["sarvam"]["balance"]["known"])
-        self.assertAlmostEqual(status["sarvam"]["balance"]["remaining"], 487.5, places=2)
+        # The spend survives; a balance is not derived from it any more.
+        self.assertEqual(status["sarvam"]["balance"]["spent_total"], 12.5)
+        self.assertFalse(status["sarvam"]["balance"]["known"])
+        self.assertIsNone(status["sarvam"]["balance"]["remaining"])
+        self.assertIsNone(status["sarvam"]["balance"]["starting"])
 
 
 class DashboardSnapshotRegressionTest(unittest.TestCase):

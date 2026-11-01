@@ -26,20 +26,22 @@ import unittest
 from unittest import mock
 
 from sarvam_meter import config as config_mod
-from sarvam_meter.cli import main
+from sarvam_meter.cli import main, render_status
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 
-#: The five checks ``doctor`` performs with the default config
-#: (``proxy.enabled``, ``cliproxy.enabled`` and ``dashboard.enabled`` are false).
+#: The six checks ``doctor`` performs with the default config
+#: (``proxy.enabled`` and ``cliproxy.enabled`` are false, ``dashboard.enabled``
+#: is true, so the dashboard contributes its session *and* reachability checks).
 DOCTOR_CHECKS = (
     "config loads",
     "data dir writable",
     "db opens",
     "daemon port free",
     "dashboard session",
+    "dashboard reachable",
 )
 
 
@@ -296,14 +298,20 @@ class StatusTest(CliTestCase):
         sarvam = payload["sarvam"]
         self.assertEqual(set(sarvam), self.SARVAM_KEYS)
         self.assertEqual(sarvam["currency"], "INR")
-        self.assertIs(sarvam["balance"]["known"], True)
-        self.assertEqual(sarvam["balance"]["starting"], 500.0)
-        self.assertEqual(sarvam["balance"]["remaining"], 500.0)
+        # A starting balance was set, but only Sarvam can report a balance: with
+        # no dashboard figure there is no "left" number at all.
+        self.assertIs(sarvam["balance"]["known"], False)
+        self.assertIsNone(sarvam["balance"]["starting"])
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertEqual(sarvam["balance"]["spent_total"], 0.0)
         self.assertEqual(
             sarvam["spend"], {"today": 0.0, "month": 0.0, "source": "ledger"}
         )
         self.assertEqual(sarvam["balance"]["source"], "ledger")
-        self.assertFalse(sarvam["dashboard"]["configured"])
+        # The dashboard source is on by default; `status` never polls it, so the
+        # block is configured but not yet reachable.
+        self.assertTrue(sarvam["dashboard"]["configured"])
+        self.assertFalse(sarvam["dashboard"]["reachable"])
         self.assertIsNone(sarvam["dashboard"]["error"])
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
@@ -316,7 +324,7 @@ class StatusTest(CliTestCase):
         self.assertIsNone(payload["cliproxy"]["worst_fraction"])
         self.assertEqual(payload["cliproxy"]["accounts"], [])
 
-    def test_status_human_output_names_the_currency_and_says_left(self):
+    def test_status_human_output_with_a_starting_balance_still_says_spend_only(self):
         self.write_config()
         self.assert_exit(["balance", "set", "500"], EXIT_OK)
 
@@ -326,8 +334,50 @@ class StatusTest(CliTestCase):
         sarvam_lines = [line for line in lines if "Sarvam" in line]
         self.assertEqual(len(sarvam_lines), 1, out)
         self.assertIn("INR", sarvam_lines[0])
-        self.assertIn("left", sarvam_lines[0])
-        self.assertIn("500.00", sarvam_lines[0])
+        # A starting balance is not a balance: no "left" figure is claimed.
+        self.assertIn("spend only", sarvam_lines[0])
+        self.assertNotIn("left", sarvam_lines[0])
+
+    def test_status_human_output_says_left_only_for_a_reported_balance(self):
+        # The "X left" wording still exists; it is reached only with a balance
+        # the dashboard reported (the CLI itself never polls the dashboard).
+        known = {
+            "schema": 2,
+            "generated_at": "2026-11-15T10:00:00+05:30",
+            "stale": False,
+            "errors": [],
+            "sarvam": {
+                "configured": True,
+                "currency": "INR",
+                "balance": {
+                    "known": True,
+                    "remaining": 412.6,
+                    "starting": 500.0,
+                    "spent_total": 87.4,
+                    "set_at": "2026-10-20T09:00:00Z",
+                    "source": "dashboard",
+                },
+                "spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
+                "calls": {"today": 42},
+                "by_api": [],
+                "rate_limits": {"count_24h": 0, "last_at": None},
+                "quota_exhausted": False,
+                "quota_exhausted_at": None,
+                "untracked_calls": {"today": 0, "total": 0},
+                "dashboard": {"configured": True, "reachable": True},
+            },
+            "cliproxy": {
+                "configured": False,
+                "reachable": False,
+                "api_version": "v8",
+                "worst_fraction": None,
+                "accounts": [],
+            },
+        }
+        line = render_status(known)[0]
+        self.assertIn("INR 412.60 left", line)
+        self.assertIn("12.30 today", line)
+        self.assertIn("42 calls", line)
 
     def test_status_human_output_without_a_balance_says_spend_only(self):
         self.write_config()
@@ -399,10 +449,10 @@ class RecordTest(CliTestCase):
         self.assertEqual([entry["api"] for entry in sarvam["by_api"]], ["chat"])
         # money() rounds to 2 dp for display; the ledger keeps 6.
         self.assertEqual(sarvam["balance"]["spent_total"], round(0.015, 2))
-        self.assertEqual(
-            sarvam["balance"]["remaining"],
-            round(500.0 - round(0.015, 2), 2),
-        )
+        # The spend is counted, but 500 - 0.02 is not turned into a balance.
+        self.assertFalse(sarvam["balance"]["known"])
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertIsNone(sarvam["balance"]["starting"])
 
     def test_record_on_an_unpublished_rate_is_free_and_untracked(self):
         self.write_config()
@@ -483,10 +533,21 @@ class ExitCodeTest(CliTestCase):
 
 
 class DoctorTest(CliTestCase):
+    def _write_session(self):
+        """A valid 0600 session file: the dashboard is on by default."""
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            json.dump({"Cookie": "a=1"}, handle)
+        os.chmod(self.session_path, 0o600)
+
     def test_doctor_reports_ok_for_a_healthy_install(self):
         self.write_config()
+        self._write_session()
 
-        out, err = self.assert_exit(["doctor"], EXIT_OK)
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, err = self.assert_exit(["doctor"], EXIT_OK)
         lines = [line for line in out.splitlines() if line.strip()]
         self.assertEqual(len(lines), len(DOCTOR_CHECKS), out)
         for line in lines:
@@ -505,12 +566,24 @@ class DoctorTest(CliTestCase):
         port = int(occupied.getsockname()[1])
 
         self.write_config(daemon={"port": port})
-        out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
+        self._write_session()
+        with mock.patch(
+            "sarvam_meter.daemon.fetch_dashboard_snapshot",
+            return_value=_dashboard_snapshot(),
+        ):
+            out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
 
         fail_lines = [line for line in out.splitlines() if line.startswith("FAIL ")]
         self.assertTrue(fail_lines, out)
         self.assertIn("FAIL daemon port free", out)
         self.assertIn("OK   config loads", out)
+        # The occupied port is the *only* failure on an otherwise healthy box:
+        # the dashboard session is captured and the snapshot is mocked, so the
+        # dashboard checks must not add a second FAIL.
+        self.assertEqual(len(fail_lines), 1, out)
+        self.assertTrue(fail_lines[0].startswith("FAIL daemon port free"), out)
+        self.assertIn("OK   dashboard session", out)
+        self.assertIn("OK   dashboard reachable", out)
         # One OK/FAIL line per check, no more and no fewer.
         self.assertEqual(
             len([line for line in out.splitlines() if line.strip()]),
@@ -680,17 +753,21 @@ class SessionTest(CliTestCase):
 
 
 class DashboardCommandTest(CliTestCase):
-    def test_dashboard_reports_not_configured(self):
-        self.write_config()
+    def test_dashboard_reports_not_configured_when_disabled(self):
+        self.write_config(dashboard={"enabled": False})
         out, err = self.assert_exit(["dashboard"], EXIT_OK)
         self.assertIn("not configured", out)
         self.assertEqual(err, "")
 
     def test_dashboard_json_is_the_status_block(self):
+        # Enabled by default with no session file: configured but unreachable,
+        # which is a runtime error (the command could not do what was asked).
         self.write_config()
-        out, _err = self.assert_exit(["dashboard", "--json"], EXIT_OK)
+        out, _err = self.assert_exit(["dashboard", "--json"], EXIT_RUNTIME)
         block = json.loads(out)
-        self.assertFalse(block["configured"])
+        self.assertTrue(block["configured"])
+        self.assertFalse(block["reachable"])
+        self.assertEqual(block["error"]["code"], "no_session")
         self.assertEqual(
             set(block),
             {
@@ -748,11 +825,23 @@ class DoctorDashboardTest(CliTestCase):
             json.dump(document or {"Cookie": "a=1"}, handle)
         os.chmod(self.session_path, mode)
 
-    def test_enabled_without_a_session_file_fails(self):
+    def test_enabled_without_a_session_file_is_not_configured_not_a_failure(self):
+        # Scraping is the default source, so a fresh install has no session yet.
+        # That is a setup step with a one-line fix, not something to fail on.
         self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        out, _err = self.assert_exit(["doctor"], EXIT_OK)
+        self.assertIn("OK   dashboard session", out)
+        self.assertIn("not configured", out)
+        self.assertIn("OK   dashboard reachable", out)
+        self.assertNotIn("FAIL", out)
+
+    def test_a_session_file_with_loose_permissions_fails(self):
+        self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
+        self._write_session(document={"Cookie": "a=1"})
+        os.chmod(self.session_path, 0o644)
         out, _err = self.assert_exit(["doctor"], EXIT_RUNTIME)
         self.assertIn("FAIL dashboard session", out)
-        self.assertIn("FAIL dashboard reachable", out)
+        self.assertIn("0600", out)
 
     def test_a_good_session_file_passes_the_session_check(self):
         self.write_config(dashboard={"enabled": True, "session_file": self.session_path})
@@ -813,7 +902,9 @@ class DoctorDashboardTest(CliTestCase):
         self.assertNotIn("Traceback", out + err)
 
     def test_disabled_dashboard_adds_one_check_and_stays_ok(self):
-        self.write_config()
+        # Explicitly disabled (the default is on): only the session check is
+        # run, and a missing session file is not a failure for a disabled source.
+        self.write_config(dashboard={"enabled": False})
         out, _err = self.assert_exit(["doctor"], EXIT_OK)
         self.assertIn("OK   dashboard session", out)
         self.assertNotIn("dashboard reachable", out)

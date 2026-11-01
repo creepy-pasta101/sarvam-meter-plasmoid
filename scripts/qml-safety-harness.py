@@ -15,6 +15,9 @@ that misbehaves in each of the ways a real one can:
   good           answers with a valid status payload
   fresh-balance  a valid payload whose balance was updated 10 minutes ago
   old-balance    a valid payload whose balance was updated 2 hours ago
+  click          the panel item is clicked (the popup must expand)
+  refresh        the header's refresh button is pressed (POST /v1/refresh)
+  refresh-fail   the daemon refuses /v1/refresh, so the widget falls back to GET
   destroy        the widget is removed while a request is in flight
 
 For every scenario it asserts that the GUI thread kept running (an independent
@@ -243,12 +246,43 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
         # to sit next to them.  Copy the whole directory to keep the repo clean.
         work_dir = tempfile.mkdtemp(prefix="qml-harness-")
         shutil.copytree(ui_dir, os.path.join(work_dir, "ui"))
+        # `Plasmoid` is a C++ attached property; with no Plasma here the import
+        # cannot resolve, so drop it and supply a context property instead.
+        for name in os.listdir(os.path.join(work_dir, "ui")):
+            if not name.endswith(".qml"):
+                continue
+            target = os.path.join(work_dir, "ui", name)
+            with open(target, encoding="utf-8") as handle:
+                body = handle.read()
+            body = body.replace("import org.kde.plasma.plasmoid\n", "")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(body)
         path = os.path.join(work_dir, "ui", "main_harness.qml")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(text)
 
+        from PySide6.QtCore import Property, QObject
+
+        class PlasmoidStub(QObject):
+            """Stands in for the Plasmoid attached property."""
+
+            def __init__(self):
+                super().__init__()
+                self._expanded = False
+
+            def _get_expanded(self):
+                return self._expanded
+
+            def _set_expanded(self, value):
+                self._expanded = bool(value)
+
+            expanded = Property(bool, _get_expanded, _set_expanded)
+
+        plasmoid = PlasmoidStub()
+
         engine = QQmlEngine()
         engine.addImportPath(STUB_DIR)
+        engine.rootContext().setContextProperty("Plasmoid", plasmoid)
         warnings = []
         engine.warnings.connect(lambda w: warnings.append(str(w.toString())))
 
@@ -312,6 +346,24 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
                 ok = (bool(re.match(r"^balance (2|3)h ago", freshness))
                       and freshness.endswith("not refreshed") and bool(old))
             return ok, "freshness line %r (old=%s)" % (freshness, old), samples
+        if mode == "click":
+            # Clicking the panel item must expand the popup: the compact
+            # representation owns that gesture, not Plasma.  It is loaded
+            # standalone here, because a property-typed child is not part of the
+            # parent's object tree and so cannot be reached with findChild().
+            from PySide6.QtCore import QMetaObject, Qt
+            compact_component = QQmlComponent(
+                engine, QUrl.fromLocalFile(os.path.join(work_dir, "ui", "CompactRepresentation.qml")))
+            compact = compact_component.create()
+            if compact is None:
+                return False, "compact representation failed: %s" % (
+                    compact_component.errorString(),), samples
+            before = plasmoid.expanded
+            QMetaObject.invokeMethod(compact, "toggleExpanded", Qt.DirectConnection)
+            app.processEvents()
+            after = plasmoid.expanded
+            ok = (before is False) and (after is True)
+            return ok, "expanded %s -> %s" % (before, after), samples
         if mode == "refresh":
             # The header's refresh button must make the daemon re-poll, i.e. a
             # POST to /v1/refresh, not just another GET of the cache.
@@ -365,7 +417,7 @@ def main(argv=None) -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     failures = 0
     modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance",
-             "refresh", "refresh-fail", "destroy")
+             "click", "refresh", "refresh-fail", "destroy")
     for mode in modes:
         ok, detail, samples = run_scenario(mode, args.repo, args.verbose)
         print("%-8s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))
