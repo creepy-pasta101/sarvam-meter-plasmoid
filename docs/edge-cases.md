@@ -96,3 +96,8 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | The reported balance is exactly `0.00` | `status._normalise_dashboard_balance` | `balance.known` stays true and the widget shows `₹0.00` — an exhausted wallet is a known state, not an unknown one |
 | The balance endpoint answers but the usage windows do not | `dashboard.snapshot`, `status._sarvam_block` | `balance.source` is `"dashboard"` (the reported figure is shown) while `spend.source` stays `"ledger"` and `dashboard.reachable` is false |
 | A malformed date passed to the client | `dashboard.snapshot` (fail-fast validation) | `bad_request` and no request is made at all |
+| The daemon accepts the socket and never answers | `main.qml` `requestWatchdog` → `abortRequest()` | the widget shows offline after ~6 s and keeps backing off; plasmashell never blocks, because the request was asynchronous and is now aborted |
+| The daemon returns a body larger than 512 KiB | `main.qml` size cap before `JSON.parse` | "daemon response too large", offline; the GUI thread never parses it |
+| The widget is removed while a request is in flight | `main.qml` `Component.onDestruction` | the request is aborted and no callback outlives the widget |
+| The settings dialog is closed mid-Test | `configGeneral.qml` `Component.onDestruction` | the probe is aborted; the dialog cannot be left waiting on a socket |
+| The user clicks Test twice quickly | `configGeneral.qml` `testConnection()` | the first request is aborted, so its callbacks cannot clobber the second result |

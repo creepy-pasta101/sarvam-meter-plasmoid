@@ -95,6 +95,24 @@ PlasmoidItem {
     readonly property int baseIntervalMs: refreshSeconds * 1000
     readonly property int pollInterval: Math.round(baseIntervalMs * backoffMultiplier)
 
+    // ---- plasmashell safety -------------------------------------------
+    // This applet runs *inside* plasmashell, on the same GUI thread as every
+    // panel and every other widget.  Anything that blocks or runs unbounded
+    // there freezes the whole desktop, so every request here is bounded four
+    // ways: an async-only XHR, a hard timeout, an independent watchdog that
+    // aborts it, and a single-flight guard so a slow daemon cannot stack up
+    // requests.  The response size is capped before JSON.parse, and every list
+    // the delegate model sees is sliced.  Nothing below loops unboundedly.
+    readonly property int requestTimeoutMs: 4000
+    readonly property int maxResponseChars: 512 * 1024
+    readonly property int maxAccountsShown: 12
+    readonly property int maxErrorsShown: 5
+
+    // The in-flight request and a mutable "already handled" flag shared with its
+    // callbacks, so abort() and a late event can never both settle it.
+    property var activeRequest: null
+    property var activeRequestState: null
+
     Timer {
         id: refreshTimer
         interval: root.pollInterval
@@ -104,7 +122,20 @@ PlasmoidItem {
         onTriggered: root.refresh()
     }
 
+    // Belt and braces: Qt's own xhr.timeout covers the transfer, not every way a
+    // server can go quiet.  If the request has not settled by then, kill it.
+    Timer {
+        id: requestWatchdog
+        interval: root.requestTimeoutMs + 2000
+        repeat: false
+        running: false
+        onTriggered: root.abortRequest("daemon did not answer in time")
+    }
+
     Component.onCompleted: root.refresh()
+
+    // Never leave a socket, a timer or a pending callback behind.
+    Component.onDestruction: root.abortRequest("")
 
     // Re-poll straight away if the user repoints the widget at another daemon.
     onDaemonUrlChanged: root.refresh()
@@ -115,20 +146,62 @@ PlasmoidItem {
         root.backoffMultiplier = Math.min(10, root.backoffMultiplier * 2);
     }
 
+    // Drop the in-flight request, if there is one, and stop waiting on it.
+    // Called by the watchdog and on destruction; `message` empty means "do not
+    // count this as a failure" (a widget being removed is not an error).
+    function abortRequest(message) {
+        requestWatchdog.stop();
+        var state = root.activeRequestState;
+        var request = root.activeRequest;
+        root.activeRequestState = null;
+        root.activeRequest = null;
+        root.loading = false;
+        if (state)
+            state.done = true;
+        if (request) {
+            try {
+                request.abort();
+            } catch (e) {
+                // aborting an already-finished request is harmless
+            }
+        }
+        if (message !== "")
+            root.handleFailure(message);
+    }
+
     function refresh() {
+        // Single flight: while a request is outstanding, do nothing.  A daemon
+        // that stops answering therefore cannot pile requests up.
         if (root.loading)
             return;
 
         var url = root.daemonUrl + "/v1/status";
-        var xhr = new XMLHttpRequest();
-        var finished = false;
+        var xhr = null;
+        try {
+            xhr = new XMLHttpRequest();
+        } catch (e) {
+            root.handleFailure("cannot create a request");
+            return;
+        }
 
-        function fail(message) {
-            if (finished)
+        var state = { "done": false };
+
+        function settle(message, parsed) {
+            if (state.done)
                 return;
-            finished = true;
+            state.done = true;
+            requestWatchdog.stop();
+            root.activeRequestState = null;
+            root.activeRequest = null;
             root.loading = false;
-            root.handleFailure(message);
+            if (message !== "") {
+                root.handleFailure(message);
+                return;
+            }
+            root.payload = parsed;
+            root.offline = false;
+            root.lastError = "";
+            root.backoffMultiplier = 1;
         }
 
         try {
@@ -136,53 +209,74 @@ PlasmoidItem {
             xhr.open("GET", url, true);
             xhr.setRequestHeader("Accept", "application/json");
         } catch (e) {
-            fail("cannot reach " + url);
+            settle("cannot reach " + url);
             return;
         }
 
         root.loading = true;
-        xhr.timeout = Math.max(1000, Math.min(15000, root.baseIntervalMs));
+        root.activeRequest = xhr;
+        root.activeRequestState = state;
+        xhr.timeout = root.requestTimeoutMs;
+        requestWatchdog.restart();
 
         xhr.onreadystatechange = function () {
             if (xhr.readyState !== 4)
                 return;
-            if (finished)
+            if (state.done)
                 return;
-            finished = true;
-            root.loading = false;
 
             if (xhr.status !== 200) {
-                root.handleFailure("HTTP " + xhr.status);
+                settle("HTTP " + xhr.status);
+                return;
+            }
+
+            var body = "";
+            try {
+                body = xhr.responseText || "";
+            } catch (e) {
+                settle("daemon returned an unreadable response");
+                return;
+            }
+
+            // Never hand a huge string to JSON.parse on the GUI thread: that is
+            // the one way this widget could stall plasmashell.
+            if (body.length > root.maxResponseChars) {
+                settle("daemon response too large");
                 return;
             }
 
             var parsed = null;
             try {
-                parsed = JSON.parse(xhr.responseText);
+                parsed = JSON.parse(body);
             } catch (e) {
                 parsed = null;
             }
 
             if (typeof parsed !== "object" || parsed === null) {
-                root.handleFailure("daemon returned malformed JSON");
+                settle("daemon returned malformed JSON");
                 return;
             }
 
-            root.payload = parsed;
-            root.offline = false;
-            root.lastError = "";
-            root.backoffMultiplier = 1;
+            settle("", parsed);
         };
 
         xhr.onerror = function () {
-            fail("daemon unreachable");
+            settle("daemon unreachable");
         };
 
         xhr.ontimeout = function () {
-            fail("daemon timed out");
+            settle("daemon timed out");
         };
 
-        xhr.send();
+        xhr.onabort = function () {
+            settle("daemon request aborted");
+        };
+
+        try {
+            xhr.send();
+        } catch (e) {
+            settle("cannot send the request");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -344,12 +438,14 @@ PlasmoidItem {
         return largest;
     }
 
-    readonly property var accountsList: root.asArray(root.cliproxyObject.accounts)
+    // Sliced: a pathological payload must not build thousands of delegates on
+    // the GUI thread.  Twelve accounts is more than anyone watches.
+    readonly property var accountsList: root.asArray(root.cliproxyObject.accounts).slice(0, root.maxAccountsShown)
 
     readonly property var errorList: {
         if (!root.hasPayload)
             return [];
-        return root.asArray(root.payload.errors);
+        return root.asArray(root.payload.errors).slice(0, root.maxErrorsShown);
     }
 
     readonly property string currencyCode: {

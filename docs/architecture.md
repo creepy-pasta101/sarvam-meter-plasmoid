@@ -319,6 +319,38 @@ user can act on. When no starting balance is set, `balance.known` is `false` and
 widget shows spend only, exactly as in schema 1. When the dashboard is unreachable,
 all of this is skipped and the ledger arithmetic applies unchanged.
 
+## 4b. Plasmashell safety
+
+The applet is not a separate process: it is QML running on plasmashell's GUI
+thread, next to every panel and every other widget. A blocking call or an
+unbounded loop there freezes the whole desktop, so the request path is bounded
+four ways, all of them in `contents/ui/main.qml`:
+
+| guard | what it prevents |
+| --- | --- |
+| `xhr.open(..., true)` only | a synchronous request stalling the event loop |
+| `requestTimeoutMs = 4000` | waiting on a daemon that stopped answering |
+| a `requestWatchdog` timer that calls `abortRequest()` at timeout + 2 s | Qt's own timeout not covering every way a socket can go quiet; without it the widget would sit in `loading` for ever |
+| single-flight (`if (root.loading) return`) | a slow daemon stacking requests until the shell runs out of handles |
+| `maxResponseChars` checked before `JSON.parse` | a huge or corrupted body blocking the GUI thread inside the parser |
+| `.slice()` on every delegate list | a pathological payload building thousands of delegates |
+| `Component.onDestruction: abortRequest("")` | a callback outliving the widget |
+
+The settings page has the same treatment for its Test button: a 5 s timeout, and
+`abort()` both when a second test starts and when the page is destroyed.
+
+`scripts/qml-safety-harness.py` loads the real `main.qml` in a real Qt engine
+(namespace-substituted: `PlasmoidItem` becomes `Item`, `Plasmoid.configuration`
+becomes a local object) and drives it against a daemon that hangs, floods the
+socket, returns garbage, or is removed mid-request, asserting each time that an
+independent timer kept ticking — i.e. that the GUI thread never blocked. CI runs
+it in the `qml-safety` job. `tests/test_qml_safety.py` is the cheap static
+counterpart that runs where Qt is not installed.
+
+The one thing no guard can prevent is a genuine C++ crash in Qt itself; the applet
+loads no C++ plugin, ships no compiled code, and performs no synchronous I/O, so
+its failure modes are the ones above.
+
 ## 5. Threading model
 
 Both servers are `ThreadingHTTPServer` instances with `SO_REUSEADDR` on and
