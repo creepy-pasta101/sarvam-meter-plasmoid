@@ -319,7 +319,34 @@ user can act on. When no starting balance is set, `balance.known` is `false` and
 widget shows spend only, exactly as in schema 1. When the dashboard is unreachable,
 all of this is skipped and the ledger arithmetic applies unchanged.
 
-## 4b. Plasmashell safety
+## 4b. The popup
+
+`FullRepresentation.qml` is built the way Plasma's own applets are, so it inherits
+the shell's margins, typography and control sizes instead of inventing its own:
+
+```
+PlasmaExtras.Representation (collapseMargins: true)
+├── header: PlasmaExtras.PlasmoidHeading
+│   └── RowLayout: title · BusyIndicator (while a request is in flight) · refresh
+└── PlasmaComponents3.ScrollView
+    ├── PlasmaExtras.PlaceholderMessage   (only when no status has arrived)
+    ├── Sarvam section, per-API bars, per-model rows
+    ├── Kirigami.Separator
+    ├── CLIProxyAPI section
+    └── Kirigami.Separator + footer
+```
+
+The header's refresh button calls `forceRefresh()`, which is a `POST
+/v1/refresh` — not another `GET /v1/status`. A GET would only re-read the
+daemon's cache; the dashboard is re-polled on its own TTL, so a plain re-read
+would usually show the same numbers and look broken. The forced call can take a
+while when the dashboard is slow, so a failure falls back to one `GET
+/v1/status`: the spinner always stops and the user always ends up looking at
+numbers. Both paths go through `startRequest()`, so the timeout, the watchdog,
+the single-flight guard and the size cap apply to the button exactly as they do
+to the timer.
+
+## 4c. Plasmashell safety
 
 The applet is not a separate process: it is QML running on plasmashell's GUI
 thread, next to every panel and every other widget. A blocking call or an
