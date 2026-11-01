@@ -250,6 +250,7 @@ the mechanical description.
 the dashboard's own front-end traffic and **not** from any published API:
 
 ```
+GET /api/dhan/org/balance
 GET /api/dhan/org/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=model&product=sarvam-api-platform
 GET /api/dhan/org/usage/timeseries?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=product&product=sarvam-api-platform&granularity=auto
 ```
