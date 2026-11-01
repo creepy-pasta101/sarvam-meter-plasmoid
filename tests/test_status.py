@@ -31,8 +31,21 @@ SARVAM_KEYS = {
     "quota_exhausted",
     "quota_exhausted_at",
     "untracked_calls",
+    "dashboard",
 }
-BALANCE_KEYS = {"known", "remaining", "starting", "spent_total", "set_at"}
+BALANCE_KEYS = {"known", "remaining", "starting", "spent_total", "set_at", "source"}
+SPEND_KEYS = {"today", "month", "source"}
+DASHBOARD_KEYS = {
+    "configured",
+    "reachable",
+    "as_of",
+    "org_id",
+    "currency",
+    "window",
+    "spend",
+    "by_model",
+    "error",
+}
 CLIPROXY_KEYS = {"configured", "reachable", "api_version", "worst_fraction", "accounts"}
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -82,13 +95,17 @@ class ShapeTest(StatusTestBase):
         self.assertEqual(set(payload.keys()), TOP_LEVEL_KEYS)
         self.assertEqual(set(payload["sarvam"].keys()), SARVAM_KEYS)
         self.assertEqual(set(payload["sarvam"]["balance"].keys()), BALANCE_KEYS)
+        self.assertEqual(set(payload["sarvam"]["spend"].keys()), SPEND_KEYS)
+        self.assertEqual(set(payload["sarvam"]["dashboard"].keys()), DASHBOARD_KEYS)
         self.assertEqual(set(payload["cliproxy"].keys()), CLIPROXY_KEYS)
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], 2)
 
     def test_empty_ledger_is_zeroed_not_missing(self):
         payload = self.status()
         sarvam = payload["sarvam"]
-        self.assertEqual(sarvam["spend"], {"today": 0.0, "month": 0.0})
+        self.assertEqual(
+            sarvam["spend"], {"today": 0.0, "month": 0.0, "source": "ledger"}
+        )
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
         self.assertEqual(sarvam["rate_limits"], {"count_24h": 0, "last_at": None})
@@ -99,7 +116,7 @@ class ShapeTest(StatusTestBase):
 
     def test_json_serialisable(self):
         text = json.dumps(self.status({"accounts": [], "errors": []}))
-        self.assertIn('"schema": 1', text)
+        self.assertIn('"schema": 2', text)
 
     def test_generated_at_is_local_iso_with_offset(self):
         payload = self.status()
@@ -328,7 +345,9 @@ class NeverRaisesTest(StatusTestBase):
         self.assertEqual(payload["errors"][0]["code"], "read_failed")
         self.assertIn("database is locked", payload["errors"][0]["message"])
         sarvam = payload["sarvam"]
-        self.assertEqual(sarvam["spend"], {"today": 0.0, "month": 0.0})
+        self.assertEqual(
+            sarvam["spend"], {"today": 0.0, "month": 0.0, "source": "ledger"}
+        )
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
         self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
