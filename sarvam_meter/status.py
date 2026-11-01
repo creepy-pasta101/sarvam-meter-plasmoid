@@ -208,7 +208,16 @@ def _empty_dashboard(configured: bool) -> Dict[str, Any]:
         "org_id": None,
         "currency": "INR",
         "window": {"start": None, "end": None},
-        "spend": {"window": 0.0, "today": 0.0},
+        "spend": {"window": 0.0, "today": 0.0, "month": 0.0},
+        "balance": {
+            "known": False,
+            "amount": None,
+            "currency": "INR",
+            "as_of": None,
+            "state": "",
+            "billing_model": "",
+            "unit": "",
+        },
         "by_model": [],
         "error": None,
     }
@@ -290,6 +299,35 @@ def _normalise_dashboard_error(raw: Any) -> Optional[Dict[str, str]]:
     }
 
 
+def _normalise_dashboard_balance(raw: Any) -> Dict[str, Any]:
+    """The reported credit balance, or the empty shape when it is unknown."""
+    block = {
+        "known": False,
+        "amount": None,
+        "currency": "INR",
+        "as_of": None,
+        "state": "",
+        "billing_model": "",
+        "unit": "",
+    }
+    if not isinstance(raw, dict):
+        return block
+    amount = _as_float(raw.get("amount"))
+    if amount is None or not bool(raw.get("known")):
+        return block
+    block["known"] = True
+    block["amount"] = amount
+    currency = raw.get("currency")
+    if isinstance(currency, str) and currency:
+        block["currency"] = currency
+    as_of = raw.get("as_of")
+    block["as_of"] = as_of if isinstance(as_of, str) else None
+    for key in ("state", "billing_model", "unit"):
+        value = raw.get(key)
+        block[key] = value if isinstance(value, str) else ""
+    return block
+
+
 def _dashboard_block(config: Any, snapshot: Optional[dict]) -> Dict[str, Any]:
     """The ``sarvam.dashboard`` object (always present, SPEC 17.5)."""
     section = getattr(config, "dashboard", None)
@@ -308,6 +346,7 @@ def _dashboard_block(config: Any, snapshot: Optional[dict]) -> Dict[str, Any]:
     block["currency"] = str(currency) if isinstance(currency, str) and currency else "INR"
     block["window"] = _normalise_window(snapshot.get("window"))
     block["spend"] = _normalise_dashboard_spend(snapshot.get("spend"))
+    block["balance"] = _normalise_dashboard_balance(snapshot.get("balance"))
     block["by_model"] = _normalise_by_model(snapshot.get("by_model"))
     error = _normalise_dashboard_error(snapshot.get("error"))
     if error is None:
@@ -366,23 +405,49 @@ def _sarvam_block(
 
     source = "dashboard" if dashboard_reachable else "ledger"
 
-    if starting_raw is not None:
+    # The reported credit balance needs no arithmetic at all: prefer it whenever
+    # the balance endpoint answered (SPEC 17.5).  It is independent of the usage
+    # windows, so it can be known even when ``reachable`` is false.
+    reported = None
+    dashboard_balance = dashboard_block.get("balance")
+    if isinstance(dashboard_balance, dict) and dashboard_balance.get("known"):
+        reported = _as_float(dashboard_balance.get("amount"))
+
+    if reported is not None:
+        window_spend = None
         if dashboard_reachable:
-            # The dashboard is authoritative for the window that started when the
-            # starting balance was set (SPEC 17.5).
+            window_spend = _as_float(
+                (dashboard_block.get("spend") or {}).get("window")
+            )
+        balance_block = {
+            "known": True,
+            "remaining": money(reported),
+            "starting": money(starting_raw) if starting_raw is not None else None,
+            "spent_total": money(
+                window_spend if window_spend is not None else spend_total
+            ),
+            "set_at": set_at if isinstance(set_at, str) else None,
+            "source": "dashboard",
+        }
+    elif starting_raw is not None:
+        if dashboard_reachable:
+            # No reported balance, but the dashboard is authoritative for the
+            # window that started when the starting balance was set.
             dashboard_spend = dashboard_block.get("spend") or {}
             measured = _as_float(dashboard_spend.get("window")) or 0.0
             remaining = max(0.0, starting_raw - measured)
+            balance_source = "dashboard-derived"
         else:
             measured = spend_total
             remaining = starting_raw - measured
+            balance_source = source
         balance_block = {
             "known": True,
             "remaining": money(remaining),
             "starting": money(starting_raw),
             "spent_total": money(measured),
             "set_at": set_at if isinstance(set_at, str) else None,
-            "source": source,
+            "source": balance_source,
         }
     else:
         balance_block = {

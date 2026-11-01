@@ -9,6 +9,7 @@ Confirmed endpoints (SPEC 17.1), base ``https://indus.sarvam.ai``::
 
     GET /api/dhan/org/usage/summary?start=&end=&group_by=model&product=
     GET /api/dhan/org/usage/timeseries?start=&end=&group_by=product&product=&granularity=auto
+    GET /api/dhan/org/balance
 
 Facts encoded here:
 
@@ -50,14 +51,17 @@ __all__ = [
     "load_session",
     "parse_summary",
     "parse_timeseries",
+    "parse_balance",
     "SESSION_HEADERS",
     "SUMMARY_PATH",
     "TIMESERIES_PATH",
+    "BALANCE_PATH",
 ]
 
 #: API paths below ``base_url`` (SPEC 17.1).
 SUMMARY_PATH = "/api/dhan/org/usage/summary"
 TIMESERIES_PATH = "/api/dhan/org/usage/timeseries"
+BALANCE_PATH = "/api/dhan/org/balance"
 
 #: The only header names a session file may carry (matched case-insensitively).
 SESSION_HEADERS = ("cookie", "authorization")
@@ -432,6 +436,34 @@ def _common(payload: Any, group_by_fallback: str) -> Tuple[dict, dict]:
     return parsed, document
 
 
+def parse_balance(payload: Any) -> dict:
+    """Parse the org balance payload (SPEC 17.1a).
+
+    The reported credit balance is the authoritative number: unlike the usage
+    windows it needs no starting balance and no arithmetic.  ``balance`` and
+    ``real_time_credit_balance`` are both strings; the real-time figure wins when
+    both are present, and ``balance`` is the fallback.  ``currency`` here is
+    uppercase already, but it is normalised all the same.
+    """
+    document = _load_object(payload)
+    realtime_raw = document.get("real_time_credit_balance")
+    if realtime_raw is None:
+        realtime_raw = document.get("balance")
+    if realtime_raw is None:
+        raise DashboardError(
+            "dashboard balance payload has no balance", code="bad_response"
+        )
+    return {
+        "org_id": _text(document.get("org_id")),
+        "balance": _to_float(realtime_raw, "real_time_credit_balance"),
+        "currency": _normalise_currency(document.get("currency")),
+        "as_of": _text(document.get("balance_updated_at")) or None,
+        "state": _text(document.get("state")),
+        "billing_model": _text(document.get("billing_model")),
+        "unit": _text(document.get("unit")),
+    }
+
+
 def parse_summary(payload: Any) -> dict:
     """Parse a ``summary`` payload (bytes, JSON text or an already-decoded dict).
 
@@ -681,6 +713,10 @@ class DashboardClient:
         url = self._url(SUMMARY_PATH, start, end, group_by or "model")
         return parse_summary(self._request_json(url))
 
+    def balance(self) -> dict:
+        """Fetch and parse the org balance (the authoritative credits left)."""
+        return parse_balance(self._request_json(self.base_url + BALANCE_PATH))
+
     def usage_timeseries(
         self,
         start_date: str,
@@ -719,6 +755,15 @@ class DashboardClient:
             "currency": "INR",
             "window": {"start": _text(since_date), "end": _text(today)},
             "spend": {"window": 0.0, "today": 0.0, "month": 0.0},
+            "balance": {
+                "known": False,
+                "amount": None,
+                "currency": "INR",
+                "as_of": None,
+                "state": "",
+                "billing_model": "",
+                "unit": "",
+            },
             "by_model": [],
             "usage": [],
             "error": None,
@@ -726,13 +771,44 @@ class DashboardClient:
         if not snapshot["configured"]:
             return snapshot
 
+        # Fail fast on a malformed date: never spend a request to learn it.
         try:
-            window = self.usage_summary(since_date, today, group_by="model")
+            _validate_date(since_date, "since date")
+            _validate_date(today, "today")
         except DashboardError as exc:
             snapshot["error"] = self._error(exc)
             return snapshot
+
+        # The reported credit balance is the most valuable number here and needs
+        # no arithmetic, so it is fetched first: a failure of the usage windows
+        # must not cost us the authoritative balance.
+        try:
+            reported = self.balance()
+        except DashboardError as exc:
+            snapshot["error"] = self._error(exc)
         except Exception as exc:  # noqa: BLE001 - snapshot must never raise
             snapshot["error"] = self._error(
+                DashboardError("%s: %s" % (type(exc).__name__, exc), code="error")
+            )
+        else:
+            snapshot["balance"] = {
+                "known": True,
+                "amount": float(reported.get("balance") or 0.0),
+                "currency": reported.get("currency") or "INR",
+                "as_of": reported.get("as_of"),
+                "state": reported.get("state") or "",
+                "billing_model": reported.get("billing_model") or "",
+                "unit": reported.get("unit") or "",
+            }
+            snapshot["org_id"] = reported.get("org_id") or None
+
+        try:
+            window = self.usage_summary(since_date, today, group_by="model")
+        except DashboardError as exc:
+            snapshot["error"] = snapshot["error"] or self._error(exc)
+            return snapshot
+        except Exception as exc:  # noqa: BLE001 - snapshot must never raise
+            snapshot["error"] = snapshot["error"] or self._error(
                 DashboardError(
                     "%s: %s" % (type(exc).__name__, exc), code="error"
                 )
@@ -757,10 +833,10 @@ class DashboardClient:
         try:
             today_summary = self.usage_summary(today, today, group_by="model")
         except DashboardError as exc:
-            snapshot["error"] = self._error(exc)
+            snapshot["error"] = snapshot["error"] or self._error(exc)
             return snapshot
         except Exception as exc:  # noqa: BLE001 - snapshot must never raise
-            snapshot["error"] = self._error(
+            snapshot["error"] = snapshot["error"] or self._error(
                 DashboardError(
                     "%s: %s" % (type(exc).__name__, exc), code="error"
                 )
@@ -773,10 +849,10 @@ class DashboardClient:
         try:
             month_summary = self.usage_summary(month_start, today, group_by="model")
         except DashboardError as exc:
-            snapshot["error"] = self._error(exc)
+            snapshot["error"] = snapshot["error"] or self._error(exc)
             return snapshot
         except Exception as exc:  # noqa: BLE001 - snapshot must never raise
-            snapshot["error"] = self._error(
+            snapshot["error"] = snapshot["error"] or self._error(
                 DashboardError(
                     "%s: %s" % (type(exc).__name__, exc), code="error"
                 )

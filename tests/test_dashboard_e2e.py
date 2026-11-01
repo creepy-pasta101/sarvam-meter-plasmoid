@@ -31,12 +31,18 @@ from sarvam_meter.ledger import Ledger  # noqa: E402
 
 FIXTURES = os.path.join(REPO_ROOT, "tests", "fixtures")
 SUMMARY = os.path.join(FIXTURES, "dhan_usage_summary_by_model.json")
+BALANCE = os.path.join(FIXTURES, "dhan_org_balance.json")
 
 COOKIE = "session=SuperSecretCookieValue; __cf_bm=abc"
 
 
 def _summary_payload():
     with open(SUMMARY, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _balance_payload():
+    with open(BALANCE, encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -64,11 +70,15 @@ class _FakeDashboard(BaseHTTPRequestHandler):
             {"path": self.path, "cookie": self.headers.get("Cookie"),
              "authorization": self.headers.get("Authorization")}
         )
+        from urllib.parse import parse_qs, urlsplit
+        path = urlsplit(self.path).path
         if _FakeDashboard.unauthorised:
             body = json.dumps({"error": "unauthorized"}).encode()
             self.send_response(401)
+        elif path.endswith("/balance"):
+            body = json.dumps(_balance_payload()).encode()
+            self.send_response(200)
         else:
-            from urllib.parse import parse_qs, urlsplit
             query = parse_qs(urlsplit(self.path).query)
             start = (query.get("start") or [""])[0]
             end = (query.get("end") or [""])[0]
@@ -169,10 +179,17 @@ class DashboardEndToEndTest(unittest.TestCase):
         # today comes from the dashboard, not from the ledger's 1.0
         self.assertAlmostEqual(sarvam["spend"]["today"], 12.5, places=2)
         self.assertEqual(sarvam["spend"]["source"], "dashboard")
-        # balance = starting - window spend, capped at zero
+        # the reported balance wins: no arithmetic, no starting balance needed
+        self.assertTrue(sarvam["dashboard"]["balance"]["known"])
+        self.assertAlmostEqual(
+            sarvam["dashboard"]["balance"]["amount"], 80.03533, places=5
+        )
+        self.assertEqual(
+            sarvam["dashboard"]["balance"]["as_of"], "2026-11-01T05:55:39.713767Z"
+        )
         self.assertEqual(sarvam["balance"]["source"], "dashboard")
         self.assertTrue(sarvam["balance"]["known"])
-        self.assertAlmostEqual(sarvam["balance"]["remaining"], 365.77, places=2)
+        self.assertAlmostEqual(sarvam["balance"]["remaining"], 80.04, places=2)
         self.assertAlmostEqual(sarvam["balance"]["spent_total"], 134.23, places=2)
         # per-model rows, largest first is not required, but all four are there
         models = {row["model"]: row["cost"] for row in sarvam["dashboard"]["by_model"]}
@@ -204,7 +221,10 @@ class DashboardEndToEndTest(unittest.TestCase):
         self.assertEqual(sarvam["balance"]["source"], "ledger")
         # the ledger's own numbers are still shown
         self.assertAlmostEqual(sarvam["spend"]["today"], 1.0, places=2)
+        # no reported balance either, so the ledger's own arithmetic applies
+        self.assertEqual(sarvam["balance"]["source"], "ledger")
         self.assertAlmostEqual(sarvam["balance"]["remaining"], 499.0, places=2)
+        self.assertFalse(sarvam["dashboard"]["balance"]["known"])
 
 
 class SessionCliTest(unittest.TestCase):

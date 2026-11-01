@@ -38,6 +38,7 @@ They are committed as fixtures and are the contract for the parser:
 | fixture | request |
 | --- | --- |
 | `tests/fixtures/dhan_usage_summary_by_model.json` | `GET /api/dhan/org/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=model&product=sarvam-api-platform` |
+| `tests/fixtures/dhan_org_balance.json` | `GET /api/dhan/org/balance` — the authoritative credits left |
 | `tests/fixtures/dhan_usage_timeseries_by_product.json` | `GET /api/dhan/org/usage/timeseries?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=product&product=sarvam-api-platform&granularity=auto` |
 
 Both need the session. Unauthenticated they answer `401 application/json`; an
@@ -90,7 +91,10 @@ It reads, per snapshot:
 - the window summary — total cost, the per-model groups, and the usage units;
 - today's summary, for the "spend today" figure.
 
-It produces `sarvam.spend.source = "dashboard"`, `sarvam.balance.source =
+`/api/dhan/org/balance` is the endpoint that matters most: it reports the credits
+left directly, so no starting balance and no arithmetic are involved. The usage
+endpoints supply the spend windows, the per-model split and the token/audio
+quantities. It produces `sarvam.spend.source = "dashboard"`, `sarvam.balance.source =
 "dashboard"`, a `sarvam.dashboard` block with `by_model`, and, when it cannot read
 the dashboard, one error code. It does **not**:
 

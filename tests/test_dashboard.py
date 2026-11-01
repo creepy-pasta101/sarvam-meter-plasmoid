@@ -15,6 +15,7 @@ import urllib.parse
 from sarvam_meter.dashboard import (
     SUMMARY_PATH,
     TIMESERIES_PATH,
+    BALANCE_PATH,
     DashboardClient,
     DashboardError,
     load_session,
@@ -45,6 +46,22 @@ def header_value(headers, name):
         if str(key).lower() == name.lower():
             return value
     return None
+
+
+def balance_body(**overrides):
+    """The captured org balance payload (tests/fixtures/dhan_org_balance.json)."""
+    document = {
+        "org_id": "019f37be-0185-7fcb-9063-5392bd2f4e63",
+        "balance": "80.03533",
+        "real_time_credit_balance": "80.03533",
+        "balance_updated_at": "2026-11-01T05:55:39.713767Z",
+        "state": "provisioned",
+        "billing_model": "prepaid",
+        "currency": "INR",
+        "unit": "rupees",
+    }
+    document.update(overrides)
+    return json.dumps(document).encode("utf-8")
 
 
 def summary_body(**overrides):
@@ -622,7 +639,10 @@ class TestSnapshot(unittest.TestCase):
             today_body = json.dumps(today_body).encode("utf-8")
 
         def handler(method, url, headers, timeout):
-            query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.path == BALANCE_PATH:
+                return 200, {}, balance_body()
+            query = dict(urllib.parse.parse_qsl(parsed.query))
             if query.get("start") == query.get("end"):
                 return today_status, {}, today_body
             return 200, {}, window_body
@@ -661,22 +681,31 @@ class TestSnapshot(unittest.TestCase):
                 "currency",
                 "window",
                 "spend",
+                "balance",
                 "by_model",
                 "usage",
                 "error",
             },
         )
+        self.assertTrue(snapshot["balance"]["known"])
+        self.assertAlmostEqual(snapshot["balance"]["amount"], 80.03533, places=5)
+        self.assertEqual(snapshot["balance"]["state"], "provisioned")
+        self.assertEqual(snapshot["balance"]["billing_model"], "prepaid")
+        self.assertEqual(snapshot["balance"]["as_of"], "2026-11-01T05:55:39.713767Z")
 
-    def test_snapshot_makes_three_calls(self):
+    def test_snapshot_makes_four_calls(self):
         transport = self.two_call_transport(self.window_body(), summary_body())
         DashboardClient(BASE, SESSION, transport=transport).snapshot(
             since_date="2026-10-20", today="2026-11-01"
         )
-        # window, today, and month-to-date (first of the month .. today)
-        self.assertEqual(transport.paths(), [SUMMARY_PATH, SUMMARY_PATH, SUMMARY_PATH])
+        # balance first, then window, today and month-to-date
         self.assertEqual(
-            [request["query"]["start"] for request in transport.requests],
-            ["2026-10-20", "2026-11-01", "2026-11-01"],
+            transport.paths(),
+            [BALANCE_PATH, SUMMARY_PATH, SUMMARY_PATH, SUMMARY_PATH],
+        )
+        self.assertEqual(
+            [request["query"].get("start", "") for request in transport.requests],
+            ["", "2026-10-20", "2026-11-01", "2026-11-01"],
         )
 
     def test_today_failure_keeps_window_result(self):
@@ -695,6 +724,7 @@ class TestSnapshot(unittest.TestCase):
 
     def test_window_failure_is_reported_and_not_reachable(self):
         transport = FakeTransport().route("GET", SUMMARY_PATH, status=401, body=b"{}")
+        transport.route("GET", BALANCE_PATH, status=401, body=b"{}")
         snapshot = DashboardClient(BASE, SESSION, transport=transport).snapshot(
             since_date="2026-10-20", today="2026-11-01"
         )
@@ -705,6 +735,7 @@ class TestSnapshot(unittest.TestCase):
 
     def test_window_transport_failure_is_unreachable(self):
         transport = FakeTransport().route("GET", SUMMARY_PATH, exc=OSError("boom"))
+        transport.route("GET", BALANCE_PATH, exc=OSError("boom"))
         snapshot = DashboardClient(BASE, SESSION, transport=transport).snapshot(
             since_date="2026-10-20", today="2026-11-01"
         )
@@ -713,6 +744,7 @@ class TestSnapshot(unittest.TestCase):
 
     def test_window_html_body_is_bad_response(self):
         transport = FakeTransport().route("GET", SUMMARY_PATH, body=b"<html>blocked</html>")
+        transport.route("GET", BALANCE_PATH, body=b"<html>blocked</html>")
         snapshot = DashboardClient(BASE, SESSION, transport=transport).snapshot(
             since_date="2026-10-20", today="2026-11-01"
         )

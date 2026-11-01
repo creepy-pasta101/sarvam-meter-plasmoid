@@ -738,7 +738,18 @@ Base: `https://indus.sarvam.ai` (the dashboard; `dashboard.sarvam.ai` 308-redire
 ```
 GET /api/dhan/org/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=model&product=sarvam-api-platform
 GET /api/dhan/org/usage/timeseries?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=product&product=sarvam-api-platform&granularity=auto
+GET /api/dhan/org/balance
 ```
+
+Balance payload (fixture `dhan_org_balance.json`) — the authoritative credits left:
+
+```json
+{"org_id": "019f37be-...", "balance": "80.03533", "real_time_credit_balance": "80.03533",
+ "balance_updated_at": "2026-11-01T05:55:39.713767Z", "state": "provisioned",
+ "billing_model": "prepaid", "currency": "INR", "unit": "rupees"}
+```
+
+Here `currency` is already uppercase and the numbers are still strings.
 
 Both need the signed-in session. Unauthenticated they answer `401 application/json`;
 an unknown `/api/...` path answers `404` with the SPA shell instead.
@@ -802,9 +813,11 @@ class DashboardClient:
     def usage_summary(self, start_date: str, end_date: str, group_by: str = "model") -> dict
     def usage_timeseries(self, start_date: str, end_date: str, group_by: str = "product",
                          granularity: str = "auto") -> dict
+    def balance(self) -> dict
     def snapshot(self, *, since_date: str, today: str) -> dict   # NEVER raises
 def parse_summary(payload: bytes | dict) -> dict
 def parse_timeseries(payload: bytes | dict) -> dict
+def parse_balance(payload: bytes | dict) -> dict
 ```
 
 `transport(method, url, headers, timeout) -> (status, headers, body_bytes)`,
@@ -832,17 +845,28 @@ no redirects (same rules as `cliproxy.py`). Dates are `YYYY-MM-DD`.
 {"configured": bool, "reachable": bool, "as_of": str, "org_id": str|None,
  "currency": "INR", "window": {"start": str, "end": str},
  "spend": {"window": float, "today": float, "month": float},
+ "balance": {"known": bool, "amount": float|None, "currency": "INR",
+             "as_of": str|None, "state": str, "billing_model": str, "unit": str},
  "by_model": [{"model": str, "cost": float}],
  "usage": [ ... ],
  "error": None | {"source": "dashboard", "code": str, "message": str}}
 ```
 
+`parse_balance` returns `{"org_id","balance","currency","as_of","state","billing_model","unit"}`
+(`as_of` from `balance_updated_at`; `real_time_credit_balance` wins over `balance`
+when both are present).
+
 Error codes: `no_session`, `unauthorized` (401/403), `bad_response` (non-JSON or
-unparsable), `unreachable` (transport failure), `http_error`. Three calls per
-snapshot: the window summary, today's summary, and the month-to-date summary
-(first of the current month .. today, because the ledger's own month total is not
-comparable once the dashboard is the source). A failure of either short call
-leaves that field at `0.0` and keeps the window result, with the error recorded.
+unparsable), `unreachable` (transport failure), `http_error`. Four calls per
+snapshot, in this order: the **balance** (authoritative, needs no arithmetic, so
+it is fetched first and a later failure must not cost it), the window summary,
+today's summary, and the month-to-date summary (first of the current month ..
+today, because the ledger's own month total is not comparable once the dashboard
+is the source). A failure of either short call leaves that field at `0.0` and
+keeps the window result. The **first** error encountered is the one recorded, and
+`reachable` stays `false` unless the window call produced numbers — so a reported
+balance can be known while `reachable` is `false`. Dates are validated before any
+request is made (`bad_request`, no transport call).
 
 ## 17.4 Config section
 
@@ -884,11 +908,14 @@ this section.
 
 Rules:
 
-- `balance.source` and `spend.source` are `"dashboard"` when the dashboard snapshot
-  is reachable, else `"ledger"`.
-- With a dashboard snapshot and a starting balance: `spent_total = dashboard.spend.window`,
-  `remaining = max(0, starting - spent_total)`, window start = the date part of
-  `balance.set_at`.
+- `spend.source` is `"dashboard"` when the dashboard snapshot is reachable, else
+  `"ledger"`.
+- `balance.source` is `"dashboard"` when the balance endpoint reported a number
+  (**no starting balance is needed**), `"dashboard-derived"` when only the usage
+  windows answered (`remaining = max(0, starting - dashboard.spend.window)`, window
+  start = the date part of `balance.set_at`), and `"ledger"` otherwise.
+- `balance.remaining` is the reported figure verbatim when it is known; a reported
+  `0.0` is a known, exhausted balance, not an unknown one.
 - Without a dashboard snapshot: the existing ledger behaviour, `source = "ledger"`.
 - `spend.today` and `spend.month` come from the dashboard when reachable, else
   from the ledger.

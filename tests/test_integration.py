@@ -81,6 +81,7 @@ DASHBOARD_KEYS = {
     "spend",
     "by_model",
     "error",
+    "balance",
 }
 CALLS_KEYS = {"today"}
 RATE_LIMIT_KEYS = {"count_24h", "last_at"}
