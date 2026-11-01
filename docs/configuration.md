@@ -111,7 +111,7 @@ Example — raise the upload ceiling for long audio and listen on a different po
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Show the Sarvam section at all. |
 | `currency` | string | `INR` | Three-letter uppercase currency code, used for formatting. |
-| `starting_balance` | number or null | `null` | The credit balance you saw in the Sarvam dashboard. `null` means "not set": the widget shows spend only, and `balance.known` is `false`. `sarvam-meter balance set <amount>` stores the same figure in the ledger (table `balance`), which is what the status payload reports. |
+| `starting_balance` | number or null | `null` | The credit balance you saw in the Sarvam dashboard (not needed when the dashboard source is enabled — it reads the real figure). `null` means "not set": the widget shows spend only, and `balance.known` is `false`. `sarvam-meter balance set <amount>` stores the same figure in the ledger (table `balance`), which is what the status payload reports. |
 | `rate_overrides` | object | `{}` | Rate card overrides, see below. |
 
 ### `cliproxy`
@@ -231,32 +231,47 @@ change for a reader of `GET /v1/status` (the full annotated shape is in
 
 - `sarvam.spend` gains `source`: `"dashboard"` when a dashboard snapshot is
   reachable, `"ledger"` otherwise.
-- `sarvam.balance` gains the same `source` field.
+- `sarvam.balance` gains a `source` field with three possible values:
+  `"dashboard"` when the balance endpoint reported the credits left,
+  `"dashboard-derived"` when only the usage windows answered and the figure is
+  `starting - window spend`, and `"ledger"` when the local meter is all there is.
+- `sarvam.dashboard.balance` carries the reported figure:
+  `{"known", "amount", "currency", "as_of", "state", "billing_model", "unit"}`.
 - `sarvam.dashboard` is **always present** — `configured: false` when the section is
   disabled — and carries the snapshot:
 
 ```json
 "sarvam": {
   "spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
-  "balance": {"known": true, "remaining": 365.77, "starting": 500.0,
-              "spent_total": 134.23, "set_at": "...", "source": "dashboard"},
+  "balance": {"known": true, "remaining": 80.04, "starting": null,
+              "spent_total": 134.23, "set_at": null, "source": "dashboard"},
   "dashboard": {
     "configured": true, "reachable": true, "as_of": "...",
     "org_id": "...", "currency": "INR",
     "window": {"start": "2026-10-20", "end": "2026-11-01"},
-    "spend": {"window": 134.23, "today": 12.3},
+    "spend": {"window": 134.23, "today": 12.3, "month": 134.23},
+    "balance": {"known": true, "amount": 80.03533, "currency": "INR",
+                "as_of": "2026-11-01T05:55:39.713767Z", "state": "provisioned",
+                "billing_model": "prepaid", "unit": "rupees"},
     "by_model": [{"model": "saaras:v4", "cost": 74.05}],
     "error": null
   }
 }
 ```
 
-With a reachable dashboard snapshot **and** a starting balance set, the arithmetic
-changes: `spent_total` becomes the dashboard's spend for the window (the date part of
-`balance.set_at` through today) and `remaining = max(0, starting - spent_total)`.
-Without a snapshot nothing changes from schema 1: the ledger numbers are reported
-with `source: "ledger"`. `spend.today` likewise comes from the dashboard when it is
-reachable and from the ledger otherwise.
+`GET /api/dhan/org/balance` reports the credits left, so **once the dashboard source
+is on you do not need `sarvam-meter balance set` at all**: `balance.remaining` is the
+reported figure verbatim and `balance.source` is `"dashboard"`. A reported `0.00` is a
+known, exhausted balance — the widget shows it as such rather than as "unknown".
+
+Without a reported balance but with the usage windows answering and a starting
+balance set, the arithmetic applies instead: `spent_total` is the dashboard's spend
+for the window (the date part of `balance.set_at` through today) and
+`remaining = max(0, starting - spent_total)`, with `balance.source` set to
+`"dashboard-derived"` so you can tell the two apart. Without a snapshot nothing
+changes from schema 1: the ledger numbers are reported with `source: "ledger"`.
+`spend.today` and `spend.month` likewise come from the dashboard when it is reachable
+and from the ledger otherwise.
 
 A dashboard that is configured but not reachable is not something you have to act
 on: `sarvam.dashboard.reachable` is `false`, `sarvam.dashboard.error` carries
