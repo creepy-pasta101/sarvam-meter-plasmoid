@@ -38,6 +38,13 @@ BuildArch:      noarch
 
 Requires:       python3 >= 3.9
 Requires:       plasma-workspace >= 6.0
+# Declared because the QML imports them directly. plasma-workspace pulls these in
+# transitively today, but a direct import should not depend on someone else's
+# dependency graph -- plasma5support in particular is a recent split-out, and a
+# missing module means the applet fails to load with "module not installed".
+Requires:       plasma5support
+Requires:       kf6-kirigami
+Requires:       kf6-kcmutils
 Requires:       systemd
 # Optional: the settings page can sign in to the Sarvam dashboard in a webview.
 # Without it the page falls back to the CLI, which is why this is not a hard

@@ -126,6 +126,62 @@ class ReleaseMustChangeTest(unittest.TestCase):
         self.assertIn('RELEASE="1.', self.ci)
 
 
+class QmlDependenciesAreDeclaredTest(unittest.TestCase):
+    """Every QML module the applet imports must be a declared dependency.
+
+    A missing module is not a warning: the applet fails to load with "module
+    <name> is not installed". Relying on plasma-workspace to pull the rest in
+    transitively works until it does not -- plasma5support is a recent split-out.
+    """
+
+    #: import -> the Fedora package that provides it.  QtQuick* ships with the Qt
+    #: runtime that plasma-workspace already requires, so it needs no line here.
+    PROVIDED = {
+        "QtQuick": None,
+        "QtQuick.Controls": None,
+        "QtQuick.Layouts": None,
+        "org.kde.plasma.plasmoid": "plasma-workspace",
+        "org.kde.plasma.components": "plasma-workspace",
+        "org.kde.plasma.extras": "plasma-workspace",
+        "org.kde.plasma.configuration": "plasma-workspace",
+        "org.kde.plasma.plasma5support": "plasma5support",
+        "org.kde.kirigami": "kf6-kirigami",
+        "org.kde.kcmutils": "kf6-kcmutils",
+        "QtWebEngine": "qt6-qtwebengine",
+    }
+
+    def imports(self):
+        root = os.path.join(REPO_ROOT, "plasmoid", "io.github.creepy_pasta101.sarvammeter", "contents")
+        found = set()
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if not name.endswith(".qml"):
+                    continue
+                with open(os.path.join(dirpath, name), encoding="utf-8") as handle:
+                    for line in handle:
+                        match = re.match(r"\s*import\s+([\w.]+)", line)
+                        if match:
+                            found.add(match.group(1))
+        return found
+
+    def test_every_import_maps_to_a_package(self):
+        unknown = sorted(self.imports() - set(self.PROVIDED))
+        self.assertEqual(
+            unknown, [],
+            "these imports are not mapped to a package; add them here and to the "
+            "spec's Requires: %r" % (unknown,))
+
+    def test_each_package_is_declared(self):
+        spec = read(SPEC)
+        declared = set(re.findall(r"(?m)^(?:Requires|Recommends):\s*(\S+)", spec))
+        for module, package in sorted(self.PROVIDED.items()):
+            if package is None:
+                continue
+            self.assertIn(
+                package, declared,
+                "%r is imported but %r is not in Requires/Recommends" % (module, package))
+
+
 class SpecMacroSafetyTest(unittest.TestCase):
     """Comments in a spec are still macro-expanded.
 
