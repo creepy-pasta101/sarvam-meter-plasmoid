@@ -79,6 +79,18 @@ class DaemonTestCase(unittest.TestCase):
         self.port = self.daemon.start()
         self.addCleanup(self.daemon.shutdown)
 
+    def wait_for_logs(self, count, timeout=5.0):
+        """Block until the daemon has logged `count` lines.
+
+        The daemon writes its log line *after* the response, so a client can
+        return before the line exists.  Asserting on the count straight away is a
+        race -- it failed once in CI on a loaded runner.
+        """
+        deadline = time.time() + timeout
+        while len(self.logs) < count and time.time() < deadline:
+            time.sleep(0.01)
+        return len(self.logs)
+
     def request(self, method, path, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
@@ -271,7 +283,7 @@ class LoggingTest(DaemonTestCase):
         self.request("GET", "/v1/status")
         self.request("GET", "/v1/health")
         self.request("PUT", "/v1/status")
-        self.assertGreaterEqual(len(self.logs), 3)
+        self.assertGreaterEqual(self.wait_for_logs(3), 3)
         for line in self.logs:
             self.assertIn("/v1/", line)
             self.assertNotIn(SECRET, line)
@@ -281,6 +293,9 @@ class LoggingTest(DaemonTestCase):
 
     def test_query_string_is_not_logged(self):
         self.request("GET", "/v1/status?key=" + SECRET)
+        # Wait for the line to exist, otherwise "no secret in the log" passes
+        # vacuously because the log is empty.
+        self.assertEqual(self.wait_for_logs(1), 1)
         self.assertFalse(any(SECRET in line for line in self.logs))
 
 
