@@ -237,6 +237,13 @@ change for a reader of `GET /v1/status` (the full annotated shape is in
   `starting - window spend`, and `"ledger"` when the local meter is all there is.
 - `sarvam.dashboard.balance` carries the reported figure:
   `{"known", "amount", "currency", "as_of", "state", "billing_model", "unit"}`.
+
+`as_of` is worth looking at: it is `balance_updated_at` from the balance endpoint,
+which is when the *balance value* last changed, not when the widget last asked.
+Sarvam updates it lazily, so a reading can be an hour old while the widget polled a
+minute ago. The applet therefore prints the age under the balance — `balance 4m
+ago`, or `balance 2h ago · not refreshed` past 30 minutes — refreshed by a 30 s
+timer with no network involved.
 - `sarvam.dashboard` is **always present** — `configured: false` when the section is
   disabled — and carries the snapshot:
 
