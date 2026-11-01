@@ -701,6 +701,7 @@ class DashboardCommandTest(CliTestCase):
                 "currency",
                 "window",
                 "spend",
+                "balance",
                 "by_model",
                 "error",
             },
