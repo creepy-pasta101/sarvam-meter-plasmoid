@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Build artifacts, caches and local state
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.plasmoid
+rpmbuild/
+*.rpm
+*.tar.gz
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
