@@ -147,6 +147,12 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # A unit file with a typo is only discovered by the user at enable time.
+      - name: Validate the systemd unit
+        run: |
+          dnf install -y --setopt=install_weak_deps=False systemd
+          systemd-analyze verify --man=no packaging/sarvam-meter.service
+
       - name: Build the source tarball and the RPM
         run: |
           set -euo pipefail
