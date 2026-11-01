@@ -27,6 +27,24 @@
 // in main.xml, and are written only by the "Save backend settings" button -
 // never by this dialog's Apply, which copies cfg_* properties only.
 
+// A THIRD THING: THE DASHBOARD SESSION (unit D)
+// The dashboard source needs a signed-in Sarvam session, stored by the daemon in
+// a 0600 file. The "Capture session..." button below opens SessionCapture.qml in
+// a browser window and POSTs what it harvests to /v1/session.
+//
+// That sheet is the only file in this package that imports QtWebEngine, and
+// QtWebEngine is not part of a standard KDE install - an unresolvable QML import
+// is fatal to the component that holds it. So this page never names the module
+// and never instantiates the sheet at load time: it is reached through a Loader
+// that is activated on demand (sessionSheetLoader, source "SessionCapture.qml"),
+// and a Loader.Error - the missing module - is turned into a message naming the
+// package to install and the CLI fallback. A machine without QtWebEngine loses
+// this one button and keeps the whole settings page.
+//
+// Session values are secret. They travel in one local variable, straight into
+// the POST body, and are never put into a property, a label, a tooltip, a log
+// line or an error message. The status line shows counts and header names only.
+
 import QtQuick
 import QtQuick.Layouts
 
@@ -98,9 +116,27 @@ KCM.SimpleKCM {
     readonly property int backendTimeoutMs: 8000
     readonly property int maxBackendResponseChars: 256 * 1024
 
-    // One GET /v1/config when the page opens. Read-only, so it cannot disturb
+    // ---- dashboard session (unit D): state shown in the Backend group ----
+    // idle | loading | ready | error
+    property string sessionState: "idle"
+    property bool sessionConfigured: false
+    // Header NAMES the daemon reports holding ("cookie", "authorization").
+    // Never a value: GET /v1/session does not return one.
+    property var sessionHeaderNames: []
+    property string sessionMessage: ""
+
+    // The sheet, its loader and the last result of a capture.
+    property bool sessionSheetActive: false
+    property bool sessionLoadFailed: false
+    property string sessionFeedback: ""
+    property string sessionFeedbackKind: "none"   // none | ok | fail | info
+
+    // One GET /v1/session when the page opens, then the usual GET /v1/config.
+    // Both go through sendBackendRequest(), which is single-flight, so they are
+    // sequenced rather than fired together: the session read settles, and its
+    // completion starts the config read. Read-only, so neither can disturb
     // anything the user has typed.
-    Component.onCompleted: page.loadBackendConfig()
+    Component.onCompleted: page.loadSessionStatus()
 
     readonly property string daemonUrlError: validateDaemonUrl(daemonUrlField.text)
     readonly property bool daemonUrlInvalid: daemonUrlError !== ""
@@ -589,6 +625,181 @@ KCM.SimpleKCM {
         return message;
     }
 
+    // ------------------------------------------------------------------
+    // Dashboard session (unit D)
+    // ------------------------------------------------------------------
+
+    // The header names the daemon says it holds, filtered and bounded: the
+    // answer comes off the wire and nothing about its shape is guaranteed.
+    function sanitiseHeaderNames(raw) {
+        if (!raw || typeof raw !== "object" || typeof raw.length !== "number") {
+            return [];
+        }
+        var names = [];
+        var limit = Math.min(raw.length, 4);
+        for (var i = 0; i < limit; i++) {
+            var name = raw[i];
+            if (typeof name !== "string" || name.length === 0 || name.length > 40) {
+                continue;
+            }
+            if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) {
+                continue;
+            }
+            names.push(name.toLowerCase());
+        }
+        return names;
+    }
+
+    function applySessionDocument(doc) {
+        if (!doc || typeof doc !== "object") {
+            page.sessionState = "error";
+            page.sessionMessage = "Cannot read the session - the daemon did not answer with a session document.";
+            return;
+        }
+        page.sessionConfigured = doc.configured === true;
+        page.sessionHeaderNames = page.sanitiseHeaderNames(doc.headers);
+        page.sessionState = "ready";
+        page.sessionMessage = "";
+    }
+
+    // "session captured (cookie)" / "no session captured yet". Counts and header
+    // names only - the endpoint never hands out a value and this page could not
+    // show one if it did.
+    function sessionStatusLabel() {
+        if (page.sessionState === "loading") {
+            return "reading the session ...";
+        }
+        if (page.sessionState === "error") {
+            return page.sessionMessage;
+        }
+        if (page.sessionState === "ready") {
+            if (!page.sessionConfigured) {
+                return "no session captured yet";
+            }
+            var names = page.sessionHeaderNames.join(", ");
+            return names === "" ? "session captured" : "session captured (" + names + ")";
+        }
+        return "not read yet.";
+    }
+
+    function sessionFeedbackColor() {
+        if (page.sessionFeedbackKind === "ok") {
+            return Kirigami.Theme.positiveTextColor;
+        }
+        if (page.sessionFeedbackKind === "fail") {
+            return Kirigami.Theme.negativeTextColor;
+        }
+        return Kirigami.Theme.disabledTextColor;
+    }
+
+    // GET /v1/session, then GET /v1/config. The config read is chained here
+    // because sendBackendRequest() is single-flight: starting the second request
+    // aborts the first, so they must not overlap.
+    function loadSessionStatus() {
+        var base = backendBaseUrl();
+        var urlError = validateDaemonUrl(base);
+        if (urlError !== "") {
+            page.sessionState = "error";
+            page.sessionMessage = "Cannot read the session - " + urlError;
+            page.loadBackendConfig();
+            return;
+        }
+
+        var target = base + "/v1/session";
+        page.sessionState = "loading";
+        page.sessionMessage = "";
+
+        sendBackendRequest("GET", target, null, function (doc) {
+            page.applySessionDocument(doc);
+            page.loadBackendConfig();
+        }, function (message) {
+            page.sessionState = "error";
+            page.sessionMessage = "Cannot read the session - " + message;
+            page.loadBackendConfig();
+        });
+    }
+
+    // Shown in place of the sheet when the Loader cannot load it. QtWebEngine is
+    // the overwhelmingly likely cause: it is an optional package on every
+    // distribution and is absent from most KDE installs.
+    function sessionUnavailableText() {
+        return "The sign-in sheet could not be loaded. Either the QtWebEngine QML module is missing (it is not part of a standard KDE install) or the sheet itself failed to load. "
+            + "On Fedora, install it with: sudo dnf install qt6-qtwebengine - then reopen this page. On Debian and Ubuntu the package is qml6-module-qtwebengine. "
+            + "Nothing else here depends on it: the rest of this page and the widget keep working. "
+            + "To capture the session without a web engine, sign in to indus.sarvam.ai in your browser, copy the Cookie header value out of the developer tools, and run: sarvam-meter session set --cookie-file PATH (see docs/dashboard-scrape.md).";
+    }
+
+    function openSessionCapture() {
+        page.sessionFeedback = "";
+        page.sessionFeedbackKind = "none";
+        page.sessionLoadFailed = false;
+        page.sessionSheetActive = true;
+        // Created here, on demand, and nowhere else. This is the only place the
+        // page can fail on a missing QtWebEngine, and it fails inside the Loader.
+        sessionSheetLoader.active = true;
+    }
+
+    function closeSessionCapture() {
+        page.sessionSheetActive = false;
+        page.sessionLoadFailed = false;
+        // Destroying the item drops the WebEngine profile's in-memory cookies.
+        sessionSheetLoader.active = false;
+    }
+
+    // Loader.Error: the module is missing or the sheet is broken. Do not retry -
+    // a missing import is not transient - and keep the page usable.
+    function noteSessionSheetError() {
+        page.sessionLoadFailed = true;
+        sessionSheetLoader.active = false;
+    }
+
+    // The sheet's captured(cookieHeader, authorizationHeader). Both arguments are
+    // secret: they stay in these two locals and go straight into the POST body.
+    // They are never assigned to a property, so nothing can bind to them, and
+    // nothing that is displayed is built from them.
+    function handleSessionCaptured(cookieHeader, authorizationHeader) {
+        var cookie = (typeof cookieHeader === "string") ? cookieHeader : "";
+        var authorization = (typeof authorizationHeader === "string") ? authorizationHeader : "";
+
+        page.closeSessionCapture();
+
+        if (cookie === "") {
+            page.sessionFeedback = "FAIL: the sheet handed back no cookie header.";
+            page.sessionFeedbackKind = "fail";
+            return;
+        }
+
+        var base = backendBaseUrl();
+        var urlError = validateDaemonUrl(base);
+        if (urlError !== "") {
+            page.sessionFeedback = "FAIL: " + urlError;
+            page.sessionFeedbackKind = "fail";
+            return;
+        }
+
+        var target = base + "/v1/session";
+        var payload = { "cookie": cookie };
+        if (authorization !== "") {
+            payload.authorization = authorization;
+        }
+
+        page.sessionFeedback = "Sending the session to " + target + " ...";
+        page.sessionFeedbackKind = "info";
+
+        sendBackendRequest("POST", target, payload, function (doc) {
+            page.sessionFeedback = "OK: session stored";
+            page.sessionFeedbackKind = "ok";
+            // Re-read the session, and through it the config: the daemon decides
+            // what it actually kept, and this page only reports that.
+            page.loadSessionStatus();
+        }, function (message) {
+            // The message is the daemon's, or a status code and the URL. It is
+            // never built from the request body, so it cannot carry the cookie.
+            page.sessionFeedback = "FAIL: " + message;
+            page.sessionFeedbackKind = "fail";
+        });
+    }
+
     // GET /v1/config: the one read that populates the group.
     function loadBackendConfig() {
         var base = backendBaseUrl();
@@ -928,6 +1139,118 @@ KCM.SimpleKCM {
             visible: page.backendHasDashboard
             text: "Allowed range: 120 seconds (2 minutes) to 21600 seconds (6 hours), in steps of 60 seconds. The dashboard sits behind bot management, so it must not be polled minute by minute."
             color: Kirigami.Theme.disabledTextColor
+            wrapMode: Text.Wrap
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 26
+        }
+
+        RowLayout {
+            Kirigami.FormData.label: "Dashboard session:"
+            spacing: Kirigami.Units.smallSpacing
+
+            PlasmaComponents.Button {
+                text: "Capture session..."
+                icon.name: "dialog-password"
+                enabled: !page.backendBusy
+                onClicked: page.openSessionCapture()
+            }
+
+            PlasmaComponents.Label {
+                text: page.sessionStatusLabel()
+                color: page.sessionState === "error" ? Kirigami.Theme.negativeTextColor
+                     : (page.sessionState === "ready" && page.sessionConfigured) ? Kirigami.Theme.positiveTextColor
+                     : Kirigami.Theme.disabledTextColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+            }
+        }
+
+        PlasmaComponents.Label {
+            text: "The dashboard needs a signed-in session. Capture it once here, or from a terminal with sarvam-meter session set --cookie-file PATH. The daemon keeps it in a file only your user can read and never shows the value again; this page only ever reports whether a session is stored and which headers it holds."
+            color: Kirigami.Theme.disabledTextColor
+            wrapMode: Text.Wrap
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 26
+        }
+
+        // The sheet lives behind this Loader and nowhere else. It stays inactive
+        // - and therefore unloaded, and therefore harmless on a system without
+        // QtWebEngine - until the button above asks for it.
+        ColumnLayout {
+            id: sessionSheetHost
+            Kirigami.FormData.label: ""
+            visible: page.sessionSheetActive
+            Layout.fillWidth: true
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
+            spacing: Kirigami.Units.smallSpacing
+
+            Loader {
+                id: sessionSheetLoader
+                Layout.fillWidth: true
+                Layout.preferredHeight: (page.sessionSheetActive && status === Loader.Ready)
+                    ? Kirigami.Units.gridUnit * 30 : 0
+                active: false
+                // Resolved against this page's own URL, i.e. contents/config/,
+                // next to configGeneral.qml.
+                source: "SessionCapture.qml"
+
+                onLoaded: {
+                    if (!item) {
+                        page.noteSessionSheetError();
+                        return;
+                    }
+                    item.width = Qt.binding(function () { return sessionSheetLoader.width; });
+                    item.height = Qt.binding(function () { return sessionSheetLoader.height; });
+                    try {
+                        item.captured.connect(page.handleSessionCaptured);
+                        item.closeRequested.connect(page.closeSessionCapture);
+                    } catch (e) {
+                        // The file loaded but is not the sheet we expect: treat it
+                        // exactly like a missing module rather than half-using it.
+                        page.noteSessionSheetError();
+                    }
+                }
+
+                onStatusChanged: {
+                    if (status === Loader.Error) {
+                        page.noteSessionSheetError();
+                    }
+                }
+            }
+
+            PlasmaComponents.Label {
+                visible: page.sessionLoadFailed
+                text: page.sessionUnavailableText()
+                color: Kirigami.Theme.negativeTextColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+
+            PlasmaComponents.Label {
+                visible: page.sessionSheetActive && !page.sessionLoadFailed
+                    && sessionSheetLoader.status === Loader.Loading
+                text: "Opening the sign-in window ..."
+                color: Kirigami.Theme.disabledTextColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+
+            RowLayout {
+                PlasmaComponents.Button {
+                    text: "Close"
+                    icon.name: "dialog-close"
+                    onClicked: page.closeSessionCapture()
+                }
+
+                Item {
+                    Layout.fillWidth: true
+                }
+            }
+        }
+
+        PlasmaComponents.Label {
+            visible: page.sessionFeedback !== ""
+            text: page.sessionFeedback
+            color: page.sessionFeedbackColor()
             wrapMode: Text.Wrap
             Layout.maximumWidth: Kirigami.Units.gridUnit * 26
         }

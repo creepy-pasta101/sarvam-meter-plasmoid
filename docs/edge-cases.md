@@ -111,3 +111,7 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | The dashboard is enabled but no session has been captured | `cli._dashboard_session_check`, `cli._dashboard_reachable` | `doctor` prints `OK dashboard session: not configured (run: sarvam-meter session set ...)` and exits 0 — a setup step, not a fault. A session file with loose permissions is still a FAIL |
 | The settings page sends a key the daemon will not accept | `daemon` `POST /v1/config` | `400` naming the key (`cliproxy.management_key is not writable`); the config file is left byte-identical |
 | The settings page sends an out-of-range poll interval | `config.py` bounds + `configGeneral.qml` clamp | `400` from the daemon, and the page clamps to 120..21600 before sending |
+| QtWebEngine is not installed | `configGeneral.qml` `Loader.status === Loader.Error` | the sheet is replaced by a message naming `qt6-qtwebengine` and the CLI fallback; the rest of the page is untouched |
+| The webview collects no cookies (sign-in failed, or the flow changed) | `SessionCapture.qml` manual fallback | the sheet still accepts a pasted Cookie header, so capture is never a dead end |
+| The user has never captured a session | `POST`/`GET /v1/session`, `dashboard` `no_session` | the widget shows spend only, `doctor` calls it "not configured" and names the command |
+| The unit is enabled before any config exists | `ExecStartPre=... init --if-missing` | a default config is written at 0600 on first start; an edited one is never overwritten |
