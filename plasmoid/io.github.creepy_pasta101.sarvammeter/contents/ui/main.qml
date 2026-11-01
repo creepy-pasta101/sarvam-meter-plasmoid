@@ -122,6 +122,17 @@ PlasmoidItem {
         onTriggered: root.refresh()
     }
 
+    // Re-evaluates the balance age text.  No network, no allocation worth
+    // mentioning: one Date.now() and a string format every 30 seconds, and only
+    // while there is an as_of timestamp to age.
+    Timer {
+        id: clockTimer
+        interval: 30000
+        repeat: true
+        running: root.balanceAsOf.length > 0
+        onTriggered: root.clockTick = Date.now()
+    }
+
     // Belt and braces: Qt's own xhr.timeout covers the transfer, not every way a
     // server can go quiet.  If the request has not settled by then, kill it.
     Timer {
@@ -596,6 +607,63 @@ PlasmoidItem {
         if (parts.length === 0)
             return "";
         return "Errors: " + parts.join("; ");
+    }
+
+    // ---- balance freshness --------------------------------------------
+    // `balance_updated_at` from /api/dhan/org/balance is when the *balance value*
+    // last changed, not when we last asked.  Sarvam updates it lazily, so a
+    // reading can legitimately be an hour old while the widget itself polled a
+    // minute ago — and a stale "80.04 left" looks exactly like a live one.  The
+    // age is shown next to the balance so the two cannot be confused.
+    readonly property string balanceAsOf: {
+        var block = root.dashboardObject.balance;
+        if (typeof block !== "object" || block === null)
+            return "";
+        var stamp = block.as_of;
+        return (typeof stamp === "string") ? stamp : "";
+    }
+
+    // Bumped by clockTimer so the age text re-evaluates without a network call.
+    property double clockTick: 0
+
+    readonly property double balanceAgeMs: {
+        var stamp = root.balanceAsOf;
+        var tick = root.clockTick;
+        if (stamp.length === 0)
+            return -1;
+        var parsed = Date.parse(stamp);
+        if (isNaN(parsed))
+            return -1;
+        var now = tick > 0 ? tick : Date.now();
+        return now - parsed;
+    }
+
+    readonly property bool balanceAgeOld: root.balanceAgeMs > 30 * 60 * 1000
+
+    // "just now", "7m ago", "3h ago", "2d ago".
+    function ageText(ms) {
+        if (!isFinite(ms) || ms < 0)
+            return "";
+        var minutes = Math.floor(ms / 60000);
+        if (minutes < 1)
+            return "just now";
+        if (minutes < 60)
+            return minutes + "m ago";
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24)
+            return hours + "h ago";
+        return Math.floor(hours / 24) + "d ago";
+    }
+
+    readonly property string balanceFreshnessLine: {
+        if (root.balanceAgeMs < 0)
+            return "";
+        var text = root.ageText(root.balanceAgeMs);
+        if (text.length === 0)
+            return "";
+        return root.balanceAgeOld
+            ? ("balance " + text + " \u00b7 not refreshed")
+            : ("balance " + text);
     }
 
     readonly property string footerText: {
