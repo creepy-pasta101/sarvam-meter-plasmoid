@@ -1178,6 +1178,8 @@ class RobustnessTest(unittest.TestCase):
         self.assertEqual(errors[0]["source"], "cliproxy")
         self.assertEqual(errors[0]["code"], "unreachable")
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores permission bits, so the failure cannot be reproduced")
     def test_status_answers_when_the_ledger_database_cannot_be_opened(self):
         broken = os.path.join(self.tmp, "broken")
         os.makedirs(broken)
