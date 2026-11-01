@@ -11,41 +11,31 @@ Sarvam AI publishes **no** usage or credits REST API. Balance and usage exist on
 in their web dashboard, so no program on your machine can *ask* Sarvam how many
 credits you have left.
 
-This project does not pretend otherwise. It meters usage **locally**:
+This project therefore does not measure your API traffic, and it does not pretend
+to. **It relays nothing and listens on no TCP port.** There is no reverse proxy
+here, no local meter in front of `https://api.sarvam.ai`, and no client of yours
+has to be pointed anywhere else. It is a **dashboard scraper**: it reads the
+numbers Sarvam's own dashboard shows, using a session you capture once from your
+browser, and it reports the two things only Sarvam knows:
 
-- the daemon can run as a **recording reverse proxy** in front of
-  `https://api.sarvam.ai`;
-- for each call it relays it measures the billable quantity (chat tokens, TTS
-  characters, STT seconds), prices it against a rate card, and writes it to a
-  local **SQLite ledger**;
-- you enter a **starting credit balance** once, and the widget shows
-  `remaining = starting balance - measured spend`, plus spend today and this
-  month.
+- the **authoritative, org-wide spend** — every call from every machine and every
+  client, not just the traffic one machine happened to see — with the per-model
+  cost breakdown for the window;
+- the **real credit balance**, read from the balance endpoint rather than derived
+  from anything.
 
-Every Sarvam number the widget shows is a measurement of traffic that went
-through your own machine, not a reading of Sarvam's billing system. Calls that do
-not pass through the proxy are invisible to it (see
-[What is not tracked](#what-is-not-tracked)).
-
-The second source is different, and it is real: CLIProxyAPI's management API
+The second source is different, and it is real too: CLIProxyAPI's management API
 exposes actual quota for the OAuth accounts it proxies, and the widget shows the
 remaining fraction per quota window per account.
 
-### The dashboard source (optional)
+### The dashboard source
 
-The third source reads the numbers Sarvam's own dashboard shows, using a session
-you capture once from your browser. It adds what local metering structurally
-cannot know: the **authoritative, org-wide spend** — every call from every machine
-and every client, not just the traffic that happened to go through this proxy —
-plus the per-model cost breakdown for the window, and a balance derived from the
-dashboard's spend since the date you set your starting balance.
-
-It is opt-in, because it is honest about what it is: an unsupported internal
-endpoint behind Cloudflare bot management, reached with a session cookie that
-expires and that only you can renew. It polls every five minutes by default, it is
-read-only, and when it cannot reach the dashboard the widget says so on one muted
-line (`dashboard: unauthorized`, `dashboard: no_session`, and so on) and keeps
-showing the ledger numbers.
+The dashboard is opt-in, because it is honest about what it is: an unsupported
+internal endpoint behind Cloudflare bot management, reached with a session cookie
+that expires and that only you can renew. It polls every five minutes by default,
+it is read-only, and when it cannot reach the dashboard the widget says so on one
+muted line (`dashboard: unauthorized`, `dashboard: no_session`, and so on) and
+keeps showing whatever it last knew.
 
 To enable it: capture the cookie from a signed-in `https://indus.sarvam.ai`,
 `sarvam-meter session set --cookie-file <file>` (written `0600`), then set
@@ -53,29 +43,26 @@ To enable it: capture the cookie from a signed-in `https://indus.sarvam.ai`,
 [docs/dashboard-scrape.md](docs/dashboard-scrape.md) and
 [docs/configuration.md](docs/configuration.md#dashboard).
 
-**Local metering remains the fallback and is never switched off.** The dashboard
-does not replace the recording proxy: it cannot see individual calls, it cannot
-price a request, and it stops working the day Sarvam changes a private endpoint or
-your session lapses. When it works, the widget labels the spend line `dashboard`;
-when it does not, the label reads `local meter` and nothing else changes.
+### The ledger
+
+A local SQLite ledger still exists, and so does `sarvam-meter record`, for the
+entries you want to track by hand: `record` prices one event against the rate card
+and stores it. `sarvam-meter status` shows what is in the ledger, and the widget
+shows it too whenever the dashboard cannot supply a figure. What the ledger can
+never do is see a call you did not tell it about — nothing in this project sits in
+front of your API traffic any more.
 
 ## Features
 
-- Remaining Sarvam balance, spend today, spend this month, call count, from the
-  local ledger.
-- Per-API breakdown for `chat`, `stt`, `tts`, `translate`, `transliterate`, `lid`
-  and everything else.
-- Recording proxy that meters chat tokens (including SSE streams), TTS characters
-  counted in code points, STT seconds derived from the uploaded audio file, and
-  request counts.
-- Distinguishes upstream `402` (credits/quota exhausted) from `429` (rate
-  limited, counted over the last 24 hours).
-- Flags calls it could not measure instead of silently reporting them as free.
+- The **reported Sarvam credit balance**, spend today, spend this month and the
+  top models by cost, scraped from the Sarvam dashboard.
 - CLIProxyAPI quota per OAuth account: remaining fraction per window, reset time,
   plan, plus a worst-account summary for the compact view.
-- Optional dashboard source: authoritative org-wide spend, spend today and the top
-  models by cost, with the widget showing which source each figure came from and
-  falling back to the ledger when the dashboard is unreachable.
+- Manual entries: `sarvam-meter record --api ... --quantity ... --unit ...` prices
+  an event against the rate card and stores it in the local ledger, with a per-API
+  breakdown and a call count.
+- The widget labels which source each money figure came from and falls back to the
+  ledger when the dashboard is unreachable.
 - A popup built like Plasma's own applets (`PlasmaExtras.Representation` + a
   `PlasmoidHeading` header), with a refresh button that makes the daemon
   re-poll its sources and a spinner while it does.
@@ -88,31 +75,27 @@ when it does not, the label reads `local meter` and nothing else changes.
 
 ## How it works
 
-Two servers, two ports, one config file.
+One daemon, one config file, one database — and no traffic of yours passing
+through any of it.
 
 ```
-  client (Sarvam SDK / curl, base_url = http://127.0.0.1:8788)
-      |
+  Sarvam dashboard (indus.sarvam.ai)  <--- GET, session cookie, every 5 min
+          |                                 (authoritative spend + balance)
+          v
+  daemon (local socket)  --------------->  CLIProxyAPI management API
+      |  serves the status JSON               (real OAuth account quota)
+      |  over a local socket only
       v
-  recording proxy  127.0.0.1:8788  ---------------->  https://api.sarvam.ai
-      |  measures billable quantity, prices it,
-      |  records one event per upstream attempt
-      v
-  SQLite ledger  ~/.local/share/sarvam-meter/usage.db
-      ^
-      |  reads
-  daemon  127.0.0.1:8787  ------------------------->  CLIProxyAPI management API
-      ^                                               (real OAuth account quota)
-      |  GET /v1/status  (loopback HTTP only)
-  Plasma widget (plasmoid)
+  Plasma widget (plasmoid)      SQLite ledger <--- sarvam-meter record (manual)
 ```
 
-- The **widget** does no network work beyond `GET` on the local daemon.
+- The **widget** does no network work beyond reading the daemon's status over a
+  local socket on this machine.
 - The **daemon** serves the status JSON, caches the CLIProxyAPI snapshot, and
-  re-polls it in a background thread. When the optional dashboard source is
-  enabled it caches that snapshot too, with a TTL of `dashboard.poll_seconds`.
-- The **proxy** is off by default. Nothing is metered until you enable it and
-  point a client at it.
+  re-polls it in a background thread. When the dashboard source is enabled it
+  caches that snapshot too, with a TTL of `dashboard.poll_seconds`.
+- The **ledger** holds only what `sarvam-meter record` wrote. Nothing appends to
+  it behind your back.
 
 Details: [docs/architecture.md](docs/architecture.md).
 
@@ -161,17 +144,17 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    ```
 
 2. Capture your dashboard session once, so the widget can show the real credit
-   balance (scraping is the default source). The easiest way is in the widget:
-   **right-click the panel item > Configure Sarvam Meter > Capture session…**,
-   which opens the Sarvam sign-in page in a webview and hands the cookies to the
-   daemon (needs `qt6-qtwebengine`; without it the page tells you and falls back).
-   From a terminal, the same thing is:
+   balance. The easiest way is in the widget: **right-click the panel item >
+   Configure Sarvam Meter > Capture session…**, which opens the Sarvam sign-in
+   page in a webview and hands the cookies to the daemon (needs
+   `qt6-qtwebengine`; without it the page tells you and falls back). From a
+   terminal, the same thing is:
 
    ```
    sarvam-meter session set --cookie-file ~/.cache/sarvam-cookie.txt
    ```
 
-   A starting balance is no longer needed for that: the widget reports the figure
+   A starting balance is not needed for that: the widget reports the figure
    Sarvam reports. `sarvam-meter balance set <amount>` still exists but only feeds
    the "spend only" presentation.
 
@@ -180,6 +163,8 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    ```
    sarvam-meter serve
    ```
+
+   `serve` starts the daemon and nothing else; there is no proxy to enable.
 
    The RPM ships a user unit, so a packaged install is:
 
@@ -190,34 +175,22 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    ```
 
    (`loginctl enable-linger "$USER"` keeps it running while you are logged out.)
-   The unit runs `sarvam-meter serve`; whether the recording proxy also starts is
-   decided by `proxy.enabled` in the config, not by the unit.
 
-   The recording proxy is optional and off by default. If you want locally
-   measured spend as well, set `"proxy": { "enabled": true }` and run
-   `sarvam-meter serve --with-proxy` instead.
+4. Add the **Sarvam Meter** widget to a Plasma panel. Its default daemon URL
+   points at the daemon on this machine; nothing else on your network is involved.
 
-   (`systemctl --user start sarvam-meter` does the same via the packaged unit,
-   which runs `sarvam-meter serve --with-proxy`.)
-
-4. Point your Sarvam client at the proxy by changing its base URL:
+   Optionally, log usage you want tracked by hand:
 
    ```
-   base_url = "http://127.0.0.1:8788"     # was https://api.sarvam.ai
+   sarvam-meter record --api chat --model sarvam-105b --quantity 1500 --unit tokens
    ```
-
-   Requests are forwarded to `https://api.sarvam.ai` unchanged, so your API key
-   and payloads behave exactly as before.
-
-5. Add the **Sarvam Meter** widget to a Plasma panel. Its default daemon URL is
-   `http://127.0.0.1:8787`, which is where the daemon listens.
 
 Check the state at any time:
 
 ```
 sarvam-meter status          # one line per source
-sarvam-meter doctor          # config, data dir, db, ports, cliproxy
-curl -s http://127.0.0.1:8787/v1/status | python3 -m json.tool
+sarvam-meter doctor          # config, data dir, db, daemon socket, cliproxy, dashboard
+sarvam-meter dashboard       # one dashboard snapshot
 ```
 
 ## Configuration
@@ -237,45 +210,42 @@ CLIProxyAPI is the only other integration to configure: enable it, set
 | Symptom | Cause and fix |
 | --- | --- |
 | Widget shows a `!` badge and stale numbers | The daemon is down or unreachable. The widget keeps the last good payload and backs off up to 10x its refresh interval. Check `systemctl --user status sarvam-meter` or run `sarvam-meter doctor`. |
-| `sarvam-meter serve` exits 1 with an `OSError` about the address | Port already in use. `doctor` reports the daemon port and the proxy port (when enabled) as `OK`/`FAIL`. Change `daemon.port` / `proxy.port`, or stop the process holding the port. |
-| `quota_exhausted` is true and the compact view shows `!` | Upstream returned `402`. Sarvam is refusing calls for lack of credits; the timestamp is kept in `quota_exhausted_at`. This is not the same as a `429`, which only increments `rate_limits.count_24h` and does not mark the account exhausted. |
-| Spend does not move after a chat call | The response carried no `usage` object (and the stream carried no usage chunk). The call is recorded with `estimated = 1`, `quantity = null`, `cost = 0` and counted in `untracked_calls`. When you stream, the stream itself must carry a usage chunk for the tokens to be counted. |
-| STT calls never reduce the balance | The uploaded audio duration could not be parsed, so the call is untracked in the same way. Duration is derived from WAV, FLAC, OGG, MP3 and MP4/M4A payloads only; anything else (or a malformed file) yields no measurement. |
-| The full view shows `dashboard: unauthorized` (or `no_session`) | The captured dashboard session expired or is missing. Re-capture the cookie from a signed-in browser and run `sarvam-meter session set --cookie-file <file>`; until then the widget shows ledger numbers, labelled `local meter`. `sarvam-meter doctor` reports the session file's mode and which headers are present. |
+| `sarvam-meter serve` exits 1 with an `OSError` about the address | The daemon's socket is already in use — usually a second daemon. `doctor` reports it as `FAIL daemon port free`. Stop the process holding it, or change the `daemon` bind settings. |
+| The full view shows `dashboard: unauthorized` (or `no_session`) | The captured dashboard session expired or is missing. Re-capture the cookie from a signed-in browser and run `sarvam-meter session set --cookie-file <file>`; until then the widget shows the ledger numbers. `sarvam-meter doctor` reports the session file's mode and which headers are present. |
 | `dashboard: unreachable` or `dashboard: bad_response` | The dashboard did not answer, or answered with something that is not its usual JSON (a Cloudflare challenge, or a changed endpoint). Nothing to fix locally: the widget keeps the last good dashboard snapshot and falls back to the ledger on the next one. Raise `dashboard.poll_seconds` if it happens often. |
 | CLIProxyAPI section shows an error | `unauthorized` (401/403) means the management key is wrong or missing; `endpoint_missing` (404) means the configured `api_version` does not match the server; a per-account `no quota provider` (501) means that account has no quota provider behind it. All are non-fatal and appear in `errors`. |
-| Everything is zero but traffic works | The client is not going through the proxy. Only requests to `127.0.0.1:8788` are metered. |
+| Spend is zero but you have been calling Sarvam | Expected: this project does not see your API traffic. Enable the dashboard source and capture a session — that is the only way any figure arrives. `sarvam-meter record` is the manual alternative. |
+| An entry you recorded never reduces the balance | The balance is only ever the figure Sarvam reports; local entries never move it. They do count towards the ledger's spend and call figures. |
 
 ## What is not tracked
 
-- **Calls that bypass the proxy.** Anything sent straight to
-  `https://api.sarvam.ai`, or through another machine, is never seen.
-- **Batch jobs launched elsewhere.** Server-side or scheduled work that does not
-  originate from a client pointed at the proxy is invisible.
+- **Per-call detail.** The dashboard aggregates; this project reads the
+  aggregates. It cannot tell you which request cost what, because nothing here
+  sits in front of your traffic.
+- **Anything the dashboard does not show.** If Sarvam's dashboard does not
+  display it, this project cannot report it.
 - **Unpublished rates.** `translate`, `transliterate` and `lid` have no published
-  list price in the shipped rate card, so they are recorded with cost `0` and
-  reported as untracked rather than guessed at. If you know your contracted price,
-  add a rate override (see [docs/configuration.md](docs/configuration.md)).
-- **Sarvam's own view of your balance.** If you top up, change plan, or spend
-  outside this machine, re-run `sarvam-meter balance set <amount>` with the number
-  the dashboard shows — unless the dashboard source is enabled and reachable, in
-  which case the spend side of that figure comes from the dashboard itself.
+  list price in the shipped rate card, so a `record` entry for them is stored with
+  cost `0` rather than guessed at. If you know your contracted price, add a rate
+  override (see [docs/configuration.md](docs/configuration.md)).
+- **Your balance when the session has lapsed.** There is no fallback derivation:
+  the balance stays unknown (`balance.known: false`) and the widget shows spend
+  only, rather than a wrong "left" figure.
 
-The ledger is a measurement tool, not a billing record. Sarvam's dashboard is the
-authority, and with the optional dashboard source enabled the widget reads it
-directly; without it, the ledger is the best estimate this machine can make.
+The ledger is a notebook, not a billing record. Sarvam's dashboard is the
+authority, and with the dashboard source enabled the widget reads it directly.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — modules, database schema, status
-  JSON contract, threading, streaming, security posture.
+  JSON contract, threading, security posture.
 - [docs/configuration.md](docs/configuration.md) — every config key, env
   overrides, validation, rate overrides, widget settings.
 - [docs/cliproxyapi.md](docs/cliproxyapi.md) — the CLIProxyAPI adapter and its
   endpoints.
-- [docs/dashboard-scrape.md](docs/dashboard-scrape.md) — the optional dashboard
-  source: the captured endpoints, the session file, and the caveats.
-- [docs/edge-cases.md](docs/edge-cases.md) — the 22 contractual edge cases, the
+- [docs/dashboard-scrape.md](docs/dashboard-scrape.md) — the dashboard source: the
+  captured endpoints, the session file, and the caveats.
+- [docs/edge-cases.md](docs/edge-cases.md) — the contractual edge cases, the
   dashboard cases added by §17, and where each is handled.
 - [SPEC.md](SPEC.md) — the contract the implementation is written against.
 

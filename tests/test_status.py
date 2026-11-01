@@ -27,10 +27,6 @@ SARVAM_KEYS = {
     "spend",
     "calls",
     "by_api",
-    "rate_limits",
-    "quota_exhausted",
-    "quota_exhausted_at",
-    "untracked_calls",
     "dashboard",
 }
 BALANCE_KEYS = {"known", "remaining", "starting", "spent_total", "set_at", "source"}
@@ -109,10 +105,6 @@ class ShapeTest(StatusTestBase):
         )
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
-        self.assertEqual(sarvam["rate_limits"], {"count_24h": 0, "last_at": None})
-        self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
-        self.assertFalse(sarvam["quota_exhausted"])
-        self.assertIsNone(sarvam["quota_exhausted_at"])
         self.assertEqual(payload["errors"], [])
 
     def test_json_serialisable(self):
@@ -265,49 +257,6 @@ class SpendWindowTest(StatusTestBase):
         self.assertAlmostEqual(sum(e["spend"] for e in by_api), 87.4, places=2)
 
 
-class UntrackedTest(StatusTestBase):
-    def test_counts_estimated_events_today_and_total(self):
-        self.ledger.record_event(
-            source="proxy", api="chat", estimated=True, cost=0.0,
-            ts="2026-11-15T04:00:00Z",
-        )
-        self.ledger.record_event(
-            source="proxy", api="stt", estimated=True, cost=0.0,
-            ts="2026-11-02T04:00:00Z",
-        )
-        self.ledger.record_event(
-            source="proxy", api="chat", quantity=5.0, unit="tokens",
-            cost=0.1, ts="2026-11-15T04:10:00Z",
-        )
-        untracked = self.status()["sarvam"]["untracked_calls"]
-        self.assertEqual(untracked, {"today": 1, "total": 2})
-
-
-class RateLimitTest(StatusTestBase):
-    def test_counts_429_within_24h_and_reports_last(self):
-        self.ledger.record_event(
-            source="proxy", api="chat", status=429, ts="2026-11-15T04:00:00Z"
-        )
-        self.ledger.record_event(
-            source="proxy", api="chat", status=429, ts="2026-11-01T04:00:00Z"
-        )
-        self.ledger.record_event(
-            source="proxy", api="chat", status=500, ts="2026-11-15T04:20:00Z"
-        )
-        limits = self.status()["sarvam"]["rate_limits"]
-        self.assertEqual(limits["count_24h"], 1)
-        self.assertEqual(limits["last_at"], "2026-11-15T04:00:00Z")
-
-
-class QuotaExhaustedTest(StatusTestBase):
-    def test_flag_follows_ledger_kv(self):
-        self.assertFalse(self.status()["sarvam"]["quota_exhausted"])
-        self.ledger.set_kv("quota_exhausted_at", "2026-11-14T09:00:00Z")
-        sarvam = self.status()["sarvam"]
-        self.assertTrue(sarvam["quota_exhausted"])
-        self.assertEqual(sarvam["quota_exhausted_at"], "2026-11-14T09:00:00Z")
-
-
 class CliproxyTest(StatusTestBase):
     def snapshot(self, accounts, reachable=True, errors=None):
         return {
@@ -406,7 +355,6 @@ class NeverRaisesTest(StatusTestBase):
         )
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
-        self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
         self.assertFalse(sarvam["balance"]["known"])
         self.assertEqual(sarvam["balance"]["spent_total"], 0.0)
         self.assertEqual(set(payload.keys()), TOP_LEVEL_KEYS)

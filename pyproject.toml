@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sarvam-meter"
 version = "0.1.0"
-description = "KDE Plasma 6 widget and local daemon that meter Sarvam AI credit usage and CLIProxyAPI OAuth quota"
+description = "KDE Plasma 6 widget and local daemon that report Sarvam AI credit usage (scraped from the Sarvam dashboard) and CLIProxyAPI OAuth quota"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

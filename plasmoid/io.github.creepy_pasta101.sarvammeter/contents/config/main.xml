@@ -13,9 +13,9 @@
       http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
     <kcfgfile name=""/>
     <group name="General">
-        <entry name="daemonUrl" type="String">
-            <label>Base URL of the local sarvam-meter daemon, for example http://127.0.0.1:8787</label>
-            <default>http://127.0.0.1:8787</default>
+        <entry name="command" type="String">
+            <label>The program the widget runs to reach the daemon: a bare name on PATH (sarvam-meter) or an absolute path. It is executed, so it must contain no spaces, quotes or shell metacharacters.</label>
+            <default>sarvam-meter</default>
         </entry>
         <entry name="refreshSeconds" type="Int">
             <label>How often the widget polls the daemon, in seconds</label>

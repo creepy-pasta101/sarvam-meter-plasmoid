@@ -13,9 +13,9 @@
 #
 #     loginctl enable-linger "$USER"
 #
-# The recording proxy is not forced on here: `proxy.enabled` in
-# ~/.config/sarvam-meter/config.json decides, and the settings page can toggle
-# it. `--with-proxy` on the command line still overrides that.
+# `serve` starts the daemon and nothing else. This project relays no API
+# traffic and opens no port for one: the daemon's only endpoint is its own local
+# socket, which serves the widget.
 
 [Unit]
 Description=Sarvam AI usage meter daemon
@@ -34,7 +34,7 @@ ExecStart=/usr/bin/sarvam-meter serve
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
-# The daemon binds loopback ports only and stores its state under $HOME.
+# The daemon binds a loopback socket only and stores its state under $HOME.
 NoNewPrivileges=yes
 PrivateTmp=yes
 

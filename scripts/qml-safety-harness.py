@@ -6,24 +6,40 @@ This is the plasmashell-safety harness.  It loads
 plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui/main.qml with the
 smallest possible namespace substitution (there is no Plasma here, so
 PlasmoidItem becomes Item, Plasmoid.configuration becomes a local object and the
-two representation blocks are commented out), then drives it against a daemon
-that misbehaves in each of the ways a real one can:
+two representation blocks are resolved against the QML stubs), then drives it
+against a daemon that misbehaves in each of the ways a real one can.
 
-  hung           accepts the connection and never answers
-  huge           answers with a body far larger than the cap
-  garbage        answers with something that is not JSON
-  good           answers with a valid status payload
+THE DAEMON IS A CHILD PROCESS NOW
+The widget no longer speaks HTTP: it runs `<command> query <op>` through
+Plasma's executable data source and reads the JSON on the child's stdout.  So
+the "daemon" in this harness is a tiny shell script named ``sarvam-meter`` in a
+per-scenario temporary directory that is prepended to PATH, and the scenarios
+are chosen by an environment variable the script reads:
+
+  good           prints a valid status payload
   fresh-balance  a valid payload whose balance was updated 10 minutes ago
   old-balance    a valid payload whose balance was updated 2 hours ago
+  garbage        prints something that is not JSON
+  huge           prints a body far larger than the widget's cap
+  hung           accepts the request and never answers (sleeps)
+  empty          prints nothing at all and exits 0
+  nonzero        prints an error on stderr and exits 3
+  refresh        the header's refresh button is pressed (query refresh)
+  refresh-fail   `query refresh` fails, so the widget falls back to status
   click          the panel item is clicked (the popup must expand)
   panel-width    the panel item widens for a long value plus the badge
-  refresh        the header's refresh button is pressed (POST /v1/refresh)
-  refresh-fail   the daemon refuses /v1/refresh, so the widget falls back to GET
   destroy        the widget is removed while a request is in flight
+
+`plasma5support`'s DataSource is supplied by scripts/qml-stubs (so the widget
+loads with no Plasma installed); that stub is passive, so this harness gives it
+a process-spawning helper through the ``harnessExec`` context property.  Real
+QProcess objects start the script, and disconnectSource() kills a child that is
+still running - which is exactly what the widget relies on.
 
 For every scenario it asserts that the GUI thread kept running (an independent
 QTimer keeps ticking), that the widget settles into a defined state instead of
-staying stuck in `loading`, and that nothing throws into the engine.
+staying stuck in `loading`, that the child process is gone afterwards, and that
+nothing throws into the engine.
 
 Usage:  python3 scripts/qml-safety-harness.py [--repo DIR] [-v]
 Exit code 0 means every scenario passed.
@@ -36,10 +52,8 @@ import json
 import os
 import re
 import shutil
-import socket
 import sys
 import tempfile
-import threading
 import time
 
 DEFAULT_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,12 +100,54 @@ GOOD_PAYLOAD = {
     },
 }
 
+#: The fake daemon.  One script, one scenario per run, selected by
+#: $QML_HARNESS_MODE; every invocation is appended to $QML_HARNESS_LOG so a
+#: scenario can assert *which* query the widget ran.
+FAKE_DAEMON = r'''#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Fake sarvam-meter for scripts/qml-safety-harness.py.  Never installed.
+printf '%s\n' "$*" >> "$QML_HARNESS_LOG"
+case "$QML_HARNESS_MODE" in
+    garbage)
+        printf '<html>not json</html>\n'
+        ;;
+    huge)
+        head -c 921600 /dev/zero | tr '\0' 'x'
+        ;;
+    hung)
+        sleep 30
+        ;;
+    empty)
+        :
+        ;;
+    nonzero)
+        printf 'boom: the daemon is unhappy\n' >&2
+        exit 3
+        ;;
+    refresh-fail)
+        case "$*" in
+            *refresh*)
+                printf 'refused: nothing to refresh\n' >&2
+                exit 1
+                ;;
+            *)
+                cat "$QML_HARNESS_PAYLOAD"
+                ;;
+        esac
+        ;;
+    *)
+        cat "$QML_HARNESS_PAYLOAD"
+        ;;
+esac
+exit 0
+'''
+
 
 # ---------------------------------------------------------------------------
 # the QML source, with the minimum namespace substitution
 # ---------------------------------------------------------------------------
 
-def transform_main_qml(source: str, daemon_url: str, refresh_seconds: int) -> str:
+def transform_main_qml(source: str, command: str, refresh_seconds: int) -> str:
     """Return a runnable copy of main.qml for a plain QtQuick engine."""
     text = source
     text = text.replace("import org.kde.plasma.plasmoid\n", "")
@@ -100,9 +156,8 @@ def transform_main_qml(source: str, daemon_url: str, refresh_seconds: int) -> st
     text = text.replace("PlasmoidItem {", "Item {", 1)
     text = text.replace("Plasmoid.configuration.", "harnessConfig.")
 
-
     config = {
-        "daemonUrl": daemon_url,
+        "command": command,
         "refreshSeconds": refresh_seconds,
         "compactMode": "sarvam",
         "warnBelowPercent": 20,
@@ -128,101 +183,114 @@ def transform_main_qml(source: str, daemon_url: str, refresh_seconds: int) -> st
 
 
 # ---------------------------------------------------------------------------
-# misbehaving daemons
+# the fake daemon on PATH
 # ---------------------------------------------------------------------------
 
-class HostileServer:
-    """A one-connection-at-a-time TCP server that behaves as told."""
+class FakeDaemon:
+    """A shell script named ``sarvam-meter`` in a temporary directory on PATH."""
 
     def __init__(self, mode: str):
         self.mode = mode
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(8)
-        self.sock.settimeout(0.5)
-        self.port = self.sock.getsockname()[1]
-        self.requests = []
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self.dir = tempfile.mkdtemp(prefix="qml-fake-daemon-")
+        self.bin_dir = os.path.join(self.dir, "bin")
+        os.makedirs(self.bin_dir)
+        self.payload_path = os.path.join(self.dir, "payload.json")
+        self.log_path = os.path.join(self.dir, "calls.log")
+        open(self.log_path, "w", encoding="utf-8").close()
 
-    def start(self):
-        self._thread.start()
-        return self
-
-    def stop(self):
-        self._stop.set()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-        self._thread.join(timeout=3)
-
-    @property
-    def url(self):
-        return "http://127.0.0.1:%d" % self.port
-
-    def _serve(self):
-        while not self._stop.is_set():
-            try:
-                conn, _ = self.sock.accept()
-            except (socket.timeout, OSError):
-                continue
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
-
-    def _payload(self):
         document = json.loads(json.dumps(GOOD_PAYLOAD))
-        minutes = {"fresh-balance": 10, "old-balance": 120}.get(self.mode)
+        minutes = {"fresh-balance": 10, "old-balance": 120}.get(mode)
         if minutes is not None:
             stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                   time.gmtime(time.time() - minutes * 60))
             document["sarvam"]["dashboard"]["balance"]["as_of"] = stamp
-        return document
+        with open(self.payload_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
 
-    def _handle(self, conn):
+        script = os.path.join(self.bin_dir, "sarvam-meter")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(FAKE_DAEMON)
+        os.chmod(script, 0o755)
+
+        self._saved_env = {}
+
+    def __enter__(self):
+        for name, value in (
+            ("QML_HARNESS_MODE", self.mode),
+            ("QML_HARNESS_PAYLOAD", self.payload_path),
+            ("QML_HARNESS_LOG", self.log_path),
+            ("PATH", self.bin_dir + os.pathsep + os.environ.get("PATH", "")),
+        ):
+            self._saved_env[name] = os.environ.get(name)
+            os.environ[name] = value
+        return self
+
+    def __exit__(self, *_exc):
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+    def calls(self):
+        """Every argument list the fake daemon was invoked with."""
         try:
-            conn.settimeout(30)
-            try:
-                head = conn.recv(65536).decode("latin-1")
-            except OSError:
+            with open(self.log_path, encoding="utf-8") as handle:
+                return [line.strip() for line in handle if line.strip()]
+        except OSError:  # pragma: no cover - the log always exists here
+            return []
+
+
+# ---------------------------------------------------------------------------
+# the process-spawning helper the DataSource stub delegates to
+# ---------------------------------------------------------------------------
+
+def make_exec_runner():
+    """A QObject standing in for Plasma's executable data engine."""
+    from PySide6.QtCore import QObject, QProcess, Signal, Slot
+
+    class ExecRunner(QObject):
+        dataReady = Signal(str, "QVariantMap")
+
+        def __init__(self):
+            super().__init__()
+            self._procs = {}
+
+        @Slot(str)
+        def connectSource(self, name):
+            self.disconnectSource(name)
+            proc = QProcess(self)
+            proc.setProcessChannelMode(QProcess.SeparateChannels)
+            proc.finished.connect(
+                lambda code, status, n=name: self._finished(n, code))
+            self._procs[name] = proc
+            # The real engine splits the command into arguments; /bin/sh -c is
+            # the same thing with the quoting rules the widget relies on.
+            proc.start("/bin/sh", ["-c", name])
+
+        def _finished(self, name, code):
+            proc = self._procs.pop(name, None)
+            if proc is None:
                 return
-            request_line = head.split("\r\n", 1)[0].split()
-            if len(request_line) >= 2:
-                self.requests.append((request_line[0], request_line[1]))
-            if self.mode == "refresh-fail" and request_line[:1] == ["POST"]:
-                # Refuse the forced refresh; the cached GET must still work.
-                body = b'{"error": "nope"}'
-                conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\n"
-                             b"Content-Type: application/json\r\n"
-                             b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
+            err = bytes(proc.readAllStandardError()).decode("utf-8", "replace")
+            self.dataReady.emit(
+                name, {"stdout": out, "stderr": err, "exit code": int(code)})
+
+        @Slot(str)
+        def disconnectSource(self, name):
+            proc = self._procs.pop(name, None)
+            if proc is None:
                 return
-            if self.mode == "hung":
-                # Accept the request and never answer.  The client must give up.
-                self._stop.wait(30)
-                return
-            if self.mode == "huge":
-                body = b"x" * (900 * 1024)
-                head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
-                conn.sendall(head + body)
-                return
-            if self.mode == "garbage":
-                body = b"<html>not json</html>"
-                head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
-                        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
-                conn.sendall(head + body)
-                return
-            body = json.dumps(self._payload()).encode()
-            head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
-            conn.sendall(head + body)
-        except OSError:
-            pass
-        finally:
-            try:
-                conn.close()
-            except OSError:
-                pass
+            proc.kill()
+            proc.waitForFinished(1000)
+
+        def running_sources(self):
+            return sorted(self._procs)
+
+    return ExecRunner()
 
 
 # ---------------------------------------------------------------------------
@@ -230,19 +298,18 @@ class HostileServer:
 # ---------------------------------------------------------------------------
 
 def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
-    """Load the widget against one daemon mode; return (ok, detail, samples)."""
-    from PySide6.QtCore import QTimer, QUrl, QCoreApplication  # noqa: F401
+    """Load the widget against one fake daemon; return (ok, detail, samples)."""
+    from PySide6.QtCore import QMetaObject, Qt, QTimer, QUrl
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlComponent, QQmlEngine
 
     app = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
 
-    server = HostileServer(mode).start()
-    try:
+    with FakeDaemon(mode) as daemon:
         ui_dir = os.path.join(
             repo, "plasmoid/io.github.creepy_pasta101.sarvammeter/contents/ui")
         source = open(os.path.join(ui_dir, "main.qml"), encoding="utf-8").read()
-        text = transform_main_qml(source, server.url, 60)
+        text = transform_main_qml(source, "sarvam-meter", 60)
         # The representations are referenced relative to main.qml, so the copy has
         # to sit next to them.  Copy the whole directory to keep the repo clean.
         work_dir = tempfile.mkdtemp(prefix="qml-harness-")
@@ -280,10 +347,13 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
             expanded = Property(bool, _get_expanded, _set_expanded)
 
         plasmoid = PlasmoidStub()
+        runner = make_exec_runner()
 
         engine = QQmlEngine()
         engine.addImportPath(STUB_DIR)
         engine.rootContext().setContextProperty("Plasmoid", plasmoid)
+        # The plasma5support stub delegates process spawning to this object.
+        engine.rootContext().setContextProperty("harnessExec", runner)
         warnings = []
         engine.warnings.connect(lambda w: warnings.append(str(w.toString())))
 
@@ -317,15 +387,24 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
 
         if mode == "destroy":
             root.deleteLater()
-            app.processEvents()
+            for _ in range(20):
+                app.processEvents()
+                time.sleep(0.01)
             heartbeat.stop()
-            return True, "destroyed cleanly while a request was in flight", samples
+            leftover = runner.running_sources()
+            return (not leftover), (
+                "destroyed cleanly while a request was in flight; "
+                "child processes still running: %r" % (leftover,)), samples
 
         # The GUI thread must have kept running throughout.
         if beats_total < 20:
             return False, "the event loop stalled (%d ticks)" % beats_total, samples
         if loading:
             return False, "the widget stayed stuck in loading=true", samples
+        # Nothing may be left running once a request has settled.
+        leftover = runner.running_sources()
+        if leftover:
+            return False, "child processes left running: %r" % (leftover,), samples
 
         if mode == "good":
             # QML hands the parsed object back as a QJSValue, so convert it.
@@ -417,7 +496,6 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
             # representation owns that gesture, not Plasma.  It is loaded
             # standalone here, because a property-typed child is not part of the
             # parent's object tree and so cannot be reached with findChild().
-            from PySide6.QtCore import QMetaObject, Qt
             compact_component = QQmlComponent(
                 engine, QUrl.fromLocalFile(os.path.join(work_dir, "ui", "CompactRepresentation.qml")))
             compact = compact_component.create()
@@ -431,47 +509,79 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
             ok = (before is False) and (after is True)
             return ok, "expanded %s -> %s" % (before, after), samples
         if mode == "refresh":
-            # The header's refresh button must make the daemon re-poll, i.e. a
-            # POST to /v1/refresh, not just another GET of the cache.
-            from PySide6.QtCore import QMetaObject, Qt
+            # The header's refresh button must ask the daemon to re-poll, i.e.
+            # run `query refresh`, not just another `query status`.
             QMetaObject.invokeMethod(root, "forceRefresh", Qt.DirectConnection)
             deadline = time.time() + 4.0
             while time.time() < deadline:
                 app.processEvents()
                 time.sleep(0.02)
-            seen = list(server.requests)
-            posts = [r for r in seen if r[0] == "POST"]
-            ok = bool(posts) and posts[0][1].endswith("/v1/refresh")
-            return ok, "daemon saw %r" % (seen,), samples
+            calls = daemon.calls()
+            refreshes = [call for call in calls if "query refresh" in call]
+            ok = bool(refreshes) and not root.property("loading")
+            return ok, "daemon ran %r" % (calls,), samples
         if mode == "refresh-fail":
-            from PySide6.QtCore import QMetaObject, Qt
             QMetaObject.invokeMethod(root, "forceRefresh", Qt.DirectConnection)
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 app.processEvents()
                 time.sleep(0.02)
-            seen = list(server.requests)
-            methods = [r[0] for r in seen]
-            payload = root.property("payload")
+            calls = daemon.calls()
+            ops = [call.split("query", 1)[-1].strip() for call in calls]
             document = payload.toVariant() if hasattr(payload, "toVariant") else {}
-            ok = (methods[:2] == ["GET", "POST"] or methods[:2] == ["POST", "GET"])
-            ok = ok and "GET" in methods[1:]
+            ok = "refresh" in ops and ops.count("status") >= 1
             ok = ok and not root.property("loading")
             ok = ok and bool(document)
-            return ok, "methods %r, settled with payload=%s" % (
-                methods, bool(document)), samples
+            return ok, "queries %r, settled with payload=%s" % (
+                ops, bool(document)), samples
         if mode == "huge":
             ok = offline is True and "too large" in error
             return ok, "huge body rejected: error=%r" % error, samples
         if mode == "garbage":
-            ok = offline is True and ("malformed" in error or "HTTP" in error)
+            ok = offline is True and "malformed" in error
             return ok, "garbage rejected: error=%r" % error, samples
+        if mode == "empty":
+            ok = offline is True and "nothing" in error
+            return ok, "empty output rejected: error=%r" % error, samples
+        if mode == "nonzero":
+            ok = offline is True and ("exited with status" in error or "sarvam-meter:" in error)
+            return ok, "non-zero exit rejected: error=%r" % error, samples
         if mode == "hung":
             ok = offline is True and error != ""
-            return ok, "hung daemon timed out: error=%r" % error, samples
+            return ok, "hung child gave up: error=%r" % error, samples
         return False, "unknown mode", samples
-    finally:
-        server.stop()
+    return False, "scenario crashed before it started", []  # pragma: no cover
+
+
+def check_stub(repo: str) -> tuple:
+    """Load the plasma5support stub on its own, so a broken stub is not silent."""
+    from PySide6.QtCore import QUrl
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtQml import QQmlComponent, QQmlEngine
+
+    QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
+    engine = QQmlEngine()
+    engine.addImportPath(STUB_DIR)
+    path = os.path.join(
+        STUB_DIR, "org", "kde", "plasma", "plasma5support", "DataSource.qml")
+    component = QQmlComponent(engine, QUrl.fromLocalFile(path))
+    item = component.create()
+    if item is None:
+        return False, "stub failed to load: %s" % component.errorString()
+    missing = [name for name in ("connectSource", "disconnectSource", "newData")
+               if not hasattr(item, name) and not _has_signal(item, name)]
+    ok = not missing
+    return ok, "stub loaded; missing members: %r" % (missing,) if missing else "stub loaded"
+
+
+def _has_signal(item, name) -> bool:
+    """True when *item* exposes a signal called *name* (QML signals are meta)."""
+    meta = item.metaObject()
+    for index in range(meta.methodCount()):
+        method = meta.method(index)
+        if method.name() == name and method.methodType() == method.Signal:
+            return True
+    return False
 
 
 def main(argv=None) -> int:
@@ -481,18 +591,26 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
     failures = 0
-    modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance",
-             "click", "panel-width", "refresh", "refresh-fail", "destroy")
+    ok, detail = check_stub(args.repo)
+    print("%-8s %s  %s" % ("stub", "PASS" if ok else "FAIL", detail))
+    if not ok:
+        failures += 1
+
+    modes = ("good", "garbage", "huge", "hung", "empty", "nonzero",
+             "fresh-balance", "old-balance", "click", "panel-width",
+             "refresh", "refresh-fail", "destroy")
     for mode in modes:
         ok, detail, samples = run_scenario(mode, args.repo, args.verbose)
-        print("%-8s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))
+        print("%-12s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))
         if args.verbose and samples:
-            print("         last samples (loading, offline, error): %r" % (samples[-3:],))
+            print("             last samples (loading, offline, error): %r" % (samples[-3:],))
         if not ok:
             failures += 1
+    total = len(modes) + 1
     print("")
-    print("%d of %d scenarios passed" % (len(modes) - failures, len(modes)))
+    print("%d of %d checks passed" % (total - failures, total))
     return 0 if failures == 0 else 1
 
 

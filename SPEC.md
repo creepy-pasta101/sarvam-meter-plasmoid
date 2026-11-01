@@ -14,12 +14,12 @@ keep it consistent with this document, and note the decision in your summary.
 A KDE Plasma 6 widget (plasmoid) that shows API usage/quota for:
 
 1. **Sarvam AI** — Sarvam publishes **no** usage/credits REST endpoint. Balance and
-   usage exist only in their web dashboard. Therefore usage is metered **locally**:
-   a small daemon (`sarvam-meter`) can act as a recording reverse proxy in front of
-   `https://api.sarvam.ai`, measures the billable quantity of each call (chat tokens,
-   TTS characters, STT seconds), prices it against a rate card, and stores it in a
-   local SQLite ledger. The user enters a starting credit balance once; the widget
-   shows remaining balance = starting − measured spend, plus spend today/month.
+   usage exist only in their web dashboard, so the project **scrapes that dashboard**:
+   with a session the user captures once from their own browser, the daemon reads
+   the authoritative org-wide spend, the per-model split for the window, and the
+   real credit balance, and serves them as status JSON.
+   A local SQLite ledger still exists for **manual** entries (`sarvam-meter record`
+   prices one event against a rate card), and `status` reports what it holds.
 2. **CLIProxyAPI** (`router-for-me/CLIProxyAPI`) — an optional second source. Its
    management API *does* expose real quota: OAuth-account quotas (Claude / Codex /
    Gemini-CLI style subscriptions) via a normalized quota endpoint. The widget shows
@@ -27,10 +27,11 @@ A KDE Plasma 6 widget (plasmoid) that shows API usage/quota for:
 
 The widget itself does **no** network work beyond `GET` on the local daemon.
 
-Two servers, two ports, one config:
-
-- **daemon** (default `127.0.0.1:8787`) — serves the status JSON the widget reads.
-- **recording proxy** (default `127.0.0.1:8788`, off by default) — the Sarvam metering proxy.
+**The project relays no API traffic and listens on no TCP port.** It is not a
+proxy, it is not a local meter, and no client of the user's is pointed at it. There
+is exactly one process — the **daemon**, started by `sarvam-meter serve` — which
+serves the status JSON the widget reads over its own local socket. The daemon's
+socket transport is not specified here.
 
 ---
 
@@ -76,9 +77,8 @@ sarvam-meter-plasmoid/
 │   ├── config.py
 │   ├── rates.py
 │   ├── ledger.py
-│   ├── audio.py
-│   ├── proxy.py
 │   ├── cliproxy.py
+│   ├── dashboard.py
 │   ├── status.py
 │   ├── daemon.py
 │   └── cli.py
@@ -92,8 +92,10 @@ sarvam-meter-plasmoid/
 │   ├── sarvam-meter.service
 │   └── config.example.json
 ├── scripts/{install-dev.sh,build-plasmoid.sh,smoke.sh}
-├── tests/{test_config.py,test_rates.py,test_ledger.py,test_audio.py,test_proxy.py,
-│          test_cliproxy.py,test_status.py,test_daemon.py,test_integration.py}
+├── tests/{test_config.py,test_rates.py,test_ledger.py,test_cliproxy.py,test_dashboard.py,
+│          test_status.py,test_daemon.py,test_integration.py,test_regressions.py,
+│          test_service.py,test_config_endpoint.py,test_session_endpoint.py,
+│          test_dashboard_status.py,test_qml_safety.py}
 ├── docs/{architecture.md,configuration.md,cliproxyapi.md,edge-cases.md}
 └── .github/workflows/{ci.yml,release.yml}
 ```
@@ -112,8 +114,6 @@ class ConfigError(Exception): ...
 @dataclass(frozen=True)
 class DaemonConfig:  host: str; port: int; refresh_seconds: int; request_timeout_seconds: int
 @dataclass(frozen=True)
-class ProxyConfig:   enabled: bool; host: str; port: int; upstream_base: str; max_body_bytes: int
-@dataclass(frozen=True)
 class SarvamConfig:  enabled: bool; currency: str; starting_balance: Optional[float]; rate_overrides: dict
 @dataclass(frozen=True)
 class CliproxyConfig: enabled: bool; base_url: str; management_key: str; api_version: str
@@ -121,8 +121,8 @@ class CliproxyConfig: enabled: bool; base_url: str; management_key: str; api_ver
                       include_api_key_usage: bool; allow_remote: bool
 @dataclass(frozen=True)
 class Config:
-    version: int; db_path: str; daemon: DaemonConfig; proxy: ProxyConfig
-    sarvam: SarvamConfig; cliproxy: CliproxyConfig
+    version: int; db_path: str; daemon: DaemonConfig
+    sarvam: SarvamConfig; cliproxy: CliproxyConfig; dashboard: DashboardConfig
 
 def default_config_dict() -> dict
 def load_config(path: Optional[str] = None) -> Config      # raises ConfigError
@@ -136,14 +136,15 @@ Default JSON document (`packaging/config.example.json` must match it exactly):
   "version": 1,
   "db_path": "~/.local/share/sarvam-meter/usage.db",
   "daemon": { "host": "127.0.0.1", "port": 8787, "refresh_seconds": 60, "request_timeout_seconds": 10 },
-  "proxy":  { "enabled": false, "host": "127.0.0.1", "port": 8788,
-              "upstream_base": "https://api.sarvam.ai", "max_body_bytes": 268435456 },
   "sarvam": { "enabled": true, "currency": "INR", "starting_balance": null,
               "rate_overrides": {} },
   "cliproxy": { "enabled": false, "base_url": "http://127.0.0.1:8317",
                 "management_key": "", "api_version": "v8", "quota_fetch": true,
                 "quota_fetch_interval_seconds": 300, "include_api_key_usage": false,
-                "allow_remote": false }
+                "allow_remote": false },
+  "dashboard": { "enabled": true, "base_url": "https://indus.sarvam.ai",
+                 "session_file": "~/.config/sarvam-meter/session.json",
+                 "poll_seconds": 300, "product": "sarvam-api-platform" }
 }
 ```
 
@@ -155,10 +156,11 @@ Validation (each failure raises `ConfigError` with a message naming the offendin
 - `api_version` in `{"v8","v0"}`.
 - `currency` is a 3-letter uppercase code; default `INR`.
 - `starting_balance` is `null` or a finite number `>= 0`.
-- `upstream_base` and `cliproxy.base_url` must be `http://` or `https://` URLs with a host.
-- **SSRF guard:** a non-loopback `cliproxy.base_url` (or `proxy.upstream_base`) is
-  rejected unless `allow_remote` is `true` for that section. Loopback =
-  `127.0.0.0/8`, `::1`, `localhost`.
+- `cliproxy.base_url` must be an `http://` or `https://` URL with a host.
+- **SSRF guard:** a non-loopback `cliproxy.base_url` is rejected unless
+  `cliproxy.allow_remote` is `true`. Loopback = `127.0.0.0/8`, `::1`, `localhost`.
+- There is no `proxy` section. It was removed with the recording proxy; a document
+  that still carries one is not an error (unknown keys are ignored).
 - env override: `SARVAM_METER_CLIPROXY_KEY` (if non-empty) replaces
   `cliproxy.management_key`.
 - `db_path` supports `~` expansion.
@@ -276,100 +278,31 @@ strings (all stored as fixed-width UTC ISO8601 with `Z`) — that is a valid ord
 
 ---
 
-## 7. Audio duration (`sarvam_meter/audio.py`)
+## 7. Audio duration -- removed
 
-Sarvam's STT response carries no duration, so the proxy derives it from the bytes.
+`sarvam_meter/audio.py` (and `tests/test_audio.py`) are deleted. The module only
+existed to derive STT duration from an uploaded audio file that the recording proxy
+had intercepted. Nothing relays an upload any more, so a duration is now supplied by
+the caller: `sarvam-meter record --api stt --quantity <seconds> --unit seconds`.
 
-```python
-def duration_seconds(data: bytes, content_type: Optional[str] = None) -> Optional[float]
-def container_of(data: bytes) -> Optional[str]   # 'wav','flac','ogg','mp3','mp4', None
-```
-
-Must handle: **WAV** (RIFF/WAVE `fmt ` byte_rate + `data` chunk size — exact),
-**FLAC** (STREAMINFO total samples / sample rate — exact), **OGG** (last valid
-granule position ÷ sample rate, 48000 for Opus, else read header sample rate),
-**MP3** (Xing/Info frame count ÷ sample rate, else CBR: `(size - tag_bytes) * 8 / bitrate`),
-**MP4/M4A** (`mvhd` timescale + duration — exact). Anything else → `None`.
-Never raise: any malformed input returns `None`. Must not read more than needed for
-WAV/FLAC (a 200 MB WAV must not be fully scanned for the data chunk — read the header
-region, then trust the declared size). Return a float, never NaN/inf.
+The section number is kept so cross-references elsewhere stay stable.
 
 ---
 
-## 8. The recording proxy (`sarvam_meter/proxy.py`)
+## 8. The recording proxy -- removed
 
-`ThreadingHTTPServer` bound to `proxy.host:proxy.port`. It is a transparent-ish
-reverse proxy for `proxy.upstream_base`.
+`sarvam_meter/proxy.py` (and `tests/test_proxy.py`) are deleted, together with the
+`proxy` config section, the `proxy` subcommand, `serve --with-proxy`,
+`should_start_proxy`, and the status fields that only the proxy could populate
+(`rate_limits`, `quota_exhausted`, `quota_exhausted_at`, `untracked_calls`).
 
-```python
-class ProxyServer:
-    def __init__(self, config: Config, ledger: Ledger, logger=None)
-    def serve_forever(self) -> None      # blocking
-    def shutdown(self) -> None
-    @property
-    def port(self) -> int                # actual bound port (tests use 0)
+**This is deliberate and permanent: the project relays no API traffic and listens
+on no TCP port.** There is no upstream to forward to, no `max_body_bytes` to
+enforce, no SSE relay to parse and no per-call quantity to measure. Anything that
+used to be "measured" is now either scraped from the dashboard (§17) or recorded by
+hand with `sarvam-meter record`.
 
-def classify(method: str, path: str) -> dict
-    # -> {"api": "chat"|"stt"|"tts"|"translate"|"transliterate"|"lid"|"other",
-    #     "metered": bool, "stream": bool}
-def chat_usage(body: bytes) -> Optional[dict]
-    # -> {"in_tokens":int,"out_tokens":int,"cached_tokens":int} or None
-def chat_stream_usage(lines: list) -> Optional[dict]   # same shape; scan `data: {...}` chunks
-def tts_char_count(body: bytes) -> Optional[int]        # JSON body "text" -> len() in code points
-def record_from_exchange(config, ledger, method, path, req_headers, req_body_head,
-                         status, resp_body, *, duration_hint=None) -> None
-```
-
-Path routing for `classify` (prefix match on the *path*, query ignored):
-
-| path contains | api |
-| --- | --- |
-| `/v1/chat/completions`, `/v2/chat/completions`, `/chat/completions` | `chat` (stream if body has `"stream": true`) |
-| `/speech-to-text` , `/speech-to-text-translate` | `stt` |
-| `/text-to-speech` | `tts` |
-| `/translate` | `translate` |
-| `/transliterate` | `transliterate` |
-| `/text-lid` | `lid` |
-| anything else | `other`, `metered=False` |
-
-Behaviour that must be right:
-
-1. **Stream the request body** to upstream in 64 KiB chunks (`urllib.request` with a
-   file-like object, or a raw `http.client` connection). Never hold a whole 200 MB
-   upload in memory. Enforce `max_body_bytes` → `413` if exceeded.
-2. **Stream the response** back to the client: forward bytes as they arrive. For SSE
-   (`text/event-stream`) flush per line and keep a bounded tail buffer (max 64 KiB)
-   of the last `data:` payloads so usage can be extracted without buffering the stream.
-   `Transfer-Encoding: chunked` from upstream must be relayed correctly (or the body
-   de-chunked and re-sent with `Content-Length` if that is simpler — but then it is not
-   streaming; prefer streaming).
-3. Forward request headers except `Host`, `Content-Length`, `Transfer-Encoding`,
-   `Connection`, `Accept-Encoding` (send `identity`). Always add
-   `X-Forwarded-For: 127.0.0.1` is **not** needed; do not add it.
-4. **Never log or store** `api-subscription-key` / `authorization` values. If a
-   `meta` field is written, it may contain the api name, model, path, and status only.
-5. Record on **every** attempt that reached upstream, including 4xx/5xx (cost 0 for
-   errors, `status` set). Network failure to upstream → respond `502` with
-   `{"error":{"message":"upstream unreachable","code":"meter_upstream_error"}}` and
-   record nothing.
-6. After recording: if `status == 402`, `ledger.set_kv("quota_exhausted_at", now)`.
-   If `status == 429`, nothing special (status counts come from `events`).
-7. Quantities: `chat` → `unit="tokens"`, `quantity = in+out` (the total tokens
-   processed; `prompt_tokens` already include the cached ones, so cached tokens
-   are never counted twice), `cost` from
-   `cost_for("chat", model, in-cached, "tokens", cached_quantity=cached,
-   out_quantity=out)`. Missing
-   `usage` in the response → `estimated=1`, `quantity=None`, `cost=0.0`.
-   `stt` → `unit="seconds"` from `duration_seconds()` of the uploaded file; `None`
-   when unparseable → `estimated=1`, `quantity=None`, `cost=0.0`.
-   `tts` → `unit="chars"`, code-point count of `text`. `translate`/`transliterate` →
-   `unit="chars"` from the request `input`, cost 0 (rate unpublished, `rate_known`
-   False). `lid` → `unit="requests"`, quantity 1.
-8. Model resolution: response `model` field, else request JSON `model`, else `None`.
-9. Only `POST` and `GET` forwarded; other methods → `405`.
-10. Path must start with `/` and must not contain `..` or a scheme (`http:`) → `400`.
-11. Bind failure (port in use) surfaces as `OSError` from `serve_forever`'s caller,
-    not a silent hang.
+The section number is kept so cross-references elsewhere stay stable.
 
 ---
 
@@ -455,16 +388,18 @@ Never raise out of `snapshot()`.
 ## 10. Status payload (`sarvam_meter/status.py`)
 
 **This is the widget's contract. The JSON shape below is exact**; add fields only
-inside objects explicitly marked extensible. Schema version is `1`.
+inside objects explicitly marked extensible. Schema version is `2` (§17.5 lists the
+schema-2 additions; this block is the whole payload, and the key sets are exact).
 
 ```python
 def build_status(config: Config, ledger: Ledger, cliproxy_snapshot: Optional[dict] = None,
-                 now: Optional[datetime] = None) -> dict
+                 now: Optional[datetime] = None,
+                 dashboard_snapshot: Optional[dict] = None) -> dict
 ```
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "generated_at": "2026-11-01T10:00:00+05:30",
   "stale": false,
   "errors": [{"source": "cliproxy", "code": "unreachable", "message": "..."}],
@@ -472,14 +407,21 @@ def build_status(config: Config, ledger: Ledger, cliproxy_snapshot: Optional[dic
     "configured": true,
     "currency": "INR",
     "balance": {"known": true, "remaining": 412.6, "starting": 500.0,
-                "spent_total": 87.4, "set_at": "2026-10-20T09:00:00Z"},
-    "spend": {"today": 12.3, "month": 87.4},
+                "spent_total": 87.4, "set_at": "2026-10-20T09:00:00Z",
+                "source": "dashboard"},
+    "spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
     "calls": {"today": 42},
     "by_api": [{"api": "chat", "spend": 8.0, "calls": 20}],
-    "rate_limits": {"count_24h": 3, "last_at": "2026-10-31T18:00:00Z"},
-    "quota_exhausted": false,
-    "quota_exhausted_at": null,
-    "untracked_calls": {"today": 0, "total": 0}
+    "dashboard": {
+      "configured": true, "reachable": true, "as_of": "2026-11-01T09:58:00+05:30",
+      "org_id": "019f37be-...", "currency": "INR",
+      "window": {"start": "2026-10-20", "end": "2026-11-01"},
+      "spend": {"window": 134.23, "today": 12.3},
+      "balance": {"known": true, "amount": 412.6, "currency": "INR", "as_of": "...",
+                  "state": "provisioned", "billing_model": "prepaid", "unit": "rupees"},
+      "by_model": [{"model": "saaras:v4", "cost": 74.05}],
+      "error": null
+    }
   },
   "cliproxy": {
     "configured": false,
@@ -491,14 +433,25 @@ def build_status(config: Config, ledger: Ledger, cliproxy_snapshot: Optional[dic
 }
 ```
 
-Rules: `balance.known` is `false` when no starting balance is set; then `remaining`,
-`starting`, `set_at` are `null` and `spent_total` is the all-time measured spend.
-`stale` is `true` when `cliproxy_snapshot` is `None` while `cliproxy.enabled` is true.
-`errors` is always present (possibly `[]`), and carries the cliproxy snapshot's
-`errors` when present. `worst_fraction` = min over all known account bucket fractions,
-`null` if none known. All money rounded to 2 dp for display; `quantity`/fractions 4 dp.
-Never raise: a ledger failure must be caught and reported as
-`errors:[{"source":"ledger","code":"read_failed","message":...}]` with zeroed numbers.
+Rules: `balance.remaining` is only ever the figure the dashboard's balance endpoint
+reported; when none was reported `balance.known` is `false`, `remaining`, `starting`
+and `set_at` are `null`, and `spent_total` carries the ledger's all-time total (the
+manual `sarvam-meter record` entries). `spend.today`/`spend.month` come from the
+dashboard when it is reachable and from the ledger otherwise, and `spend.source` says
+which. `calls.today` and `by_api` count ledger entries — the manual ones, because
+nothing else writes to the ledger. `stale` is `true` when `cliproxy_snapshot` is
+`None` while `cliproxy.enabled` is true. `errors` is always present (possibly `[]`),
+and carries the cliproxy snapshot's `errors` when present. `worst_fraction` = min over
+all known account bucket fractions, `null` if none known. All money rounded to 2 dp
+for display; `quantity`/fractions 4 dp. Never raise: a ledger failure must be caught
+and reported as `errors:[{"source":"ledger","code":"read_failed","message":...}]` with
+zeroed numbers.
+
+**There are no proxy-derived fields.** `rate_limits`, `quota_exhausted`,
+`quota_exhausted_at` and `untracked_calls` were removed with the recording proxy
+(§8): nothing in the project observes an upstream status or an unmeasured call any
+more, so a permanently-empty stub would be a lie. `by_api` stays because the ledger
+still fills it from manual entries.
 
 ---
 
@@ -537,12 +490,13 @@ on. Log to stderr, one line per request, no secrets.
 `argparse`, prog `sarvam-meter`, exit `0` ok / `1` runtime error / `2` config or usage error.
 
 ```
-sarvam-meter serve [--config PATH] [--with-proxy] [--port N] [--print-status]
+sarvam-meter serve [--config PATH] [--port N] [--print-status]   # starts the daemon, nothing else
 sarvam-meter status [--config PATH] [--json]
 sarvam-meter balance set <amount> [--config PATH]
 sarvam-meter balance show [--config PATH]
 sarvam-meter record --api <api> --quantity <n> --unit <unit> [--model M] [--config PATH]
-sarvam-meter proxy [--config PATH] [--port N]
+sarvam-meter session set|show [--config PATH]
+sarvam-meter dashboard [--config PATH] [--json]
 sarvam-meter doctor [--config PATH]
 sarvam-meter init [--config PATH]        # writes default config, prints the path
 ```
@@ -550,10 +504,13 @@ sarvam-meter init [--config PATH]        # writes default config, prints the pat
 `status` human output: one line per source, e.g.
 `Sarvam  INR 412.60 left  (spent 12.30 today, 87.40 this month, 42 calls)`
 `Claude  max 5h window 62% left, resets 2026-11-01T10:00Z`
-`record` prices the event with `cost_for` and stores it with `source="manual"`.
-`doctor` checks: config loads, data dir writable, db opens, daemon port free,
-proxy port free (if enabled), cliproxy reachable (if enabled), and prints one
-`OK`/`FAIL` line each; exit `1` if any FAIL.
+`record` prices the event with `cost_for` and stores it with `source="manual"`; it is
+the only writer of the ledger, because the project relays no traffic of its own.
+`doctor` checks: config loads, data dir writable, db opens, daemon socket free,
+cliproxy reachable (if enabled), dashboard session, dashboard reachable (if
+enabled), and prints one `OK`/`FAIL` line each; exit `1` if any FAIL.
+There is no `proxy` subcommand and no `--with-proxy` flag: `serve` starts the daemon
+and nothing else.
 
 ---
 
@@ -598,7 +555,7 @@ QML rules (Plasma **6.7 and 6.8 compatible**; 6.8 removes nothing we use, but do
   `formatMoney(v, currency)` JS helper (₹ = `\u20b9`, $ = `$`).
 - Compact representation: icon or short value — shows `₹412` (Sarvam) or the worst
   cliproxy percentage, whichever the config asks for; red text when below the warning
-  threshold; a small `!` badge when `offline` or when `quota_exhausted` is true.
+  threshold; a small `!` badge when `offline`.
 - Full representation: a `ColumnLayout` with
   (a) Sarvam section: remaining balance or "spend only" when `balance.known` is false,
   today/month spend, calls, a `Bar` per top-3 `by_api` entries;
@@ -675,7 +632,7 @@ attach artifacts to a GitHub Release with `softprops/action-gh-release@v2`. Pin 
 action to a major tag (`@v4`, `@v5`, `@v2`). No secrets required.
 
 `packaging/sarvam-meter.service` — systemd **user** unit:
-`ExecStart=/usr/bin/sarvam-meter serve --with-proxy`, `Restart=on-failure`,
+`ExecStart=/usr/bin/sarvam-meter serve`, `Restart=on-failure`,
 `RestartSec=5`, `WantedBy=default.target`, `After=network-online.target` is wrong for a
 user unit — use `After=default.target` or omit. Add `Environment=SARVAM_METER_CONFIG=%h/.config/sarvam-meter/config.json`.
 
@@ -694,21 +651,26 @@ integration-test unit must test as many as it can without network:
 5. DB path unwritable → daemon still serves `/v1/status` with a `ledger` error entry.
 6. Port already in use → `OSError`/clear message, exit 1.
 7. `starting_balance` unset → `balance.known == false`, spend still shown.
-8. 402 from upstream → `quota_exhausted: true`; 429 → counted in `rate_limits`.
-9. Chat response without `usage` (and SSE without a usage chunk) → `estimated: true`,
-   quantity null, cost 0, counted in `untracked_calls`.
-10. STT audio whose duration cannot be parsed → same untracked treatment.
-11. TTS text with non-ASCII/emoji → counted in code points, not bytes.
+8. 402/429 from upstream → **retired** with the recording proxy (§8): the payload
+   carries no `rate_limits`/`quota_exhausted*`; an exhausted wallet shows up as a
+   reported balance of `0.00`.
+9. Chat response without `usage` → **retired** with the proxy; the surviving analogue
+   is an unpriced manual entry (`cost 0`, `estimated = 1`).
+10. STT duration unparseable → **retired** with `audio.py`; `record` takes the
+    duration from the user.
+11. TTS text with non-ASCII/emoji → **retired** with the proxy; `record` takes the
+    character count from the user.
 12. `remainingFraction` null/missing → `unknown: true`, never rendered as 0%.
 13. `resetTime` in the past → still shown, with the raw timestamp.
 14. CLIProxyAPI 401/404/501/HTML-body/empty-providers → distinct, non-fatal errors.
 15. Never poll CLIProxyAPI's destructive usage-queue endpoint (assert in tests).
-16. Concurrent proxy threads + daemon → WAL, no `database is locked` under load
+16. Concurrent writers on one database → WAL, no `database is locked` under load
     (a test with 20 parallel `record_event` calls must pass).
 17. Secrets never appear in logs, `meta`, `/v1/config`, or `status`.
 18. Non-loopback cliproxy `base_url` refused unless `allow_remote`.
 19. Widget with two instances → both poll; daemon is threaded and idempotent.
-20. Large upload (200 MB) streamed, not buffered; `max_body_bytes` enforced.
+20. Large upload streamed, `max_body_bytes` enforced → **retired** with the proxy:
+    no request body passes through this project at all.
 21. Timezone: "today" is the local calendar day; "month" is the local calendar month.
 22. Plasma 6.8: no deprecated QML APIs, no `PlasmaCore.Units`, no custom
     contextual actions.
@@ -918,11 +880,10 @@ Rules:
   otherwise it describes where the *spend* came from (`"dashboard"` or `"ledger"`).
   The value `"dashboard-derived"` no longer exists.
 - `balance.remaining` is **only ever** the figure Sarvam reports. It is never
-  derived from locally measured spend: a proxy-side estimate silently disagreed
-  with the real wallet (top-ups, other machines, calls that bypassed the proxy),
-  and a wrong "left" number is worse than none. `sarvam-meter balance set` still
-  records a starting balance and the ledger still records spend, but neither
-  affects `remaining`.
+  derived from local entries: a local estimate silently disagreed with the real
+  wallet (top-ups, other machines, calls made elsewhere), and a wrong "left" number
+  is worse than none. `sarvam-meter balance set` still records a starting balance and
+  `sarvam-meter record` still writes ledger entries, but neither affects `remaining`.
 - Without a reported balance: `known: false`, `remaining`/`starting`/`set_at` are
   `null`, and `spent_total` carries the ledger's all-time spend.
 - `spend.today` and `spend.month` come from the dashboard when reachable, else
@@ -939,7 +900,6 @@ subset of:
 ```
 dashboard.{enabled, base_url, poll_seconds, session_file}
 cliproxy.{enabled, base_url, api_version}
-proxy.{enabled}
 daemon.{refresh_seconds}
 ```
 

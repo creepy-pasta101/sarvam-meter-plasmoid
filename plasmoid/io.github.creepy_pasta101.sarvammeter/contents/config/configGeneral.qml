@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Sarvam Meter - plasmoid configuration page "General" (unit U6).
+// Sarvam Meter - plasmoid configuration page "General" (unit U6, transport unit B2).
 //
 // Plasma 6 (6.7 / 6.8). The root is a KCM component (KCM.SimpleKCM, a
 // Kirigami.ScrollablePage) because Plasma 6 loads widget configuration pages
@@ -16,21 +16,38 @@
 // [Containments][N][Applets][M][Configuration][General].
 // Declaring these cfg_ properties is therefore the whole contract. Controls
 // whose value is always valid are exposed as two-way property aliases; the
-// daemon URL is a plain property so that an invalid string can never be
-// written to the config file (see syncDaemonUrl()).
-
+// command is a plain property so that an invalid string can never be written to
+// the config file (see syncCommand()).
+//
+// HOW THIS PAGE TALKS TO THE DAEMON (transport change, unit B2)
+// The daemon no longer listens on a TCP port: it serves newline-delimited JSON
+// on a Unix socket, and `sarvam-meter query <op>` is its client, printing the
+// reply's `result` as JSON on stdout. So there is no XMLHttpRequest anywhere in
+// this page any more. Every call is one child process, started through Plasma's
+// executable data source (org.kde.plasma.plasma5support, engine "executable"),
+// and the answer arrives asynchronously through its newData signal as a map of
+// "stdout", "stderr" and "exit code".
+//
+// The program that is run comes from the "Command" field: a bare program name
+// (sarvam-meter, resolved on PATH) or an absolute path. Because it is executed,
+// it is validated against a whitelist - no spaces, no quotes, no shell
+// metacharacters, no leading dash - and an unacceptable value is never saved.
+//
 // A SECOND STORE
-// The page also edits the daemon's own config, read with GET /v1/config and
-// written with POST /v1/config (the "Backend (sarvam-meter daemon)" group at
-// the bottom). Those values belong to the daemon and live in its config file,
-// not in KConfigXT, so they are deliberately not named cfg_*, are not declared
-// in main.xml, and are written only by the "Save backend settings" button -
-// never by this dialog's Apply, which copies cfg_* properties only.
-
+// The page also edits the daemon's own config, read with "<command> query
+// config" and written with "<command> query set-config '<json>'" (the "Backend
+// (sarvam-meter daemon)" group at the bottom). Those values belong to the daemon
+// and live in its config file, not in KConfigXT, so they are deliberately not
+// named cfg_*, are not declared in main.xml, and are written only by the "Save
+// backend settings" button - never by this dialog's Apply, which copies cfg_*
+// properties only.
+//
 // A THIRD THING: THE DASHBOARD SESSION (unit D)
 // The dashboard source needs a signed-in Sarvam session, stored by the daemon in
 // a 0600 file. The "Capture session..." button below opens SessionCapture.qml in
-// a browser window and POSTs what it harvests to /v1/session.
+// a browser window; that sheet hands the captured headers to the daemon over
+// D-Bus (org.kde.sarvam.Meter.SetSession), not over HTTP. This page only reads
+// the session's *state* back, with "<command> query session".
 //
 // That sheet is the only file in this package that imports QtWebEngine, and
 // QtWebEngine is not part of a standard KDE install - an unresolvable QML import
@@ -41,9 +58,9 @@
 // package to install and the CLI fallback. A machine without QtWebEngine loses
 // this one button and keeps the whole settings page.
 //
-// Session values are secret. They travel in one local variable, straight into
-// the POST body, and are never put into a property, a label, a tooltip, a log
-// line or an error message. The status line shows counts and header names only.
+// Session values are secret. They never enter a property of this page, a label,
+// a tooltip, a log line or an error message. The status line shows counts and
+// header names only.
 
 import QtQuick
 import QtQuick.Layouts
@@ -51,12 +68,13 @@ import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCM
 import org.kde.plasma.components as PlasmaComponents
+import org.kde.plasma.plasma5support as P5Support
 
 KCM.SimpleKCM {
     id: page
 
     // ---- KConfigXT keys, group "General" (contents/config/main.xml) ----
-    property string cfg_daemonUrl: "http://127.0.0.1:8787"
+    property string cfg_command: "sarvam-meter"
     property alias cfg_refreshSeconds: refreshSpin.value
     property string cfg_compactMode: "sarvam"
     property alias cfg_warnBelowPercent: warnBelowSpin.value
@@ -65,23 +83,12 @@ KCM.SimpleKCM {
     // ---- "Test" button state: idle | pending | ok | fail ----
     property string testState: "idle"
     property string testMessage: ""
-    property var testRequest: null
 
-    // The settings window can be closed while the probe is in flight; drop it so
-    // no callback outlives the page (and so the config dialog cannot be left
-    // waiting on a socket).
+    // The settings window can be closed while a query is in flight; drop it so
+    // no callback outlives the page (and so the dialog cannot be left waiting on
+    // a child process).
     Component.onDestruction: {
-        if (testRequest) {
-            try {
-                testRequest.abort();
-            } catch (e) {
-                // already finished
-            }
-            testRequest = null;
-        }
-        // Same discipline for the backend requests: nothing may outlive the
-        // page, and no callback may fire into a half-destroyed dialog.
-        page.abortBackendRequest();
+        page.abortQuery();
     }
 
     // ------------------------------------------------------------------
@@ -96,11 +103,6 @@ KCM.SimpleKCM {
     property string backendFeedback: ""
     property string backendFeedbackKind: "none"   // none | ok | fail | info
 
-    // The in-flight request and a mutable "already handled" flag shared with
-    // its callbacks, so abort() and a late event can never both settle it.
-    property var backendRequest: null
-    property var backendRequestState: null
-
     // The last document accepted from the daemon: the baseline the diff is
     // taken against, so Save only ever sends what the user actually changed.
     property bool backendLoaded: false
@@ -112,7 +114,7 @@ KCM.SimpleKCM {
     property string loadedCliproxyBaseUrl: ""
     property bool backendDirty: false
 
-    readonly property bool backendBusy: backendRequest !== null
+    readonly property bool backendBusy: pendingQuery !== ""
     readonly property int backendTimeoutMs: 8000
     readonly property int maxBackendResponseChars: 256 * 1024
 
@@ -121,7 +123,7 @@ KCM.SimpleKCM {
     property string sessionState: "idle"
     property bool sessionConfigured: false
     // Header NAMES the daemon reports holding ("cookie", "authorization").
-    // Never a value: GET /v1/session does not return one.
+    // Never a value: `query session` does not return one.
     property var sessionHeaderNames: []
     property string sessionMessage: ""
 
@@ -131,28 +133,49 @@ KCM.SimpleKCM {
     property string sessionFeedback: ""
     property string sessionFeedbackKind: "none"   // none | ok | fail | info
 
-    // One GET /v1/session when the page opens, then the usual GET /v1/config.
-    // Both go through sendBackendRequest(), which is single-flight, so they are
-    // sequenced rather than fired together: the session read settles, and its
-    // completion starts the config read. Read-only, so neither can disturb
-    // anything the user has typed.
+    // One `query session` when the page opens, then a `query config`.
+    // Both go through runQuery(), which is single-flight, so they are sequenced
+    // rather than fired together: the session read settles, and its completion
+    // starts the config read. Read-only, so neither can disturb anything the
+    // user has typed.
     Component.onCompleted: page.loadSessionStatus()
 
-    readonly property string daemonUrlError: validateDaemonUrl(daemonUrlField.text)
-    readonly property bool daemonUrlInvalid: daemonUrlError !== ""
-    readonly property bool daemonUrlNonLocal: !daemonUrlInvalid && !isLoopbackHost(hostOf(daemonUrlField.text))
+    // ---- the command, and why it is validated ------------------------
+    readonly property string defaultCommand: "sarvam-meter"
+
+    // The program every query runs. A configured value that would be unsafe on
+    // a command line falls back to the default instead of being executed.
+    readonly property string command: {
+        var raw = page.cfg_command;
+        if (typeof raw === "undefined" || raw === null) {
+            return page.defaultCommand;
+        }
+        var text = page.trimmed(raw);
+        if (page.validateCommand(text) !== "") {
+            return page.defaultCommand;
+        }
+        return text;
+    }
+
+    // Validation of what is currently typed in the field, for the inline error.
+    readonly property string commandErrorText: {
+        if (typeof commandField === "undefined" || !commandField) {
+            return "";
+        }
+        return page.validateCommand(commandField.text);
+    }
+    readonly property bool commandInvalid: page.commandErrorText !== ""
 
     // Value changed from outside the text field (Discard, Reset to defaults).
-    // Comparing the normalised field text keeps this from fighting the user
-    // while typing.
+    // Comparing the field text keeps this from fighting the user while typing.
     // cfg_* may be assigned during instantiation, before the children below
-    // exist, so every handler guards against an undefined child id.
-    onCfg_daemonUrlChanged: {
-        if (typeof daemonUrlField === "undefined" || !daemonUrlField) {
+    // exist, so the handler guards against an undefined child id.
+    onCfg_commandChanged: {
+        if (typeof commandField === "undefined" || !commandField) {
             return;
         }
-        if (normalisedBaseUrl(daemonUrlField.text) !== cfg_daemonUrl) {
-            daemonUrlField.text = cfg_daemonUrl;
+        if (page.trimmed(commandField.text) !== page.cfg_command) {
+            commandField.text = page.cfg_command;
         }
     }
 
@@ -166,18 +189,64 @@ KCM.SimpleKCM {
         }
     }
 
-    // ---- URL helpers (plain JS, no Qt objects) ----
+    // ---- command helpers (plain JS, no Qt objects) ----
 
-    function trimmedUrl(raw) {
+    function trimmed(raw) {
         if (raw === undefined || raw === null) {
             return "";
         }
         return String(raw).trim();
     }
 
+    // "" when the string is safe to execute, otherwise a user-facing reason.
+    // This string becomes the first word of a command line, so the check is a
+    // whitelist - letters, digits, dot, underscore, dash, plus and slash - and
+    // nothing else survives. In particular a space, a quote, a backtick, $, ;,
+    // &, |, <, >, ( or ) can never reach the executed command.
+    function validateCommand(raw) {
+        var s = page.trimmed(raw);
+        if (s === "") {
+            return "the command is empty. Use sarvam-meter, or an absolute path to it.";
+        }
+        if (s.length > 512) {
+            return "the command is too long.";
+        }
+        if (!/^[A-Za-z0-9._\/+-]+$/.test(s)) {
+            return "the command must be a bare program name or an absolute path: no spaces, quotes or shell metacharacters.";
+        }
+        if (s.charAt(0) === "-") {
+            return "the command must not start with a dash.";
+        }
+        if (s.indexOf("/") > 0 && s.charAt(0) !== "/") {
+            return "the command must be a bare program name or an absolute path, not a relative path.";
+        }
+        return "";
+    }
+
+    // Push the field into cfg_command only when the text is valid, so the config
+    // file can never receive a command that would be run as something else.
+    function syncCommand() {
+        var candidate = page.trimmed(commandField.text);
+        if (page.validateCommand(candidate) !== "") {
+            return;
+        }
+        if (candidate !== page.cfg_command) {
+            page.cfg_command = candidate;
+        }
+    }
+
+    // Trimmed URL without a trailing slash, for the CLIProxyAPI base URL.
+    function normalisedUrl(raw) {
+        var s = page.trimmed(raw);
+        while (s.length > 0 && s.charAt(s.length - 1) === "/") {
+            s = s.substring(0, s.length - 1);
+        }
+        return s;
+    }
+
     // Host part of an http(s) URL, without userinfo, port or brackets.
     function hostOf(raw) {
-        var s = trimmedUrl(raw).toLowerCase();
+        var s = page.trimmed(raw).toLowerCase();
         var marker = s.indexOf("//");
         if (marker < 0) {
             return "";
@@ -210,128 +279,200 @@ KCM.SimpleKCM {
         return rest;
     }
 
-    // Returns "" when the URL is acceptable, otherwise a user-facing reason.
-    function validateDaemonUrl(raw) {
-        var s = trimmedUrl(raw);
-        if (s === "") {
-            return "the daemon URL is empty. Use http://127.0.0.1:8787.";
+    // ------------------------------------------------------------------
+    // The query layer: one child process per call
+    // ------------------------------------------------------------------
+
+    // The command whose answer is outstanding ("" = idle). A non-empty value is
+    // also the single-flight guard: runQuery() aborts it before starting another.
+    property string pendingQuery: ""
+    property var queryOnSuccess: null
+    property var queryOnFailure: null
+
+    // The only process this page spawns. `connectedSources` holds exactly one
+    // entry per query; the entry is removed - and a running child killed - the
+    // moment the query settles, times out or the page is destroyed.
+    P5Support.DataSource {
+        id: querySource
+        engine: "executable"
+        connectedSources: []
+        onNewData: function (sourceName, data) {
+            page.handleQueryData(sourceName, data);
         }
-        if (/\s/.test(s)) {
-            return "the daemon URL must not contain spaces.";
-        }
-        var lower = s.toLowerCase();
-        if (lower.indexOf("http://") !== 0 && lower.indexOf("https://") !== 0) {
-            return "the daemon URL must start with http:// or https://.";
-        }
-        if (hostOf(s) === "") {
-            return "the daemon URL has no host name.";
-        }
-        return "";
     }
 
-    function isLoopbackHost(host) {
-        var h = String(host).toLowerCase();
-        if (h === "localhost" || h === "::1" || h === "0:0:0:0:0:0:0:1") {
-            return true;
-        }
-        if (/^127\.\d+\.\d+\.\d+$/.test(h)) {
-            return true;
-        }
-        return false;
+    // The data source has no timeout of its own: a CLI waiting on a lock would
+    // otherwise leave the settings window spinning for ever.
+    Timer {
+        id: queryWatchdog
+        interval: page.backendTimeoutMs + 2000
+        repeat: false
+        running: false
+        onTriggered: page.failPendingQuery("the daemon did not answer in time")
     }
 
-    // Trimmed base URL without a trailing slash, so "<base>/v1/health" is well formed.
-    function normalisedBaseUrl(raw) {
-        var s = trimmedUrl(raw);
-        while (s.length > 0 && s.charAt(s.length - 1) === "/") {
-            s = s.substring(0, s.length - 1);
-        }
-        return s;
+    // POSIX single-quote quoting: a literal ' becomes '\''. The JSON argument of
+    // `query set-config` is the only thing this page ever quotes, and it is
+    // wrapped so the shell passes it through as one word.
+    function shellQuote(text) {
+        return "'" + String(text).replace(/'/g, "'\\''") + "'";
     }
 
-    // Push the field into cfg_daemonUrl only when the text is valid, so the
-    // config file can never receive a bad URL.
-    function syncDaemonUrl() {
-        var candidate = trimmedUrl(daemonUrlField.text);
-        if (validateDaemonUrl(candidate) !== "") {
+    // Run "<command> query <op>" with optional already-quoted arguments.
+    // Single flight: starting a query abandons the previous one, exactly like
+    // the request this page used to send.
+    function runQuery(op, args, onSuccess, onFailure) {
+        page.abortQuery();
+        var target = page.command + " query " + op;
+        if (args !== null && args !== undefined && String(args).length > 0) {
+            target = target + " " + String(args);
+        }
+        page.pendingQuery = target;
+        page.queryOnSuccess = onSuccess;
+        page.queryOnFailure = onFailure;
+        queryWatchdog.restart();
+        try {
+            querySource.connectSource(target);
+        } catch (e) {
+            page.failPendingQuery("cannot run " + target);
+        }
+    }
+
+    // Forget the outstanding query and disconnect its source (killing a child
+    // that is still running). The callbacks are dropped: nothing may fire into a
+    // page that has moved on.
+    function abortQuery() {
+        var target = page.pendingQuery;
+        page.pendingQuery = "";
+        page.queryOnSuccess = null;
+        page.queryOnFailure = null;
+        queryWatchdog.stop();
+        if (target === "") {
             return;
         }
-        var normalised = normalisedBaseUrl(candidate);
-        if (normalised !== cfg_daemonUrl) {
-            cfg_daemonUrl = normalised;
+        try {
+            querySource.disconnectSource(target);
+        } catch (e) {
+            // already disconnected
         }
     }
 
-    // Async XHR against <base>/v1/health. Never synchronous, never blocking.
-    function testConnection() {
-        var error = validateDaemonUrl(daemonUrlField.text);
-        if (error !== "") {
-            testState = "fail";
-            testMessage = "FAIL: " + error;
+    function failPendingQuery(message) {
+        var failure = page.queryOnFailure;
+        page.abortQuery();
+        if (failure) {
+            failure(message);
+        }
+    }
+
+    function succeedPendingQuery(document) {
+        var success = page.queryOnSuccess;
+        page.abortQuery();
+        if (success) {
+            success(document);
+        }
+    }
+
+    // The data source answered. `data` is the map Plasma hands over:
+    // {"stdout": ..., "stderr": ..., "exit code": ...}. An answer for a source
+    // this page is no longer waiting on is ignored.
+    function handleQueryData(sourceName, data) {
+        if (page.pendingQuery === "" || String(sourceName) !== page.pendingQuery) {
             return;
         }
-
-        var target = normalisedBaseUrl(daemonUrlField.text) + "/v1/health";
-        testState = "pending";
-        testMessage = "Contacting " + target + " ...";
-
-        // A second click must not leave the first request running: its callbacks
-        // would clobber the state of the one being shown.
-        if (testRequest) {
+        var payload = data;
+        if (!payload || typeof payload !== "object") {
+            // Some engines deliver the map only through `data[source]`.
             try {
-                testRequest.abort();
+                payload = querySource.data[sourceName];
             } catch (e) {
-                // already finished
+                payload = null;
             }
-            testRequest = null;
+        }
+        if (!payload || typeof payload !== "object") {
+            page.failPendingQuery("the daemon returned an unreadable answer");
+            return;
         }
 
-        var request = new XMLHttpRequest();
-        testRequest = request;
+        var exitCode = Number(payload["exit code"]);
+        if (!isFinite(exitCode)) {
+            exitCode = 0;
+        }
+        var body = (typeof payload["stdout"] === "string") ? payload["stdout"] : "";
+        var stderr = (typeof payload["stderr"] === "string") ? payload["stderr"] : "";
 
-        request.ontimeout = function() {
-            page.testState = "fail";
-            page.testMessage = "FAIL: " + target + " did not answer within 5 seconds.";
-            page.testRequest = null;
-        };
-        request.onerror = function() {
-            page.testState = "fail";
-            page.testMessage = "FAIL: could not reach " + target + " - is sarvam-meter running?";
-            page.testRequest = null;
-        };
-        request.onreadystatechange = function() {
-            if (request.readyState !== XMLHttpRequest.DONE) {
-                return;
-            }
-            if (request.status === 200) {
-                var version = "";
-                try {
-                    var payload = JSON.parse(request.responseText);
-                    if (payload && payload.version !== undefined && payload.version !== null) {
-                        version = String(payload.version);
-                    }
-                } catch (parseError) {
-                    version = "";
-                }
-                page.testState = "ok";
-                page.testMessage = version !== ""
-                    ? "OK: daemon " + version + " is answering at " + target
-                    : "OK: the daemon answered at " + target + " (no version reported).";
-            } else if (request.status === 0) {
-                page.testState = "fail";
-                page.testMessage = "FAIL: no answer from " + target + " - is sarvam-meter running?";
-            } else {
-                var detail = request.statusText ? " " + request.statusText : "";
-                page.testState = "fail";
-                page.testMessage = "FAIL: HTTP " + request.status + detail + " from " + target + ".";
-            }
-            page.testRequest = null;
-        };
+        if (exitCode !== 0) {
+            var detail = page.firstLine(stderr);
+            page.failPendingQuery(detail !== ""
+                ? detail
+                : ("sarvam-meter exited with status " + exitCode));
+            return;
+        }
+        if (body.length === 0) {
+            page.failPendingQuery("the daemon returned nothing - is sarvam-meter running?");
+            return;
+        }
+        // Never hand a huge string to JSON.parse on the GUI thread: that is the
+        // one way this page could stall plasmashell.
+        if (body.length > page.maxBackendResponseChars) {
+            page.failPendingQuery("the daemon's answer is too large to read safely");
+            return;
+        }
 
-        request.timeout = 5000;
-        // Third argument true: asynchronous. A synchronous open() is banned.
-        request.open("GET", target, true);
-        request.send();
+        var parsed = null;
+        try {
+            parsed = JSON.parse(body);
+        } catch (e) {
+            parsed = null;
+        }
+        if (!parsed || typeof parsed !== "object") {
+            page.failPendingQuery("the daemon answered with something that is not JSON");
+            return;
+        }
+        page.succeedPendingQuery(parsed);
+    }
+
+    // The first line of a child's stderr, bounded and stripped of control
+    // characters. It is the CLI's own message ("sarvam-meter: ..."), which the
+    // daemon builds without ever quoting a stored value.
+    function firstLine(text) {
+        var line = String(text).replace(/\r/g, "\n");
+        var cut = line.indexOf("\n");
+        if (cut >= 0) {
+            line = line.substring(0, cut);
+        }
+        line = line.replace(/[\u0000-\u001f]/g, "").trim();
+        if (line.length > 300) {
+            line = line.substring(0, 300) + "...";
+        }
+        return line;
+    }
+
+    // Async query of the daemon's health. Never synchronous, never blocking.
+    function testConnection() {
+        var error = page.validateCommand(commandField.text);
+        if (error !== "") {
+            page.testState = "fail";
+            page.testMessage = "FAIL: " + error;
+            return;
+        }
+
+        page.testState = "pending";
+        page.testMessage = "Running " + page.command + " query health ...";
+
+        page.runQuery("health", "", function (document) {
+            var version = "";
+            if (document && document.version !== undefined && document.version !== null) {
+                version = String(document.version);
+            }
+            page.testState = "ok";
+            page.testMessage = version !== ""
+                ? "OK: daemon " + version + " is answering."
+                : "OK: the daemon answered (no version reported).";
+        }, function (message) {
+            page.testState = "fail";
+            page.testMessage = "FAIL: " + message;
+        });
     }
 
     // ------------------------------------------------------------------
@@ -339,7 +480,7 @@ KCM.SimpleKCM {
     // ------------------------------------------------------------------
 
     function validateHttpUrl(raw, what) {
-        var s = trimmedUrl(raw);
+        var s = page.trimmed(raw);
         if (s === "") {
             return what + " is empty.";
         }
@@ -350,7 +491,7 @@ KCM.SimpleKCM {
         if (lower.indexOf("http://") !== 0 && lower.indexOf("https://") !== 0) {
             return what + " must start with http:// or https://.";
         }
-        if (hostOf(s) === "") {
+        if (page.hostOf(s) === "") {
             return what + " has no host name.";
         }
         return "";
@@ -360,17 +501,7 @@ KCM.SimpleKCM {
         if (typeof cliproxyUrlField === "undefined" || !cliproxyUrlField) {
             return "";
         }
-        return validateHttpUrl(cliproxyUrlField.text, "the CLIProxyAPI base URL");
-    }
-
-    // The daemon the backend group talks to: whatever the field says, falling
-    // back to the widget setting when the field has not been filled yet.
-    function backendBaseUrl() {
-        var fromField = normalisedBaseUrl(daemonUrlField.text);
-        if (fromField !== "") {
-            return fromField;
-        }
-        return normalisedBaseUrl(page.cfg_daemonUrl);
+        return page.validateHttpUrl(cliproxyUrlField.text, "the CLIProxyAPI base URL");
     }
 
     // 120 s (2 minutes) .. 21600 s (6 hours). The SpinBox already enforces the
@@ -433,196 +564,7 @@ KCM.SimpleKCM {
         page.backendDirty = dashboardEnabledSwitch.checked !== page.loadedDashboardEnabled
             || pollSecondsSpin.value !== page.loadedDashboardPollSeconds
             || cliproxyEnabledSwitch.checked !== page.loadedCliproxyEnabled
-            || normalisedBaseUrl(cliproxyUrlField.text) !== page.loadedCliproxyBaseUrl;
-    }
-
-    // Drop the in-flight backend request, if any, and make its callbacks inert.
-    function abortBackendRequest() {
-        var state = page.backendRequestState;
-        var request = page.backendRequest;
-        page.backendRequestState = null;
-        page.backendRequest = null;
-        if (state) {
-            state.done = true;
-        }
-        if (request) {
-            try {
-                request.abort();
-            } catch (e) {
-                // aborting an already-finished request is harmless
-            }
-        }
-    }
-
-    // One bounded XHR, following the same rules as testConnection() above:
-    // asynchronous only, an explicit timeout, the response size capped before
-    // JSON.parse, a single flight (starting a request aborts the previous one)
-    // and an abort on destruction. Nothing here can block plasmashell.
-    function sendBackendRequest(method, url, payload, onSuccess, onFailure) {
-        page.abortBackendRequest();
-
-        var request = null;
-        try {
-            request = new XMLHttpRequest();
-        } catch (e) {
-            request = null;
-        }
-        if (!request) {
-            onFailure("cannot create a request");
-            return;
-        }
-
-        var body = null;
-        if (payload !== null && payload !== undefined) {
-            try {
-                body = JSON.stringify(payload);
-            } catch (e) {
-                body = null;
-            }
-            if (body === null) {
-                onFailure("cannot serialise the settings to send");
-                return;
-            }
-        }
-
-        var state = { "done": false };
-
-        function settle(message, doc) {
-            if (state.done) {
-                return;
-            }
-            state.done = true;
-            if (page.backendRequestState === state) {
-                page.backendRequestState = null;
-                page.backendRequest = null;
-            }
-            if (message !== "") {
-                onFailure(message);
-                return;
-            }
-            onSuccess(doc);
-        }
-
-        request.onreadystatechange = function () {
-            // 4 is DONE; the numeric form does not rely on the engine exposing
-            // XMLHttpRequest.DONE.
-            if (request.readyState !== 4 || state.done) {
-                return;
-            }
-
-            if (request.status === 200) {
-                var bodyText = "";
-                try {
-                    bodyText = request.responseText || "";
-                } catch (e) {
-                    bodyText = "";
-                }
-                // Never hand a huge string to JSON.parse on the GUI thread:
-                // that is the one way this page could stall plasmashell.
-                if (bodyText.length > page.maxBackendResponseChars) {
-                    settle("the daemon's answer from " + url + " is too large to read safely");
-                    return;
-                }
-                var parsed = null;
-                try {
-                    parsed = JSON.parse(bodyText);
-                } catch (e) {
-                    parsed = null;
-                }
-                if (!parsed || typeof parsed !== "object") {
-                    settle("the daemon answered " + url + " with something that is not JSON");
-                    return;
-                }
-                settle("", parsed);
-                return;
-            }
-
-            if (request.status === 0) {
-                settle("no answer from " + url + " - is sarvam-meter running?");
-                return;
-            }
-
-            var detail = backendErrorDetail(request);
-            if (detail !== "") {
-                settle("HTTP " + request.status + ": " + detail);
-            } else {
-                settle("HTTP " + request.status + " from " + url);
-            }
-        };
-
-        request.onerror = function () {
-            settle("could not reach " + url + " - is sarvam-meter running?");
-        };
-        request.ontimeout = function () {
-            settle(url + " did not answer within " + (page.backendTimeoutMs / 1000) + " seconds");
-        };
-        request.onabort = function () {
-            settle("the request to " + url + " was aborted");
-        };
-
-        try {
-            // Third argument true: asynchronous. A synchronous open() is banned.
-            request.open(method, url, true);
-            request.setRequestHeader("Accept", "application/json");
-            if (body !== null) {
-                request.setRequestHeader("Content-Type", "application/json");
-            }
-        } catch (e) {
-            settle("cannot open a request to " + url);
-            return;
-        }
-
-        request.timeout = page.backendTimeoutMs;
-
-        page.backendRequest = request;
-        page.backendRequestState = state;
-
-        try {
-            if (body === null) {
-                request.send();
-            } else {
-                request.send(body);
-            }
-        } catch (e) {
-            settle("cannot send the request to " + url);
-        }
-    }
-
-    // The daemon's own reason for a 400, from
-    // {"error": {"message": "...", "code": "invalid_config"}}. Size-capped and
-    // fully guarded: an error body is still untrusted input.
-    function backendErrorDetail(request) {
-        var text = "";
-        try {
-            text = request.responseText || "";
-        } catch (e) {
-            return "";
-        }
-        if (text.length === 0 || text.length > page.maxBackendResponseChars) {
-            return "";
-        }
-        var parsed = null;
-        try {
-            parsed = JSON.parse(text);
-        } catch (e) {
-            return "";
-        }
-        if (!parsed || typeof parsed !== "object") {
-            return "";
-        }
-        var error = parsed.error;
-        if (!error || typeof error !== "object") {
-            return "";
-        }
-        var message = error.message;
-        if (typeof message !== "string" || message.length === 0) {
-            return "";
-        }
-        // A daemon message is one line, not a stack trace.
-        if (message.length > 300) {
-            message = message.substring(0, 300) + "...";
-        }
-        return message;
+            || page.normalisedUrl(cliproxyUrlField.text) !== page.loadedCliproxyBaseUrl;
     }
 
     // ------------------------------------------------------------------
@@ -630,7 +572,8 @@ KCM.SimpleKCM {
     // ------------------------------------------------------------------
 
     // The header names the daemon says it holds, filtered and bounded: the
-    // answer comes off the wire and nothing about its shape is guaranteed.
+    // answer comes off a child process and nothing about its shape is
+    // guaranteed.
     function sanitiseHeaderNames(raw) {
         if (!raw || typeof raw !== "object" || typeof raw.length !== "number") {
             return [];
@@ -663,7 +606,7 @@ KCM.SimpleKCM {
     }
 
     // "session captured (cookie)" / "no session captured yet". Counts and header
-    // names only - the endpoint never hands out a value and this page could not
+    // names only - the daemon never hands out a value and this page could not
     // show one if it did.
     function sessionStatusLabel() {
         if (page.sessionState === "loading") {
@@ -692,24 +635,14 @@ KCM.SimpleKCM {
         return Kirigami.Theme.disabledTextColor;
     }
 
-    // GET /v1/session, then GET /v1/config. The config read is chained here
-    // because sendBackendRequest() is single-flight: starting the second request
-    // aborts the first, so they must not overlap.
+    // `query session`, then `query config`. The config read is chained here
+    // because runQuery() is single-flight: starting the second query abandons
+    // the first, so they must not overlap.
     function loadSessionStatus() {
-        var base = backendBaseUrl();
-        var urlError = validateDaemonUrl(base);
-        if (urlError !== "") {
-            page.sessionState = "error";
-            page.sessionMessage = "Cannot read the session - " + urlError;
-            page.loadBackendConfig();
-            return;
-        }
-
-        var target = base + "/v1/session";
         page.sessionState = "loading";
         page.sessionMessage = "";
 
-        sendBackendRequest("GET", target, null, function (doc) {
+        page.runQuery("session", "", function (doc) {
             page.applySessionDocument(doc);
             page.loadBackendConfig();
         }, function (message) {
@@ -726,7 +659,7 @@ KCM.SimpleKCM {
         return "The sign-in sheet could not be loaded. Either the QtWebEngine QML module is missing (it is not part of a standard KDE install) or the sheet itself failed to load. "
             + "On Fedora, install it with: sudo dnf install qt6-qtwebengine - then reopen this page. On Debian and Ubuntu the package is qml6-module-qtwebengine. "
             + "Nothing else here depends on it: the rest of this page and the widget keep working. "
-            + "To capture the session without a web engine, sign in to indus.sarvam.ai in your browser, copy the Cookie header value out of the developer tools, and run: sarvam-meter session set --cookie-file PATH (see docs/dashboard-scrape.md).";
+            + "To capture the session without a web engine, sign in to indus.sarvam.ai in your browser, copy the Cookie header value out of the developer tools into a file only you can read, and run: sarvam-meter session set --cookie-file PATH (see docs/dashboard-scrape.md).";
     }
 
     function openSessionCapture() {
@@ -753,68 +686,29 @@ KCM.SimpleKCM {
         sessionSheetLoader.active = false;
     }
 
-    // The sheet's captured(cookieHeader, authorizationHeader). Both arguments are
-    // secret: they stay in these two locals and go straight into the POST body.
-    // They are never assigned to a property, so nothing can bind to them, and
-    // nothing that is displayed is built from them.
-    function handleSessionCaptured(cookieHeader, authorizationHeader) {
-        var cookie = (typeof cookieHeader === "string") ? cookieHeader : "";
-        var authorization = (typeof authorizationHeader === "string") ? authorizationHeader : "";
-
-        page.closeSessionCapture();
-
-        if (cookie === "") {
-            page.sessionFeedback = "FAIL: the sheet handed back no cookie header.";
-            page.sessionFeedbackKind = "fail";
-            return;
-        }
-
-        var base = backendBaseUrl();
-        var urlError = validateDaemonUrl(base);
-        if (urlError !== "") {
-            page.sessionFeedback = "FAIL: " + urlError;
-            page.sessionFeedbackKind = "fail";
-            return;
-        }
-
-        var target = base + "/v1/session";
-        var payload = { "cookie": cookie };
-        if (authorization !== "") {
-            payload.authorization = authorization;
-        }
-
-        page.sessionFeedback = "Sending the session to " + target + " ...";
-        page.sessionFeedbackKind = "info";
-
-        sendBackendRequest("POST", target, payload, function (doc) {
-            page.sessionFeedback = "OK: session stored";
-            page.sessionFeedbackKind = "ok";
-            // Re-read the session, and through it the config: the daemon decides
-            // what it actually kept, and this page only reports that.
-            page.loadSessionStatus();
-        }, function (message) {
-            // The message is the daemon's, or a status code and the URL. It is
-            // never built from the request body, so it cannot carry the cookie.
-            page.sessionFeedback = "FAIL: " + message;
-            page.sessionFeedbackKind = "fail";
-        });
+    // The sheet's stored(): it delivered the captured headers to the daemon over
+    // D-Bus itself, so this page has nothing to send - only to re-read the state
+    // the daemon now reports.
+    function handleSessionStored() {
+        page.sessionFeedback = "OK: the session was handed to the daemon over D-Bus.";
+        page.sessionFeedbackKind = "ok";
+        page.loadSessionStatus();
     }
 
-    // GET /v1/config: the one read that populates the group.
+    // The sheet's deliveryFailed(message): busctl and gdbus both failed, or the
+    // daemon rejected the call. The message is the sheet's own and never carries
+    // a cookie value.
+    function handleSessionDeliveryFailed(message) {
+        page.sessionFeedback = "FAIL: " + message;
+        page.sessionFeedbackKind = "fail";
+    }
+
+    // `query config`: the one read that populates the group.
     function loadBackendConfig() {
-        var base = backendBaseUrl();
-        var urlError = validateDaemonUrl(base);
-        if (urlError !== "") {
-            page.backendState = "error";
-            page.backendMessage = "Cannot read the backend settings - " + urlError;
-            return;
-        }
-
-        var target = base + "/v1/config";
         page.backendState = "loading";
-        page.backendMessage = "Reading the backend settings from " + target + " ...";
+        page.backendMessage = "Reading the backend settings with " + page.command + " query config ...";
 
-        sendBackendRequest("GET", target, null, function (doc) {
+        page.runQuery("config", "", function (doc) {
             page.applyBackendDocument(doc);
         }, function (message) {
             page.backendState = "error";
@@ -823,8 +717,8 @@ KCM.SimpleKCM {
     }
 
     // Copy a sanitised config document into the controls and into the diff
-    // baseline. Every field is read defensively: the document comes off the
-    // wire and nothing about its shape is guaranteed here.
+    // baseline. Every field is read defensively: the document comes out of a
+    // child process and nothing about its shape is guaranteed here.
     function applyBackendDocument(doc) {
         if (!doc || typeof doc !== "object") {
             page.backendState = "error";
@@ -849,7 +743,7 @@ KCM.SimpleKCM {
             (dashboard && typeof dashboard.poll_seconds === "number") ? dashboard.poll_seconds : 300);
         page.loadedCliproxyEnabled = cliproxy ? cliproxy.enabled === true : false;
         page.loadedCliproxyBaseUrl = (cliproxy && typeof cliproxy.base_url === "string")
-            ? normalisedBaseUrl(cliproxy.base_url)
+            ? page.normalisedUrl(cliproxy.base_url)
             : "";
 
         dashboardEnabledSwitch.checked = page.loadedDashboardEnabled;
@@ -890,7 +784,7 @@ KCM.SimpleKCM {
                 cliproxyPart = cliproxyPart || {};
                 cliproxyPart.enabled = cliproxyEnabledSwitch.checked;
             }
-            var cliproxyUrl = normalisedBaseUrl(cliproxyUrlField.text);
+            var cliproxyUrl = page.normalisedUrl(cliproxyUrlField.text);
             if (cliproxyUrl !== page.loadedCliproxyBaseUrl) {
                 cliproxyPart = cliproxyPart || {};
                 cliproxyPart.base_url = cliproxyUrl;
@@ -905,19 +799,12 @@ KCM.SimpleKCM {
     }
 
     // The "Save backend settings" button. Validates first, sends only the
-    // changed subset, then re-reads the document so the form shows what the
-    // daemon actually stored (it sanitises, clamps and redacts).
+    // changed subset as one quoted JSON argument, then re-reads the document so
+    // the form shows what the daemon actually stored (it sanitises, clamps and
+    // redacts).
     function saveBackendConfig() {
         if (!page.backendLoaded) {
             page.backendFeedback = "FAIL: nothing has been read from the daemon yet.";
-            page.backendFeedbackKind = "fail";
-            return;
-        }
-
-        var base = backendBaseUrl();
-        var urlError = validateDaemonUrl(base);
-        if (urlError !== "") {
-            page.backendFeedback = "FAIL: " + urlError;
             page.backendFeedbackKind = "fail";
             return;
         }
@@ -945,13 +832,24 @@ KCM.SimpleKCM {
             return;
         }
 
-        var target = base + "/v1/config";
+        var json = null;
+        try {
+            json = JSON.stringify(subset);
+        } catch (e) {
+            json = null;
+        }
+        if (json === null) {
+            page.backendFeedback = "FAIL: cannot serialise the settings to send.";
+            page.backendFeedbackKind = "fail";
+            return;
+        }
+
         page.backendState = "saving";
         page.backendMessage = "";
-        page.backendFeedback = "Saving to " + target + " ...";
+        page.backendFeedback = "Saving with " + page.command + " query set-config ...";
         page.backendFeedbackKind = "info";
 
-        sendBackendRequest("POST", target, subset, function (doc) {
+        page.runQuery("set-config", page.shellQuote(json), function (doc) {
             page.applyBackendDocument(doc);
             page.backendFeedback = "OK: the daemon accepted the new backend settings.";
             page.backendFeedbackKind = "ok";
@@ -973,14 +871,21 @@ KCM.SimpleKCM {
         }
 
         PlasmaComponents.TextField {
-            id: daemonUrlField
-            Kirigami.FormData.label: "Daemon URL:"
-            placeholderText: "http://127.0.0.1:8787"
-            text: page.cfg_daemonUrl
+            id: commandField
+            Kirigami.FormData.label: "Command:"
+            placeholderText: "sarvam-meter"
+            text: page.cfg_command
             Layout.minimumWidth: Kirigami.Units.gridUnit * 18
             Layout.maximumWidth: Kirigami.Units.gridUnit * 26
-            onTextChanged: page.syncDaemonUrl()
-            onEditingFinished: page.syncDaemonUrl()
+            onTextChanged: page.syncCommand()
+            onEditingFinished: page.syncCommand()
+        }
+
+        PlasmaComponents.Label {
+            text: "The program the widget and this page run to reach the daemon: \"<command> query status\", \"query refresh\", \"query config\", \"query set-config\" and \"query session\". Use the bare program name when sarvam-meter is on PATH, or an absolute path to it. It is executed, so spaces, quotes and shell metacharacters are refused."
+            color: Kirigami.Theme.disabledTextColor
+            wrapMode: Text.Wrap
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 26
         }
 
         RowLayout {
@@ -1005,17 +910,9 @@ KCM.SimpleKCM {
         }
 
         PlasmaComponents.Label {
-            visible: page.daemonUrlInvalid && daemonUrlField.text.length > 0
-            text: "Not saved - " + page.daemonUrlError
+            visible: page.commandInvalid && commandField.text.length > 0
+            text: "Not saved - " + page.commandErrorText
             color: Kirigami.Theme.negativeTextColor
-            wrapMode: Text.Wrap
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 26
-        }
-
-        PlasmaComponents.Label {
-            visible: page.daemonUrlNonLocal
-            text: "Note: this host is not a loopback address. sarvam-meter is meant to run on this machine, so the daemon will probably not be reachable there."
-            color: Kirigami.Theme.neutralTextColor
             wrapMode: Text.Wrap
             Layout.maximumWidth: Kirigami.Units.gridUnit * 26
         }
@@ -1083,7 +980,7 @@ KCM.SimpleKCM {
         }
 
         PlasmaComponents.Label {
-            text: "These values belong to the sarvam-meter daemon and live in its own config file. The page reads them with GET /v1/config and the button below writes them with POST /v1/config. They are not widget settings: the dialog's Apply button does not touch them."
+            text: "These values belong to the sarvam-meter daemon and live in its own config file. The page reads them by running the command above with \"query config\", and the button below writes them with \"query set-config\" and a JSON argument. They are not widget settings: the dialog's Apply button does not touch them."
             color: Kirigami.Theme.disabledTextColor
             wrapMode: Text.Wrap
             Layout.maximumWidth: Kirigami.Units.gridUnit * 26
@@ -1201,7 +1098,8 @@ KCM.SimpleKCM {
                     item.width = Qt.binding(function () { return sessionSheetLoader.width; });
                     item.height = Qt.binding(function () { return sessionSheetLoader.height; });
                     try {
-                        item.captured.connect(page.handleSessionCaptured);
+                        item.stored.connect(page.handleSessionStored);
+                        item.deliveryFailed.connect(page.handleSessionDeliveryFailed);
                         item.closeRequested.connect(page.closeSessionCapture);
                     } catch (e) {
                         // The file loaded but is not the sheet we expect: treat it

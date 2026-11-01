@@ -3,8 +3,9 @@
 
 `systemctl --user enable --now sarvam-meter` has to succeed on a machine where
 nothing has been configured yet, and has to respect the config once it exists.
-These tests pin both halves: the unit file itself, and the CLI behaviour it
-depends on (`init --if-missing`, and `serve` reading `proxy.enabled`).
+These tests pin the unit file itself and the CLI behaviour it depends on
+(`init --if-missing`).  The recording proxy is gone, so `serve` has nothing to
+decide any more: it only binds the daemon's socket.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ SPEC = os.path.join(REPO_ROOT, "packaging", "plasma-applet-sarvam-meter.spec")
 
 sys.path.insert(0, REPO_ROOT)
 
-from sarvam_meter.cli import should_start_proxy  # noqa: E402
 from sarvam_meter import config as config_mod  # noqa: E402
 
 
@@ -56,16 +56,6 @@ class UnitFileTest(unittest.TestCase):
         line = match.group(1).strip()
         self.assertIn("/usr/bin/sarvam-meter init", line)
         self.assertIn("--if-missing", line)
-
-    def test_the_proxy_is_left_to_the_config(self):
-        # Hardcoding --with-proxy here would override `proxy.enabled: false`,
-        # which is the default and what the settings page toggles.  Only the
-        # directives count: the comment above explains the flag on purpose.
-        directives = [
-            line for line in self.unit.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-        self.assertNotIn("--with-proxy", "\n".join(directives))
 
     def test_it_points_the_daemon_at_the_users_own_config(self):
         self.assertRegex(self.unit, r"(?m)^Environment=SARVAM_METER_CONFIG=%h/")
@@ -155,33 +145,6 @@ class InitIfMissingTest(unittest.TestCase):
         self.assertEqual(
             json.loads(read(self.path))["dashboard"]["poll_seconds"], 300
         )
-
-
-class ProxyDecisionTest(unittest.TestCase):
-    """`serve` must honour `proxy.enabled`, since the unit cannot pass a flag."""
-
-    def config(self, enabled):
-        document = config_mod.default_config_dict()
-        document["proxy"]["enabled"] = enabled
-        directory = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, directory, True)
-        path = os.path.join(directory, "config.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(document, handle)
-        return config_mod.load_config(path)
-
-    class Args(object):
-        def __init__(self, with_proxy=False):
-            self.with_proxy = with_proxy
-
-    def test_the_config_alone_turns_the_proxy_on(self):
-        self.assertTrue(should_start_proxy(self.Args(), self.config(True)))
-
-    def test_the_config_alone_keeps_it_off(self):
-        self.assertFalse(should_start_proxy(self.Args(), self.config(False)))
-
-    def test_the_flag_still_forces_it_on(self):
-        self.assertTrue(should_start_proxy(self.Args(True), self.config(False)))
 
 
 if __name__ == "__main__":  # pragma: no cover

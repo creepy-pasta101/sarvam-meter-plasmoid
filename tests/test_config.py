@@ -27,13 +27,6 @@ EXPECTED_DEFAULT = {
         "refresh_seconds": 60,
         "request_timeout_seconds": 10,
     },
-    "proxy": {
-        "enabled": False,
-        "host": "127.0.0.1",
-        "port": 8788,
-        "upstream_base": "https://api.sarvam.ai",
-        "max_body_bytes": 268435456,
-    },
     "sarvam": {
         "enabled": True,
         "currency": "INR",
@@ -63,7 +56,6 @@ TOP_LEVEL_ORDER = [
     "version",
     "db_path",
     "daemon",
-    "proxy",
     "sarvam",
     "cliproxy",
     "dashboard",
@@ -156,7 +148,6 @@ class WriteDefaultConfigTests(ConfigTestBase):
         self.assertIsInstance(config, Config)
         self.assertEqual(config.version, 1)
         self.assertEqual(config.daemon.port, 8787)
-        self.assertEqual(config.proxy.upstream_base, "https://api.sarvam.ai")
         self.assertEqual(config.sarvam.currency, "INR")
         self.assertIsNone(config.sarvam.starting_balance)
         self.assertEqual(config.cliproxy.api_version, "v8")
@@ -247,9 +238,6 @@ class VersionAndNumberValidationTests(ConfigTestBase):
         )
         self.assertEqual(self.load_document({"daemon": {"port": 1}}).daemon.port, 1)
 
-    def test_proxy_port_range(self):
-        self.assert_config_error({"proxy": {"port": -5}}, "proxy.port")
-
     def test_port_must_be_integer(self):
         self.assert_config_error({"daemon": {"port": "8787"}}, "daemon.port")
 
@@ -318,10 +306,6 @@ class VersionAndNumberValidationTests(ConfigTestBase):
 
 
 class UrlValidationTests(ConfigTestBase):
-    def test_upstream_base_requires_http_scheme_and_host(self):
-        for bad in ("ftp://api.sarvam.ai", "api.sarvam.ai", "https://", "http://"):
-            self.assert_config_error({"proxy": {"upstream_base": bad}}, "upstream_base")
-
     def test_cliproxy_base_url_requires_http_scheme_and_host(self):
         self.assert_config_error(
             {"cliproxy": {"base_url": "127.0.0.1:8317"}}, "base_url"

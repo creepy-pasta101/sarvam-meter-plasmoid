@@ -8,8 +8,8 @@
 # Steps:
 #   1. python3 -m unittest discover -s tests -v
 #   2. sarvam-meter init  -> a throwaway config in a temp dir
-#   3. sarvam-meter serve --port <free port>  (background, bounded wait)
-#   4. curl /v1/health and /v1/status, print both bodies
+#   3. sarvam-meter serve --socket <path>  (background, bounded wait)
+#   4. sarvam-meter query health --socket <path>  (bounded wait for readiness)
 #   5. kill the daemon (trap on EXIT) and remove the temp dir
 #
 # No root, no network beyond 127.0.0.1, and it never hangs: every wait is
@@ -71,21 +71,15 @@ log "writing a throwaway config to ${CONFIG_PATH}"
 "${CLI[@]}" init --config "${CONFIG_PATH}"
 [ -f "${CONFIG_PATH}" ] || die "init did not create ${CONFIG_PATH}"
 
-# --- 3. a free loopback port ----------------------------------------------
-PORT="$(python3 -c '
-import socket
-sock = socket.socket()
-sock.bind(("127.0.0.1", 0))
-print(sock.getsockname()[1])
-sock.close()
-')"
-[ -n "${PORT}" ] || die "could not find a free TCP port"
-log "starting the daemon on 127.0.0.1:${PORT}"
+# --- 3. the daemon's socket path ------------------------------------------
+SOCKET_PATH="${TMP_DIR}/daemon.sock"
+[ -n "${SOCKET_PATH}" ] || die "could not work out a socket path"
+log "starting the daemon on ${SOCKET_PATH}"
 
-"${CLI[@]}" serve --config "${CONFIG_PATH}" --port "${PORT}" >"${DAEMON_LOG}" 2>&1 &
+"${CLI[@]}" serve --config "${CONFIG_PATH}" --socket "${SOCKET_PATH}" >"${DAEMON_LOG}" 2>&1 &
 DAEMON_PID=$!
 
-# --- 4. bounded wait for /v1/health ---------------------------------------
+# --- 4. bounded wait for `query health` -----------------------------------
 ready=0
 attempt=0
 while [ "${attempt}" -lt "${WAIT_TRIES}" ]; do
@@ -93,24 +87,22 @@ while [ "${attempt}" -lt "${WAIT_TRIES}" ]; do
     if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
         die "the daemon exited before it became ready (see the log above)"
     fi
-    if curl -fsS --max-time "${CURL_TIMEOUT}" \
-        "http://127.0.0.1:${PORT}/v1/health" >"${TMP_DIR}/health.json" 2>/dev/null; then
+    if "${CLI[@]}" query health --socket "${SOCKET_PATH}" >"${TMP_DIR}/health.json" 2>/dev/null; then
         ready=1
         break
     fi
     sleep "${WAIT_SLEEP}"
 done
-[ "${ready}" -eq 1 ] || die "the daemon did not answer /v1/health within 15s"
+[ "${ready}" -eq 1 ] || die "the daemon did not answer 'query health' within 15s"
 
-# --- 5. print both endpoints ----------------------------------------------
-log "GET /v1/health"
+# --- 5. print both results ------------------------------------------------
+log "query health"
 cat "${TMP_DIR}/health.json"
 printf '\n'
 
-curl -fsS --max-time "${CURL_TIMEOUT}" \
-    "http://127.0.0.1:${PORT}/v1/status" >"${TMP_DIR}/status.json" \
-    || die "GET /v1/status failed"
-log "GET /v1/status"
+"${CLI[@]}" query status --socket "${SOCKET_PATH}" >"${TMP_DIR}/status.json" \
+    || die "'query status' failed"
+log "query status"
 cat "${TMP_DIR}/status.json"
 printf '\n'
 
@@ -128,13 +120,13 @@ if health.get("ok") is not True:
     problems.append("health.ok is not true")
 if not isinstance(health.get("version"), str):
     problems.append("health.version is not a string")
-if status.get("schema") != 1:
-    problems.append("status.schema is not 1")
+if status.get("schema") != 2:
+    problems.append("status.schema is not 2")
 if not isinstance(status.get("sarvam"), dict):
     problems.append("status.sarvam is not an object")
 if problems:
     sys.exit("; ".join(problems))
-print("[smoke] status payload looks sane (schema 1, sarvam block present)")
+print("[smoke] status payload looks sane (schema 2, sarvam block present)")
 PY
 
 log "smoke test passed"

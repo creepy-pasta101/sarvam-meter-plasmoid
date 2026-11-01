@@ -6,17 +6,13 @@ Each test names the review id it pins down, so a future regression is obvious.
 
 from __future__ import annotations
 
-import dataclasses
-import http.client
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,7 +28,6 @@ from sarvam_meter.config import (  # noqa: E402
     is_loopback_host,
     load_config,
 )
-from sarvam_meter.daemon import Daemon  # noqa: E402
 from sarvam_meter.ledger import Ledger  # noqa: E402
 from sarvam_meter.status import build_status  # noqa: E402
 
@@ -131,10 +126,6 @@ class DashboardSnapshotRegressionTest(unittest.TestCase):
             "spend",
             "calls",
             "by_api",
-            "rate_limits",
-            "quota_exhausted",
-            "quota_exhausted_at",
-            "untracked_calls",
             "dashboard",
         }
         for dash in (None, "nope", [], 0, {"reachable": True}, {"error": "boom"}):
@@ -213,89 +204,6 @@ class CostOverflowTest(unittest.TestCase):
         self.assertNotIn("inf", result.stdout.lower())
 
 
-class CliPortTest(unittest.TestCase):
-    """MJ-4: `proxy --port` must override the proxy section, not the daemon one."""
-
-    def test_proxy_port_override(self):
-        from sarvam_meter.cli import _with_port
-
-        directory = tempfile.mkdtemp()
-        config = load_config(_write_config(directory, proxy={"port": 18788},
-                                           daemon={"port": 18787}))
-        patched = _with_port(config, 19999, section="proxy")
-        self.assertEqual(patched.proxy.port, 19999)
-        self.assertEqual(patched.daemon.port, 18787)
-
-
-class DoctorProbeTest(unittest.TestCase):
-    """MN-6 / MN-7: doctor must not false-fail or false-pass."""
-
-    def test_time_wait_port_is_reported_free(self):
-        from sarvam_meter.cli import _port_is_free
-
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        port = listener.getsockname()[1]
-        client = socket.create_connection(("127.0.0.1", port))
-        accepted, _ = listener.accept()
-        accepted.close()  # server side goes into TIME_WAIT
-        client.close()
-        listener.close()
-        ok, detail = _port_is_free("127.0.0.1", port)
-        self.assertTrue(ok, detail)
-
-
-class DaemonKeepAliveTest(unittest.TestCase):
-    """MN-1: a request body must not poison the next request."""
-
-    def setUp(self):
-        self.directory = tempfile.mkdtemp()
-        # The config schema rejects port 0, so bind an ephemeral port by patching
-        # the loaded config instead (the same trick the daemon tests use).
-        config = load_config(_write_config(self.directory, daemon={"port": 18787}))
-        config = dataclasses.replace(
-            config, daemon=dataclasses.replace(config.daemon, port=0)
-        )
-        self.daemon = Daemon(config)
-        self.port = self.daemon.start()
-
-    def tearDown(self):
-        self.daemon.shutdown()
-
-    def test_body_is_drained_between_requests(self):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        try:
-            body = b"hello world"
-            connection.request("POST", "/v1/refresh", body=body,
-                               headers={"Content-Length": str(len(body))})
-            first = connection.getresponse()
-            first.read()
-            self.assertEqual(first.status, 200)
-            # A fresh connection is used because the daemon closes after each
-            # response; the point is that the second request still succeeds.
-            second_connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-            second_connection.request("GET", "/v1/health")
-            second = second_connection.getresponse()
-            payload = json.loads(second.read())
-            second_connection.close()
-            self.assertEqual(second.status, 200)
-            self.assertTrue(payload["ok"])
-        finally:
-            connection.close()
-
-    def test_head_is_allowed_on_get_routes(self):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        try:
-            connection.request("HEAD", "/v1/status")
-            response = connection.getresponse()
-            self.assertEqual(response.status, 200)
-            self.assertEqual(response.read(), b"")
-        finally:
-            connection.close()
-
-
 class LoopbackGuardTest(unittest.TestCase):
     """MN-3 / MN-4: host names resolve, credentials are refused."""
 
@@ -315,31 +223,6 @@ class LoopbackGuardTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config(_write_config(directory,
                                       cliproxy={"base_url": "http://a:b@127.0.0.1:8317"}))
-
-
-class SttTruncatedHeadTest(unittest.TestCase):
-    """MJ-1: an MP3 whose head is truncated must be recorded as an estimate."""
-
-    def test_truncated_mp3_head_is_not_reported_as_exact(self):
-        from sarvam_meter.proxy import HEAD_LIMIT, _audio_duration_from_head
-
-        frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
-        small = frame * 4
-        self.assertIsNotNone(_audio_duration_from_head(small))
-        huge = (frame * ((HEAD_LIMIT // len(frame)) + 8))[:HEAD_LIMIT]
-        self.assertIsNone(_audio_duration_from_head(huge))
-
-    def test_wav_head_stays_exact_even_when_truncated(self):
-        import struct
-
-        from sarvam_meter.proxy import HEAD_LIMIT, _audio_duration_from_head
-
-        data_size = 10 * 16000 * 2  # 10 s of 16 kHz mono s16
-        header = b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
-        header += b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
-        header += b"data" + struct.pack("<I", data_size)
-        payload = header + b"\x00" * HEAD_LIMIT
-        self.assertAlmostEqual(_audio_duration_from_head(payload), 10.0, places=3)
 
 
 class ShutdownCleanlinessTest(unittest.TestCase):

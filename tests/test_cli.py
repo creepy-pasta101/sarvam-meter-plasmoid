@@ -33,13 +33,13 @@ EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 
 #: The six checks ``doctor`` performs with the default config
-#: (``proxy.enabled`` and ``cliproxy.enabled`` are false, ``dashboard.enabled``
-#: is true, so the dashboard contributes its session *and* reachability checks).
+#: (``cliproxy.enabled`` is false, ``dashboard.enabled`` is true, so the
+#: dashboard contributes its session *and* reachability checks).
 DOCTOR_CHECKS = (
     "config loads",
     "data dir writable",
     "db opens",
-    "daemon port free",
+    "daemon socket free",
     "dashboard session",
     "dashboard reachable",
 )
@@ -48,16 +48,6 @@ DOCTOR_CHECKS = (
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def free_port():
-    """A port that was free a moment ago (bound and released on loopback)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-    finally:
-        sock.close()
 
 
 def run_cli(argv):
@@ -117,12 +107,21 @@ class CliTestCase(unittest.TestCase):
         self.db_path = os.path.join(self.tmp, "usage.db")
         # Never read or write the real ~/.config/sarvam-meter/session.json.
         self.session_path = os.path.join(self.tmp, "session.json")
+        # Where the daemon's socket lives for this test.  `doctor` resolves the
+        # path exactly the way the daemon and the client do, so pinning it here
+        # keeps every check inside the throwaway directory.
+        self.socket_path = os.path.join(self.tmp, "run", "daemon.sock")
 
         saved = {}
-        for name in ("SARVAM_METER_CONFIG", "SARVAM_METER_CLIPROXY_KEY"):
+        for name in (
+            "SARVAM_METER_CONFIG",
+            "SARVAM_METER_CLIPROXY_KEY",
+            "SARVAM_METER_SOCKET",
+        ):
             saved[name] = os.environ.get(name)
         self.addCleanup(self._restore_env, saved)
         os.environ["SARVAM_METER_CONFIG"] = self.config_path
+        os.environ["SARVAM_METER_SOCKET"] = self.socket_path
         os.environ.pop("SARVAM_METER_CLIPROXY_KEY", None)
 
     @staticmethod
@@ -138,7 +137,6 @@ class CliTestCase(unittest.TestCase):
         path = path or self.config_path
         document = config_mod.default_config_dict()
         document["db_path"] = self.db_path
-        document["daemon"]["port"] = free_port()
         document["dashboard"]["session_file"] = self.session_path
         for section, values in sections.items():
             document[section].update(values)
@@ -214,8 +212,11 @@ class InitTest(CliTestCase):
         loaded = config_mod.load_config(target)
         self.assertEqual(loaded.version, 1)
         self.assertEqual(loaded.daemon.port, 8787)
-        self.assertEqual(loaded.proxy.upstream_base, "https://api.sarvam.ai")
+        self.assertEqual(loaded.dashboard.poll_seconds, 300)
         self.assertEqual(loaded.sarvam.currency, "INR")
+        # The recording proxy is gone: a config must not carry a proxy section
+        # and the loaded Config must not expose one.
+        self.assertFalse(hasattr(loaded, "proxy"))
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +268,6 @@ class StatusTest(CliTestCase):
         "spend",
         "calls",
         "by_api",
-        "rate_limits",
-        "quota_exhausted",
-        "quota_exhausted_at",
-        "untracked_calls",
         "dashboard",
     }
     CLIPROXY_KEYS = {
@@ -315,8 +312,6 @@ class StatusTest(CliTestCase):
         self.assertIsNone(sarvam["dashboard"]["error"])
         self.assertEqual(sarvam["calls"], {"today": 0})
         self.assertEqual(sarvam["by_api"], [])
-        self.assertIs(sarvam["quota_exhausted"], False)
-        self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
 
         self.assertEqual(set(payload["cliproxy"]), self.CLIPROXY_KEYS)
         self.assertIs(payload["cliproxy"]["configured"], False)
@@ -360,10 +355,6 @@ class StatusTest(CliTestCase):
                 "spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
                 "calls": {"today": 42},
                 "by_api": [],
-                "rate_limits": {"count_24h": 0, "last_at": None},
-                "quota_exhausted": False,
-                "quota_exhausted_at": None,
-                "untracked_calls": {"today": 0, "total": 0},
                 "dashboard": {"configured": True, "reachable": True},
             },
             "cliproxy": {
@@ -445,7 +436,6 @@ class RecordTest(CliTestCase):
         payload = json.loads(out)
         sarvam = payload["sarvam"]
         self.assertEqual(sarvam["calls"]["today"], 1)
-        self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
         self.assertEqual([entry["api"] for entry in sarvam["by_api"]], ["chat"])
         # money() rounds to 2 dp for display; the ledger keeps 6.
         self.assertEqual(sarvam["balance"]["spent_total"], round(0.015, 2))
@@ -454,7 +444,7 @@ class RecordTest(CliTestCase):
         self.assertIsNone(sarvam["balance"]["remaining"])
         self.assertIsNone(sarvam["balance"]["starting"])
 
-    def test_record_on_an_unpublished_rate_is_free_and_untracked(self):
+    def test_record_on_an_unpublished_rate_is_free_and_flagged_estimated(self):
         self.write_config()
 
         out, err = self.assert_exit(
@@ -471,7 +461,8 @@ class RecordTest(CliTestCase):
 
         out, _err = self.assert_exit(["status", "--json"], EXIT_OK)
         sarvam = json.loads(out)["sarvam"]
-        self.assertEqual(sarvam["untracked_calls"], {"today": 1, "total": 1})
+        # The event is counted and listed; it is just priced at 0.
+        self.assertEqual(sarvam["calls"]["today"], 1)
         self.assertEqual(sarvam["spend"]["today"], 0.0)
         self.assertEqual([entry["api"] for entry in sarvam["by_api"]], ["translate"])
 
@@ -558,15 +549,20 @@ class DoctorTest(CliTestCase):
             self.assertIn(name, out)
         self.assertNotIn("FAIL", out)
 
-    def test_doctor_fails_when_the_daemon_port_is_occupied(self):
-        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        occupied.bind(("127.0.0.1", 0))
-        occupied.listen(1)
-        self.addCleanup(occupied.close)
-        port = int(occupied.getsockname()[1])
+    def test_doctor_fails_when_a_daemon_holds_the_socket(self):
+        from sarvam_meter.daemon import Daemon
 
-        self.write_config(daemon={"port": port})
+        self.write_config()
         self._write_session()
+        # A live daemon on the very path `doctor` probes: the socket exists, it
+        # is a socket, and something answers on it -- so it is not free.
+        daemon = Daemon(
+            config_mod.load_config(self.config_path),
+            logger=lambda _line: None,
+            socket_path=self.socket_path,
+        )
+        daemon.start()
+        self.addCleanup(daemon.shutdown)
         with mock.patch(
             "sarvam_meter.daemon.fetch_dashboard_snapshot",
             return_value=_dashboard_snapshot(),
@@ -575,13 +571,13 @@ class DoctorTest(CliTestCase):
 
         fail_lines = [line for line in out.splitlines() if line.startswith("FAIL ")]
         self.assertTrue(fail_lines, out)
-        self.assertIn("FAIL daemon port free", out)
+        self.assertIn("FAIL daemon socket free", out)
         self.assertIn("OK   config loads", out)
-        # The occupied port is the *only* failure on an otherwise healthy box:
+        # The busy socket is the *only* failure on an otherwise healthy box:
         # the dashboard session is captured and the snapshot is mocked, so the
         # dashboard checks must not add a second FAIL.
         self.assertEqual(len(fail_lines), 1, out)
-        self.assertTrue(fail_lines[0].startswith("FAIL daemon port free"), out)
+        self.assertTrue(fail_lines[0].startswith("FAIL daemon socket free"), out)
         self.assertIn("OK   dashboard session", out)
         self.assertIn("OK   dashboard reachable", out)
         # One OK/FAIL line per check, no more and no fewer.
@@ -612,8 +608,8 @@ class DoctorTest(CliTestCase):
         out, _err = self.assert_exit(["doctor", "--config", missing], EXIT_RUNTIME)
 
         lines = [line for line in out.splitlines() if line.strip()]
-        # "config loads" plus the seven checks it could not run.
-        self.assertEqual(len(lines), 8, out)
+        # "config loads" plus the six checks it could not run.
+        self.assertEqual(len(lines), 7, out)
         for line in lines:
             self.assertTrue(line.startswith("FAIL "), line)
         self.assertIn("FAIL config loads", out)
@@ -909,6 +905,94 @@ class DoctorDashboardTest(CliTestCase):
         self.assertIn("OK   dashboard session", out)
         self.assertNotIn("dashboard reachable", out)
         self.assertNotIn("FAIL", out)
+
+
+
+# ---------------------------------------------------------------------------
+# query (talk to a running daemon over its socket)
+# ---------------------------------------------------------------------------
+
+
+class QueryTest(CliTestCase):
+    """``query <op>`` sends one request down the socket and prints the result.
+
+    This is the CLI half of the socket transport: the daemon it talks to is a
+    real one, bound to the path ``SARVAM_METER_SOCKET`` names in the fixture.
+    """
+
+    def start_daemon(self):
+        from sarvam_meter.daemon import Daemon
+
+        self.write_config(dashboard={"enabled": False})
+        daemon = Daemon(
+            config_mod.load_config(self.config_path),
+            logger=lambda _line: None,
+            socket_path=self.socket_path,
+        )
+        daemon.start()
+        self.addCleanup(daemon.shutdown)
+        return daemon
+
+    def test_query_health_prints_the_result(self):
+        self.start_daemon()
+        out, err = self.assert_exit(
+            ["query", "health", "--socket", self.socket_path], EXIT_OK
+        )
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], True)
+        self.assertIn("uptime_seconds", payload)
+        self.assertEqual(err, "")
+
+    def test_query_resolves_the_socket_from_the_environment(self):
+        self.start_daemon()
+        out, _err = self.assert_exit(["query", "status"], EXIT_OK)
+        payload = json.loads(out)
+        self.assertEqual(payload["schema"], 2)
+        self.assertIn("sarvam", payload)
+
+    def test_query_config_and_session_report_without_a_value(self):
+        self.start_daemon()
+        out, _err = self.assert_exit(
+            ["query", "config", "--socket", self.socket_path], EXIT_OK
+        )
+        self.assertEqual(json.loads(out)["version"], 1)
+        out, _err = self.assert_exit(
+            ["query", "session", "--socket", self.socket_path], EXIT_OK
+        )
+        self.assertEqual(
+            sorted(json.loads(out)), ["configured", "headers", "mode", "path"]
+        )
+
+    def test_query_set_config_writes_the_file(self):
+        self.start_daemon()
+        out, _err = self.assert_exit(
+            [
+                "query",
+                "set-config",
+                '{"dashboard": {"poll_seconds": 600}}',
+                "--socket",
+                self.socket_path,
+            ],
+            EXIT_OK,
+        )
+        self.assertEqual(json.loads(out)["dashboard"]["poll_seconds"], 600)
+        with open(self.config_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["dashboard"]["poll_seconds"], 600)
+
+    def test_query_without_a_daemon_exits_one(self):
+        # Nothing is listening: the client's own message, exit 1, no traceback.
+        out, err = self.assert_exit(
+            ["query", "health", "--socket", self.socket_path], EXIT_RUNTIME
+        )
+        self.assertEqual(out, "")
+        self.assertIn("sarvam-meter:", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_query_rejects_a_bad_op_or_a_bad_document(self):
+        self.assert_exit(["query", "nope", "--socket", self.socket_path], EXIT_CONFIG)
+        self.assert_exit(
+            ["query", "set-config", "[]", "--socket", self.socket_path], EXIT_CONFIG
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

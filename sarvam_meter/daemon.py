@@ -1,41 +1,55 @@
 # SPDX-License-Identifier: MIT
-"""Local HTTP daemon serving the widget's status JSON (SPEC section 11).
+"""Local daemon serving the widget's status JSON over a Unix socket.
 
-Routes (nothing else exists):
+There is no TCP listener anywhere in this process.  The daemon binds one
+``AF_UNIX`` stream socket -- ``$XDG_RUNTIME_DIR/sarvam-meter/daemon.sock`` by
+default, ``~/.cache/sarvam-meter/daemon.sock`` when ``XDG_RUNTIME_DIR`` is
+unset, and ``daemon.socket_path`` when the config sets it -- at mode ``0600``
+inside a ``0700`` directory.  Only processes that can open that file can talk
+to it, which is the point: a loopback port is reachable by every local process.
 
-===========  ==============  ==============================================
-method       path            behaviour
-===========  ==============  ==============================================
-GET          /v1/status      status payload, ``Cache-Control: no-store``
-GET          /v1/health      ``{"ok": true, "version": ..., "uptime_seconds": N}``
-POST         /v1/refresh     force a cliproxy *and* dashboard re-poll
-GET          /v1/config      sanitised config, secrets redacted
-POST         /v1/config      rewrite the *writable* subset of the config
-GET          /v1/session     whether a dashboard session is stored (names only)
-POST         /v1/session     store a captured dashboard ``Cookie``/``Authorization``
-anything     anything else   ``404`` ``not_found`` / ``405`` ``method_not_allowed``
-===========  ==============  ==============================================
+Protocol: one JSON object per line in each direction.
 
-The two mutating routes are ``POST /v1/config`` -- what the plasmoid's settings
-page calls -- and ``POST /v1/session`` -- what the plasmoid's sign-in webview
-calls once the user has signed in to the Sarvam dashboard.
+================================  ==============================================
+request                           behaviour
+================================  ==============================================
+``{"op": "status"}``              the status payload (was ``GET /v1/status``)
+``{"op": "health"}``              ``{"ok": true, "version": ..., "uptime_seconds": N}``
+``{"op": "refresh"}``             force a cliproxy *and* dashboard re-poll, return status
+``{"op": "config.get"}``          sanitised config, secrets redacted
+``{"op": "config.set", ...}``     rewrite the *writable* subset: ``{"config": {...}}``
+``{"op": "session.get"}``         whether a dashboard session is stored (names only)
+``{"op": "session.set", ...}``    store a captured ``Cookie``/``Authorization``
+anything else                     ``{"ok": false, "error": {"code": "unknown_op", ...}}``
+================================  ==============================================
 
-``POST /v1/config``: only the keys listed in :data:`WRITABLE_SECTIONS` may be
+Every reply is either ``{"ok": true, "result": <json>}`` or
+``{"ok": false, "error": {"code": "<code>", "message": "<text>"}}``.  A line
+that is not a JSON object is ``bad_request``; a line longer than
+:data:`MAX_LINE_BYTES` is ``too_large`` and closes that connection.  The client
+(``sarvam_meter.client``) opens a connection per request, but a client that
+keeps one open may send several ops down it: replies come back in order.
+
+The two mutating ops are ``config.set`` -- what the plasmoid's settings page
+calls -- and ``session.set`` -- what the plasmoid's sign-in webview calls once
+the user has signed in to the Sarvam dashboard.
+
+``config.set``: only the keys listed in :data:`WRITABLE_SECTIONS` may be
 changed, values are validated by the same rules :func:`config.load_config`
 uses, and the file is replaced atomically at mode ``0600``.
 
-``POST /v1/session``: the body carries the raw ``Cookie`` and/or
+``session.set``: the request carries the raw ``Cookie`` and/or
 ``Authorization`` header value the webview captured.  Both are bounded
 (:data:`SESSION_FIELD_LIMITS`), rejected if they could inject a header
 (CR/LF/NUL), and written to ``dashboard.session_file`` atomically at mode
 ``0600`` under the canonical key names :func:`dashboard.load_session` reads
 (``{"Cookie": ..., "Authorization": ...}``).  A stored value is never echoed
-back, never logged and never appears in an error message: ``GET /v1/session``
+back, never logged and never appears in an error message: ``session.get``
 reports only the header *names*, the path and the file mode.
 
 Both source snapshots (CLIProxyAPI and the Sarvam dashboard) are refreshed on
 background threads behind locks; a slow or unreachable source never delays
-``/v1/status``, which always answers from the cached snapshots.  The dashboard
+``status``, which always answers from the cached snapshots.  The dashboard
 snapshot additionally has a TTL of ``dashboard.poll_seconds``.
 """
 
@@ -45,15 +59,16 @@ import copy
 import json
 import os
 import shutil
+import socket
 import stat
 import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+
+from .client import socket_path as resolve_socket_path
 
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -69,45 +84,45 @@ try:  # pragma: no cover - U1 owns __init__.py
 except Exception:  # noqa: BLE001
     VERSION = "0.1.0"
 
-STATUS_PATH = "/v1/status"
-HEALTH_PATH = "/v1/health"
-REFRESH_PATH = "/v1/refresh"
-CONFIG_PATH = "/v1/config"
-SESSION_PATH = "/v1/session"
+#: Every op the daemon answers, in the order the documentation lists them.
+OPS: Tuple[str, ...] = (
+    "status",
+    "health",
+    "refresh",
+    "config.get",
+    "config.set",
+    "session.get",
+    "session.set",
+)
 
-#: path -> the methods it accepts
-ROUTES = {
-    STATUS_PATH: ("GET",),
-    HEALTH_PATH: ("GET",),
-    REFRESH_PATH: ("POST",),
-    CONFIG_PATH: ("GET", "POST"),
-    SESSION_PATH: ("GET", "POST"),
-}
+#: How long ``accept()`` waits before the loop checks its stop flag.
+ACCEPT_POLL_SECONDS = 0.2
+#: Upper bound on one request line.  A longer line is answered ``too_large``
+#: and that connection is closed (the rest of it cannot be trusted).
+MAX_LINE_BYTES = 256 * 1024
+#: How long a connection may stay silent before it is closed.  One thread per
+#: connection, so an idle client must never hold a thread for ever.
+IDLE_TIMEOUT_SECONDS = 10.0
+#: Upper bound on a ``config.set`` payload (a settings document is tiny).
+MAX_CONFIG_BODY_BYTES = 64 * 1024
+#: Upper bound on a ``session.set`` payload (16 KiB cookie + 8 KiB bearer).
+MAX_SESSION_BODY_BYTES = 64 * 1024
 
-#: Sections and keys ``POST /v1/config`` may change.  Everything else in the
+#: Sections and keys ``config.set`` may change.  Everything else in the
 #: document (``cliproxy.management_key``, ``sarvam.*``, ``daemon.port``, ...) is
-#: deliberately not writable over HTTP.
+#: deliberately not writable over the socket.
 WRITABLE_SECTIONS: Dict[str, Tuple[str, ...]] = {
     "dashboard": ("enabled", "base_url", "poll_seconds", "session_file"),
     "cliproxy": ("enabled", "base_url", "api_version"),
-    "proxy": ("enabled",),
     "daemon": ("refresh_seconds",),
 }
 
-#: Sections that exist in the config document but are read-only over HTTP.  A
+#: Sections that exist in the config document but are read-only over the socket.  A
 #: key sent inside one of these is named in full (``sarvam.starting_balance is
 #: not writable``), so the settings page can point at the offending row.
 READ_ONLY_SECTIONS = frozenset(["sarvam"])
 
-CONTENT_TYPE = "application/json; charset=utf-8"
-#: Upper bound on how much of a request body is drained and discarded.
-MAX_DRAIN_BYTES = 1 * 1024 * 1024
-#: Upper bound on a ``POST /v1/config`` body (a settings document is tiny).
-MAX_CONFIG_BODY_BYTES = 64 * 1024
-#: Upper bound on a ``POST /v1/session`` body (16 KiB cookie + 8 KiB bearer).
-MAX_SESSION_BODY_BYTES = 64 * 1024
-
-#: The only keys ``POST /v1/session`` accepts, and how long each value may be.
+#: The only keys ``session.set`` accepts, and how long each value may be.
 SESSION_FIELD_LIMITS: Dict[str, int] = {
     "cookie": 16 * 1024,
     "authorization": 8 * 1024,
@@ -121,7 +136,7 @@ SESSION_FILE_KEYS: Dict[str, str] = {
     "cookie": "Cookie",
     "authorization": "Authorization",
 }
-#: Mode the session file is written with, as reported by both routes.
+#: Mode the session file is written with, as reported by both ops.
 SESSION_FILE_MODE = "0600"
 #: Reported mode when there is no session file (no permissions exist to report).
 SESSION_NO_FILE_MODE = "0000"
@@ -163,7 +178,7 @@ def _redact_tree(value: Any) -> Any:
 
 
 class ConfigUpdateError(Exception):
-    """A ``POST /v1/config`` request was rejected and **nothing** was written."""
+    """A ``config.set`` request was rejected and **nothing** was written."""
 
     code = "invalid_config"
 
@@ -173,12 +188,12 @@ class ConfigUpdateError(Exception):
 
 
 def _invalid_config(message: str) -> dict:
-    """The ``400`` body shape for a rejected config update."""
+    """The ``error`` shape for a rejected config update."""
     return {"error": {"message": message, "code": "invalid_config"}}
 
 
 class SessionUpdateError(Exception):
-    """A ``POST /v1/session`` request was rejected and **nothing** was written.
+    """A ``session.set`` request was rejected and **nothing** was written.
 
     The message names the offending *field* (``cookie``/``authorization``) or
     the path -- never a value, not even a prefix of one.
@@ -192,7 +207,7 @@ class SessionUpdateError(Exception):
 
 
 def _invalid_session(message: str) -> dict:
-    """The ``400`` body shape for a rejected session capture."""
+    """The ``error`` shape for a rejected session capture."""
     return {"error": {"message": message, "code": "invalid_session"}}
 
 
@@ -224,10 +239,6 @@ def sanitized_config(config: Any) -> dict:
             getattr(config, "daemon", None),
             ["host", "port", "refresh_seconds", "request_timeout_seconds"],
         ),
-        "proxy": _section(
-            getattr(config, "proxy", None),
-            ["enabled", "host", "port", "upstream_base", "max_body_bytes"],
-        ),
         "sarvam": _section(
             getattr(config, "sarvam", None),
             ["enabled", "currency", "starting_balance", "rate_overrides"],
@@ -254,7 +265,7 @@ def sanitized_config(config: Any) -> dict:
 
 
 # --------------------------------------------------------------------------
-# writable-subset updates (POST /v1/config)
+# writable-subset updates (config.set)
 # --------------------------------------------------------------------------
 
 
@@ -371,7 +382,7 @@ def write_config_atomic(path: str, document: dict) -> None:
 
 
 # --------------------------------------------------------------------------
-# the dashboard session (GET/POST /v1/session)
+# the dashboard session (session.get / session.set)
 # --------------------------------------------------------------------------
 
 
@@ -779,159 +790,400 @@ class _BrokenLedger:
         return _fail
 
 
-class _ThreadingServer(ThreadingHTTPServer):
-    """Threaded HTTP server with the socket flags the spec requires."""
-
-    daemon_threads = True
-    allow_reuse_address = True
+# --------------------------------------------------------------------------
+# the socket server (the only listener this process has)
+# --------------------------------------------------------------------------
 
 
-class _Handler(BaseHTTPRequestHandler):
-    """One handler instance per request; ``daemon`` is injected by subclassing."""
+def _ok_reply(result: Any) -> dict:
+    """The ``ok: true`` envelope."""
+    return {"ok": True, "result": result}
 
-    server_version = "sarvam-meter/" + VERSION
-    protocol_version = "HTTP/1.1"
-    daemon: "Daemon" = None  # type: ignore[assignment]
 
-    # -- logging ---------------------------------------------------------
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
-        """Silence the default stderr access log; :class:`Daemon` logs instead."""
-        return
+def _error_reply(code: str, message: str) -> dict:
+    """The ``ok: false`` envelope."""
+    return {"ok": False, "error": {"code": str(code), "message": str(message)}}
 
-    # -- verbs -----------------------------------------------------------
-    def do_GET(self) -> None:  # noqa: N802 - http.server API
-        self._dispatch("GET")
 
-    def do_HEAD(self) -> None:  # noqa: N802
-        self._dispatch("HEAD")
+def ensure_socket_directory(path: str) -> str:
+    """Create the socket's parent directory at mode ``0700`` when it is missing.
 
-    def do_POST(self) -> None:  # noqa: N802
-        self._dispatch("POST")
-
-    def do_PUT(self) -> None:  # noqa: N802
-        self._dispatch("PUT")
-
-    def do_PATCH(self) -> None:  # noqa: N802
-        self._dispatch("PATCH")
-
-    def do_DELETE(self) -> None:  # noqa: N802
-        self._dispatch("DELETE")
-
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        self._dispatch("OPTIONS")
-
-    # -- plumbing --------------------------------------------------------
-    def _read_body(self) -> bytes:
-        """Read the request body (bounded), so it cannot poison the next request."""
+    An existing directory is left exactly as it is: it may be the user's
+    ``$XDG_RUNTIME_DIR`` itself, and tightening the mode of a directory this
+    process does not own would be a nasty surprise.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        remaining = max(0, min(length, MAX_DRAIN_BYTES))
-        chunks: List[bytes] = []
-        while remaining > 0:
-            chunk = self.rfile.read(min(65536, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _dispatch(self, method: str) -> None:
-        started = time.time()
-        path = urlsplit(self.path).path or "/"
-        if len(path) > 1 and path.endswith("/"):
-            path = path.rstrip("/") or "/"
-        body = self._read_body()
-        try:
-            status_code, payload = self._route(method.upper(), path, body)
-        except Exception as exc:  # noqa: BLE001 - never leak a traceback
-            status_code = 500
-            payload = {
-                "error": {
-                    "message": "internal error: %s" % (exc.__class__.__name__,),
-                    "code": "internal_error",
-                }
-            }
-        body = json.dumps(payload).encode("utf-8")
-        try:
-            self.send_response(status_code)
-            self.send_header("Content-Type", CONTENT_TYPE)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            # One request per connection: an unread request body must never be
-            # parsed as the start of the next request on a keep-alive socket.
-            self.send_header("Connection", "close")
-            self.close_connection = True
-            self.end_headers()
-            if method.upper() != "HEAD":
-                self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):  # pragma: no cover
+            # ``mkdir`` honours the umask; this makes 0700 certain.
+            os.chmod(directory, 0o700)
+        except OSError:  # pragma: no cover - e.g. a foreign filesystem
             pass
-        self.daemon._log(method.upper(), path, status_code, time.time() - started)
+    return directory
 
-    def _route(self, method: str, path: str, body: bytes = b"") -> Tuple[int, dict]:
-        allowed = ROUTES.get(path)
-        if allowed is None:
-            return 404, {"error": {"message": "not found", "code": "not_found"}}
-        # HEAD is answered wherever GET is, without a body (the writer skips it).
-        if method == "HEAD" and "GET" in allowed:
-            method = "GET"
-        if method not in allowed:
-            return 405, {
-                "error": {"message": "method not allowed", "code": "method_not_allowed"}
-            }
-        if path == STATUS_PATH:
-            return 200, self.daemon.status()
-        if path == HEALTH_PATH:
-            return 200, self.daemon.health()
-        if path == REFRESH_PATH:
-            self.daemon.refresh_cliproxy()
-            self.daemon.refresh_dashboard()
-            return 200, self.daemon.status()
-        if path == CONFIG_PATH:
-            if method == "POST":
-                return self._config_update(body)
-            return 200, self.daemon.config_payload()
-        if path == SESSION_PATH:
-            if method == "POST":
-                return self._session_update(body)
-            return 200, self.daemon.session_payload()
-        return 404, {"error": {"message": "not found", "code": "not_found"}}  # pragma: no cover
 
-    def _config_update(self, body: bytes) -> Tuple[int, dict]:
-        """``POST /v1/config``: apply a writable-subset update, return the config.
-
-        A rejection is a ``400`` naming the offending key and changes nothing on
-        disk; a success is the same sanitised document ``GET /v1/config`` serves.
-        The request body is never echoed back.
-        """
-        if len(body) > MAX_CONFIG_BODY_BYTES:
-            return 400, _invalid_config("request body is too large")
+def socket_is_live(path: str, timeout: float = 0.5) -> bool:
+    """True when something accepts a connection on the socket *path*."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(timeout)
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
         try:
-            payload = self.daemon.apply_config(body)
-        except ConfigUpdateError as exc:
-            return 400, {"error": {"message": str(exc), "code": exc.code}}
-        return 200, payload
+            probe.close()
+        except OSError:  # pragma: no cover
+            pass
 
-    def _session_update(self, body: bytes) -> Tuple[int, dict]:
-        """``POST /v1/session``: store the captured session, return what was stored.
 
-        A rejection is a ``400`` naming the offending field and changes nothing
-        on disk; a success is ``{"stored": [...], "path": ..., "mode": ...}``.
-        The request body is never echoed back and no value is ever returned.
-        """
-        if len(body) > MAX_SESSION_BODY_BYTES:
-            return 400, _invalid_session("request body is too large")
+def prepare_socket_path(path: str) -> None:
+    """Make *path* bindable: create the directory, drop a **stale** socket file.
+
+    A file that is not a socket is never removed -- deleting something this
+    process did not create would be a destructive surprise -- and a socket that
+    still answers means another daemon owns the path, so it is left alone and
+    the caller's ``bind()`` fails loudly instead of stealing the socket.
+    """
+    ensure_socket_directory(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # pragma: no cover - defensive
+        raise OSError("cannot stat %s (%s)" % (path, exc.strerror or exc)) from None
+    if not stat.S_ISSOCK(info.st_mode):
+        raise OSError("%s exists and is not a socket" % (path,))
+    if socket_is_live(path):
+        raise OSError("another daemon is already listening on %s" % (path,))
+    try:
+        os.unlink(path)
+    except FileNotFoundError:  # pragma: no cover - raced with another daemon
+        return
+    except OSError as exc:  # pragma: no cover - defensive
+        raise OSError(
+            "cannot remove the stale socket %s (%s)" % (path, exc.strerror or exc)
+        ) from None
+
+
+class SocketServer:
+    """A ``SOCK_STREAM`` Unix-domain server speaking newline-delimited JSON.
+
+    One thread per connection (the same concurrency the removed HTTP server
+    had), an accept loop that polls with a short timeout so
+    :meth:`shutdown` never blocks, and a per-connection idle timeout so a
+    client that connects and says nothing cannot hold a thread for ever.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        dispatch: Callable[[bytes], dict],
+        idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+        logger: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        self.path = path
         try:
-            payload = self.daemon.apply_session(body)
-        except SessionUpdateError as exc:
-            return 400, {"error": {"message": str(exc), "code": exc.code}}
-        return 200, payload
+            self.idle_timeout = float(idle_timeout)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            self.idle_timeout = IDLE_TIMEOUT_SECONDS
+        if self.idle_timeout <= 0:
+            self.idle_timeout = IDLE_TIMEOUT_SECONDS
+        self._dispatch = dispatch
+        self._logger = logger
+        self._socket: Optional[socket.socket] = None
+        self._identity: Optional[Tuple[int, int]] = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._accept_thread: Optional[threading.Thread] = None
+        self._threads: List[threading.Thread] = []
+        self._connections: List[socket.socket] = []
+
+    # -- setup -----------------------------------------------------------
+    @property
+    def server_address(self) -> str:
+        """The bound path (the analogue of an HTTP server's address)."""
+        return self.path
+
+    @property
+    def thread(self) -> Optional[threading.Thread]:
+        """The accept thread, once :meth:`start` has been called."""
+        return self._accept_thread
+
+    def bind(self) -> str:
+        """Create the socket, ``chmod`` it to ``0600`` and start listening."""
+        prepare_socket_path(self.path)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(self.path)
+            os.chmod(self.path, 0o600)
+            info = os.lstat(self.path)
+            server.listen(64)
+            # A short timeout keeps the accept loop responsive to ``_stop``.
+            server.settimeout(ACCEPT_POLL_SECONDS)
+        except BaseException:
+            try:
+                server.close()
+            except OSError:  # pragma: no cover
+                pass
+            raise
+        self._socket = server
+        #: Identity of the file we created, so shutdown only unlinks our own.
+        self._identity = (info.st_dev, info.st_ino)
+        return self.path
+
+    def start(self) -> None:
+        """Start the accept loop on a background thread (binds if needed)."""
+        if self._socket is None:
+            self.bind()
+        if self._accept_thread is None or not self._accept_thread.is_alive():
+            self._stop.clear()
+            self._accept_thread = threading.Thread(
+                target=self.serve_forever,
+                name="sarvam-meter-socket",
+                daemon=True,
+            )
+            self._accept_thread.start()
+
+    # -- the accept loop -------------------------------------------------
+    def serve_forever(self) -> None:
+        server = self._socket
+        if server is None:
+            raise RuntimeError("the socket server is not bound")
+        self._stop.clear()
+        while not self._stop.is_set():
+            try:
+                connection, _address = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # The listening socket was closed under us, or the stop flag
+                # is set: either way this loop is finished.
+                if self._stop.is_set() or self._socket is None:
+                    break
+                continue
+            thread = threading.Thread(
+                target=self._serve_connection,
+                args=(connection,),
+                name="sarvam-meter-client",
+                daemon=True,
+            )
+            with self._lock:
+                self._threads = [item for item in self._threads if item.is_alive()]
+                self._threads.append(thread)
+            thread.start()
+
+    # -- one connection --------------------------------------------------
+    def _serve_connection(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._connections.append(connection)
+        try:
+            connection.settimeout(self.idle_timeout)
+            buffer = b""
+            while not self._stop.is_set():
+                try:
+                    chunk = connection.recv(65536)
+                except socket.timeout:
+                    self._emit(
+                        "idle connection closed after %.1fs" % (self.idle_timeout,)
+                    )
+                    return
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                buffer += chunk
+                while True:
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        break
+                    line = buffer[:newline]
+                    buffer = buffer[newline + 1:]
+                    if not self._serve_line(connection, line):
+                        return
+                if len(buffer) > MAX_LINE_BYTES:
+                    # No newline yet and already over the limit: the rest of
+                    # the line cannot be trusted, so close the connection.
+                    self._emit("request line too large; closing the connection")
+                    self._send(
+                        connection,
+                        _error_reply("too_large", "request line is too large"),
+                    )
+                    return
+        finally:
+            with self._lock:
+                try:
+                    self._connections.remove(connection)
+                except ValueError:  # pragma: no cover - defensive
+                    pass
+            try:
+                connection.close()
+            except OSError:  # pragma: no cover
+                pass
+
+    def _serve_line(self, connection: socket.socket, line: bytes) -> bool:
+        """Answer one request line; ``False`` means "close this connection"."""
+        if len(line) > MAX_LINE_BYTES:
+            self._emit("request line too large; closing the connection")
+            self._send(
+                connection, _error_reply("too_large", "request line is too large")
+            )
+            return False
+        try:
+            reply = self._dispatch(line)
+        except Exception as exc:  # noqa: BLE001 - never leak a traceback
+            reply = _error_reply(
+                "internal_error", "internal error: %s" % (exc.__class__.__name__,)
+            )
+        return self._send(connection, reply)
+
+    def _send(self, connection: socket.socket, reply: dict) -> bool:
+        try:
+            payload = (json.dumps(reply) + "\n").encode("utf-8")
+        except (TypeError, ValueError):  # pragma: no cover - a payload must be JSON
+            payload = (
+                json.dumps(_error_reply("internal_error", "reply was not JSON")) + "\n"
+            ).encode("utf-8")
+        try:
+            connection.sendall(payload)
+        except OSError:
+            return False
+        return True
+
+    # -- teardown --------------------------------------------------------
+    def shutdown(self) -> None:
+        """Ask the accept loop to stop and wait for it."""
+        self._stop.set()
+        thread = self._accept_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+
+    def server_close(self) -> None:
+        """Close the listening socket, every connection, and unlink the file."""
+        self._stop.set()
+        server = self._socket
+        self._socket = None
+        if server is not None:
+            try:
+                server.close()
+            except OSError:  # pragma: no cover
+                pass
+        with self._lock:
+            connections = list(self._connections)
+            self._connections = []
+        for connection in connections:
+            try:
+                connection.close()
+            except OSError:  # pragma: no cover
+                pass
+        self._unlink()
+
+    def _unlink(self) -> None:
+        """Remove the socket file, but only if it is still the one we created.
+
+        Nothing is removed when this server never bound (``identity`` is
+        ``None``) or when the path now holds a different file: a second daemon
+        that took the path over must keep its socket.
+        """
+        identity = self._identity
+        self._identity = None
+        if identity is None:
+            return
+        try:
+            info = os.lstat(self.path)
+        except OSError:
+            return
+        if (info.st_dev, info.st_ino) != identity:
+            return
+        try:
+            os.unlink(self.path)
+        except OSError:  # pragma: no cover - defensive
+            pass
+
+    def _emit(self, line: str) -> None:
+        logger = self._logger
+        if logger is None:
+            return
+        try:
+            logger(line)
+        except Exception:  # pragma: no cover - a logger must never break serving
+            pass
+
+
+# --------------------------------------------------------------------------
+# the ops (each one is exactly the handler the removed HTTP route called)
+# --------------------------------------------------------------------------
+
+
+def _encoded_size(value: Any) -> int:
+    """The byte length of *value* once encoded as JSON (``0`` when it cannot be)."""
+    try:
+        return len(json.dumps(value).encode("utf-8"))
+    except (TypeError, ValueError):  # pragma: no cover - a decoded body always can
+        return 0
+
+
+def _op_status(daemon: "Daemon", request: dict) -> Any:
+    return daemon.status()
+
+
+def _op_health(daemon: "Daemon", request: dict) -> Any:
+    return daemon.health()
+
+
+def _op_refresh(daemon: "Daemon", request: dict) -> Any:
+    daemon.refresh_cliproxy()
+    daemon.refresh_dashboard()
+    return daemon.status()
+
+
+def _op_config_get(daemon: "Daemon", request: dict) -> Any:
+    return daemon.config_payload()
+
+
+def _op_config_set(daemon: "Daemon", request: dict) -> Any:
+    """``config.set``: ``{"op": "config.set", "config": {...}}``."""
+    if "config" not in request:
+        raise ConfigUpdateError('request must carry a "config" object')
+    subset = request["config"]
+    if _encoded_size(subset) > MAX_CONFIG_BODY_BYTES:
+        raise ConfigUpdateError("request body is too large")
+    return daemon.apply_config(subset)
+
+
+def _op_session_get(daemon: "Daemon", request: dict) -> Any:
+    return daemon.session_payload()
+
+
+def _op_session_set(daemon: "Daemon", request: dict) -> Any:
+    """``session.set``: the request *is* the body (``op`` aside).
+
+    Everything except ``op`` is handed to :meth:`Daemon.apply_session`
+    unchanged, so an unknown key is rejected with exactly the message the HTTP
+    route produced (``x is not a session field``) and nothing is written.
+    """
+    body = dict((key, value) for key, value in request.items() if key != "op")
+    if _encoded_size(body) > MAX_SESSION_BODY_BYTES:
+        raise SessionUpdateError("request body is too large")
+    return daemon.apply_session(body)
+
+
+#: op name -> the handler.  This table is the whole surface of the daemon.
+OP_HANDLERS: Dict[str, Callable[["Daemon", dict], Any]] = {
+    "status": _op_status,
+    "health": _op_health,
+    "refresh": _op_refresh,
+    "config.get": _op_config_get,
+    "config.set": _op_config_set,
+    "session.get": _op_session_get,
+    "session.set": _op_session_set,
+}
 
 
 class Daemon:
-    """Owns the HTTP server, the cached snapshots and the ledger handle."""
+    """Owns the socket server, the cached snapshots and the ledger handle."""
 
     def __init__(
         self,
@@ -939,11 +1191,33 @@ class Daemon:
         ledger: Any = None,
         logger: Optional[Callable[[str], Any]] = None,
         config_path: Optional[str] = None,
+        socket_path: Optional[str] = None,
+        idle_timeout: Optional[float] = None,
     ) -> None:
         self.config = config
-        #: The file ``POST /v1/config`` rewrites (and reloads from).
+        #: The file ``config.set`` rewrites (and reloads from).
         self.config_path = resolve_config_path(config_path)
         self.logger = logger
+        #: Where this daemon's socket lives: an explicit ``--socket``, else the
+        #: path resolved exactly like :func:`sarvam_meter.client.socket_path`.
+        self._socket_path = (
+            os.path.expanduser(str(socket_path).strip())
+            if socket_path is not None and str(socket_path).strip()
+            else resolve_socket_path(config)
+        )
+        #: How long a connection may stay silent before it is closed.
+        if idle_timeout is None:
+            idle_timeout = getattr(
+                getattr(config, "daemon", None),
+                "idle_timeout_seconds",
+                IDLE_TIMEOUT_SECONDS,
+            )
+        try:
+            self.idle_timeout = float(idle_timeout)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            self.idle_timeout = IDLE_TIMEOUT_SECONDS
+        if self.idle_timeout <= 0:  # pragma: no cover - defensive
+            self.idle_timeout = IDLE_TIMEOUT_SECONDS
         self._started_at = time.time()
         self._snapshot: Optional[dict] = None
         self._snapshot_at: Optional[float] = None
@@ -953,16 +1227,20 @@ class Daemon:
         self._dashboard_lock = threading.Lock()
         #: Held across the whole read-modify-write of a config update.
         self._config_lock = threading.Lock()
-        #: Held across the atomic write of a session file (``POST /v1/session``).
+        #: Held across the atomic write of a session file (``session.set``).
         self._session_lock = threading.Lock()
         #: Bumped on every config swap; a fetch that straddles a swap is dropped.
         self._config_generation = 0
         self._stop = threading.Event()
         self._serving = threading.Event()
-        self._server: Optional[_ThreadingServer] = None
+        self._server: Optional[SocketServer] = None
         self._thread: Optional[threading.Thread] = None
         self._refresh_thread: Optional[threading.Thread] = None
         self._dashboard_thread: Optional[threading.Thread] = None
+        #: The optional D-Bus service handle (``None`` when no binding is
+        #: installed or no session bus is reachable).  See
+        #: :mod:`sarvam_meter.dbus_service`.
+        self._dbus_service: Any = None
         if ledger is None:
             ledger = self._open_ledger()
         self.ledger = ledger
@@ -977,51 +1255,52 @@ class Daemon:
             self._emit("sarvam-meter: ledger unavailable (%s); serving without it" % (exc,))
             return _BrokenLedger(exc)
 
-    def _make_http_server(self) -> _ThreadingServer:
-        section = getattr(self.config, "daemon", None)
-        host = str(getattr(section, "host", "127.0.0.1") or "127.0.0.1")
-        port = int(getattr(section, "port", 8787) or 0)
-        handler = type("SarvamMeterHandler", (_Handler,), {"daemon": self})
-        server = _ThreadingServer((host, port), handler)
-        return server
+    def _make_socket_server(self) -> SocketServer:
+        return SocketServer(
+            self.socket_path,
+            self.handle_line,
+            idle_timeout=self.idle_timeout,
+            logger=self._emit,
+        )
 
-    def _ensure_server(self) -> _ThreadingServer:
+    def _ensure_server(self) -> SocketServer:
+        """The bound (not yet serving) socket server; binds on first use."""
         if self._server is None:
-            self._server = self._make_http_server()
+            self._server = self._make_socket_server()
+            self._server.bind()
         return self._server
 
     @property
-    def port(self) -> int:
-        """The actual bound port (useful when configured with ``0``)."""
-        if self._server is None:
-            return 0
-        try:
-            return int(self._server.server_address[1])
-        except Exception:  # pragma: no cover
-            return 0
+    def socket_path(self) -> str:
+        """The path this daemon binds (resolved once, at construction)."""
+        return self._socket_path
 
     @property
-    def host(self) -> str:
-        if self._server is None:
-            section = getattr(self.config, "daemon", None)
-            return str(getattr(section, "host", "127.0.0.1") or "127.0.0.1")
-        return str(self._server.server_address[0])
+    def server(self) -> Optional[SocketServer]:
+        """The socket server, once it has been bound (``None`` before that)."""
+        return self._server
+
+    @property
+    def family(self) -> int:
+        """The address family of the listening socket (always ``AF_UNIX``)."""
+        return socket.AF_UNIX
 
     # -- lifecycle -------------------------------------------------------
-    def start(self) -> int:
-        """Bind the socket, start the background threads, return the port."""
+    def start(self) -> str:
+        """Bind the socket, start the background threads, return the path.
+
+        The socket is bound and serving before the optional D-Bus service is
+        published, and that step cannot fail: a machine without a D-Bus binding
+        (or without a session bus) simply logs one line and keeps the socket.
+        """
         server = self._ensure_server()
         self._start_refresh_thread()
         self._start_dashboard_thread()
-        if self._thread is None or not self._thread.is_alive():
-            self._serving.set()
-            self._thread = threading.Thread(
-                target=server.serve_forever,
-                name="sarvam-meter-http",
-                daemon=True,
-            )
-            self._thread.start()
-        return self.port
+        self._serving.set()
+        server.start()
+        self._thread = server.thread
+        self._start_dbus_service()
+        return self.socket_path
 
     def serve_forever(self) -> None:
         """Blocking serve loop (binds on first use)."""
@@ -1029,21 +1308,32 @@ class Daemon:
         self._start_refresh_thread()
         self._start_dashboard_thread()
         self._serving.set()
-        server.serve_forever()
+        self._thread = threading.current_thread()
+        self._start_dbus_service()
+        try:
+            server.serve_forever()
+        finally:
+            self._stop_dbus_service()
 
     def shutdown(self) -> None:
+        """Stop serving, close every connection and unlink the socket file."""
+        # Release the bus name before the socket goes away: no new D-Bus call
+        # may land while the daemon is tearing its own state down.
+        self._stop_dbus_service()
         self._stop.set()
         server = self._server
         if server is not None:
-            if self._serving.is_set():
-                try:
-                    server.shutdown()
-                except Exception:  # pragma: no cover
-                    pass
+            try:
+                server.shutdown()
+            except Exception:  # pragma: no cover
+                pass
             try:
                 server.server_close()
             except Exception:  # pragma: no cover
                 pass
+        # Forget it: a later ``start()`` binds a fresh socket instead of
+        # trying to serve on a closed one.
+        self._server = None
         current = threading.current_thread()
         for thread in (self._thread, self._refresh_thread, self._dashboard_thread):
             if thread is not None and thread is not current and thread.is_alive():
@@ -1051,6 +1341,50 @@ class Daemon:
         self._thread = None
         self._refresh_thread = None
         self._dashboard_thread = None
+
+    # -- the optional D-Bus service ---------------------------------------
+    def _start_dbus_service(self) -> None:
+        """Publish ``org.kde.sarvam.Meter`` when a D-Bus binding is installed.
+
+        Every failure mode ends here: no binding, no session bus, a bus name
+        another daemon owns, a binding that raises on import.  None of them may
+        prevent the socket from serving, so the whole thing is wrapped and the
+        only trace of it is one log line.
+        """
+        if self._dbus_service is not None:
+            return
+        try:
+            from . import dbus_service
+        except Exception as exc:  # noqa: BLE001 - never a hard dependency
+            self._emit(
+                "sarvam-meter: D-Bus service not started (%s); "
+                "the Unix socket remains the transport" % (exc.__class__.__name__,)
+            )
+            return
+        try:
+            self._dbus_service = dbus_service.start(self, logger=self.logger)
+        except Exception as exc:  # noqa: BLE001 - a bus problem must not stop us
+            self._dbus_service = None
+            self._emit(
+                "sarvam-meter: D-Bus service not started (%s); "
+                "the Unix socket remains the transport" % (exc.__class__.__name__,)
+            )
+
+    def _stop_dbus_service(self) -> None:
+        """Release the bus name, if this daemon published one."""
+        handle = self._dbus_service
+        self._dbus_service = None
+        if handle is None:
+            return
+        try:
+            handle.stop()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
+
+    @property
+    def dbus_service(self) -> Any:
+        """The published D-Bus handle, or ``None`` (mostly for tests/doctor)."""
+        return self._dbus_service
 
     # -- cliproxy snapshot ----------------------------------------------
     def _start_refresh_thread(self) -> None:
@@ -1200,7 +1534,7 @@ class Daemon:
         return str(getattr(section, "session_file", "") or "").strip()
 
     def session_payload(self) -> dict:
-        """``GET /v1/session``: configured?, path, file mode, header *names*.
+        """``session.get``: configured?, path, file mode, header *names*.
 
         Never reads a value out: the header names come from
         :func:`read_session_header_names`, which keeps only the keys.  ``mode``
@@ -1369,22 +1703,84 @@ class Daemon:
         except Exception:  # pragma: no cover
             pass
 
-    def _log(self, method: str, path: str, status_code: int, elapsed: float) -> None:
-        """One stderr line per request.  Path only: no query string, no headers."""
+    def _log_op(self, op: str, reply: dict, elapsed: float) -> None:
+        """One stderr line per request: the op and the outcome, nothing else.
+
+        The request line is never logged -- ``session.set`` carries a live
+        cookie -- so only the op name, the outcome code and the duration do.
+        """
+        if reply.get("ok") is True:
+            outcome = "ok"
+        else:
+            error = reply.get("error")
+            outcome = (
+                str(error.get("code") or "error")
+                if isinstance(error, dict)
+                else "error"
+            )
         self._emit(
-            "%s %s %s -> %d (%.1f ms)"
+            "%s %s -> %s (%.1f ms)"
             % (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                method,
-                path,
-                status_code,
+                op or "-",
+                outcome,
                 elapsed * 1000.0,
             )
         )
 
 
-def make_server(config: Any, ledger: Any = None) -> Tuple[ThreadingHTTPServer, Daemon]:
-    """Create a bound (not yet serving) server plus its :class:`Daemon`."""
-    daemon = Daemon(config, ledger=ledger)
+    # -- the wire (one JSON object per line) ------------------------------
+    def handle_line(self, line: bytes) -> dict:
+        """Decode, dispatch and log one request line; always returns a reply."""
+        started = time.time()
+        reply, op = self._dispatch_line(line)
+        self._log_op(op, reply, time.time() - started)
+        return reply
+
+    def _dispatch_line(self, line: bytes) -> Tuple[dict, str]:
+        """``(reply, op)`` for one request line -- never raises."""
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return _error_reply(
+                "bad_request", "request must be UTF-8 encoded JSON"
+            ), ""
+        if not text.strip():
+            return _error_reply("bad_request", "request must be a JSON object"), ""
+        try:
+            request = json.loads(text)
+        except ValueError:
+            return _error_reply("bad_request", "request is not valid JSON"), ""
+        if not isinstance(request, dict):
+            return _error_reply("bad_request", "request must be a JSON object"), ""
+        raw_op = request.get("op")
+        if not isinstance(raw_op, str) or not raw_op.strip():
+            return _error_reply(
+                "bad_request", 'request must carry an "op" string'
+            ), ""
+        op = raw_op.strip()
+        handler = OP_HANDLERS.get(op)
+        if handler is None:
+            # The op name is the caller's own word, never a stored value; it is
+            # bounded so a hostile client cannot flood the error path.
+            return _error_reply("unknown_op", "unknown op: %s" % (op[:64],)), op
+        try:
+            result = handler(self, request)
+        except ConfigUpdateError as exc:
+            return _error_reply(exc.code, str(exc)), op
+        except SessionUpdateError as exc:
+            return _error_reply(exc.code, str(exc)), op
+        except Exception as exc:  # noqa: BLE001 - never leak a traceback
+            return _error_reply(
+                "internal_error", "internal error: %s" % (exc.__class__.__name__,)
+            ), op
+        return _ok_reply(result), op
+
+
+def make_server(
+    config: Any, ledger: Any = None, socket_path: Optional[str] = None
+) -> Tuple[SocketServer, Daemon]:
+    """Create a bound (not yet serving) socket server plus its :class:`Daemon`."""
+    daemon = Daemon(config, ledger=ledger, socket_path=socket_path)
     server = daemon._ensure_server()
     return server, daemon

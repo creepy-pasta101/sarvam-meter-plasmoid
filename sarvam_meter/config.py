@@ -80,15 +80,6 @@ class DaemonConfig:
 
 
 @dataclass(frozen=True)
-class ProxyConfig:
-    enabled: bool = False
-    host: str = "127.0.0.1"
-    port: int = 8788
-    upstream_base: str = "https://api.sarvam.ai"
-    max_body_bytes: int = 268435456
-
-
-@dataclass(frozen=True)
 class SarvamConfig:
     enabled: bool = True
     currency: str = "INR"
@@ -125,7 +116,6 @@ class Config:
     version: int = SUPPORTED_VERSION
     db_path: str = DEFAULT_DB_PATH
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
-    proxy: ProxyConfig = field(default_factory=ProxyConfig)
     sarvam: SarvamConfig = field(default_factory=SarvamConfig)
     cliproxy: CliproxyConfig = field(default_factory=CliproxyConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
@@ -146,13 +136,6 @@ def default_config_dict() -> dict:
             "port": 8787,
             "refresh_seconds": 60,
             "request_timeout_seconds": 10,
-        },
-        "proxy": {
-            "enabled": False,
-            "host": "127.0.0.1",
-            "port": 8788,
-            "upstream_base": "https://api.sarvam.ai",
-            "max_body_bytes": 268435456,
         },
         "sarvam": {
             "enabled": True,
@@ -413,17 +396,6 @@ def _build_config(document: dict) -> Config:
         ),
     )
 
-    proxy_raw = _require_dict(document.get("proxy"), "proxy")
-    proxy = ProxyConfig(
-        enabled=_require_bool(proxy_raw.get("enabled"), "proxy.enabled"),
-        host=_require_str(proxy_raw.get("host"), "proxy.host"),
-        port=_require_int(proxy_raw.get("port"), "proxy.port", 1, 65535),
-        upstream_base=_require_url(proxy_raw.get("upstream_base"), "proxy.upstream_base"),
-        max_body_bytes=_require_int(
-            proxy_raw.get("max_body_bytes"), "proxy.max_body_bytes", 1
-        ),
-    )
-
     sarvam_raw = _require_dict(document.get("sarvam"), "sarvam")
     sarvam = SarvamConfig(
         enabled=_require_bool(sarvam_raw.get("enabled"), "sarvam.enabled"),
@@ -496,7 +468,6 @@ def _build_config(document: dict) -> Config:
         version=version,
         db_path=db_path,
         daemon=daemon,
-        proxy=proxy,
         sarvam=sarvam,
         cliproxy=cliproxy,
         dashboard=dashboard,
@@ -579,7 +550,6 @@ __all__ = [
     "MAX_DASHBOARD_POLL_SECONDS",
     "ENV_CLIPROXY_KEY",
     "ENV_CONFIG_PATH",
-    "ProxyConfig",
     "SarvamConfig",
     "SUPPORTED_VERSION",
     "default_config_dict",

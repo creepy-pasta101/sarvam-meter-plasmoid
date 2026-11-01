@@ -4,10 +4,39 @@
 //
 // WHAT THIS IS
 // A self-contained sheet that signs the user in to the Sarvam dashboard in an
-// embedded browser and hands the resulting session headers back to the settings
-// page, which POSTs them to the daemon's /v1/session endpoint. It replaces the
-// "copy the Cookie header out of DevTools by hand" step described in
-// docs/dashboard-scrape.md.
+// embedded browser and hands the resulting session headers to the daemon. It
+// replaces the "copy the Cookie header out of DevTools by hand" step described
+// in docs/dashboard-scrape.md.
+//
+// HOW THE COOKIE REACHES THE DAEMON (unit B2): D-BUS, NOT HTTP
+// The daemon no longer speaks HTTP, and it does not want the cookie written to
+// its Unix socket either, so the sheet calls the daemon's D-Bus service:
+//
+//   busctl --user call org.kde.sarvam.Meter /org/kde/sarvam/Meter \
+//          org.kde.sarvam.Meter SetSession ss '<cookie>' '<authorization>'
+//
+// with `gdbus call --session --dest ... --method ...SetSession` as the fallback
+// when busctl is not installed. The service (sarvam_meter/dbus_service.py)
+// publishes those two arguments to the same op handler the socket uses, which
+// validates and writes them to the daemon's 0600 session file.
+//
+// BE HONEST ABOUT THE TRADE-OFF
+// busctl/gdbus take the cookie as a *command-line argument*, so for the duration
+// of that one call the value is visible in that child's argv (/proc/<pid>/cmdline)
+// to the same user and to root - and only for that call, since the process exits
+// as soon as the daemon answers. That is why the D-Bus path is used instead of
+// `sarvam-meter query set-session --cookie ...` over the socket: that would put
+// the same value in a *second* process's argv (the CLI's) for just as long, plus
+// a copy in this sheet's own string, and it would make the CLI a second writer
+// of the session file. The D-Bus call goes straight from this sheet to the
+// daemon that already owns the file. A user who wants the cookie never to appear
+// in any process's argv at all can bypass this sheet entirely and run
+// `sarvam-meter session set --cookie-file PATH`, which reads it from a file that
+// only they can read.
+//
+// The value is never put into a label, a tooltip, a status line, a console
+// message or an error string: the sheet reports counts and words only, and the
+// D-Bus failure message carries the exit status, never the child's output.
 //
 // THIS IS THE ONLY FILE IN THE PACKAGE THAT IMPORTS QtWebEngine.
 // QtWebEngine is not part of a standard KDE install, and an unresolvable QML
@@ -44,14 +73,20 @@ import QtWebEngine
 
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.components as PlasmaComponents
+// Plasma's data source, used to run the D-Bus client (see the header).
+import org.kde.plasma.plasma5support as P5Support
 
 Item {
     id: sheet
 
-    // Handed to the settings page, which POSTs it to <daemon>/v1/session as
-    // {"cookie": ..., "authorization": ...}. Both strings are secret: the
-    // receiver must not render, tooltip, log or echo them.
-    signal captured(string cookieHeader, string authorizationHeader)
+    // The daemon accepted the session over D-Bus. The settings page only has to
+    // re-read the state the daemon now reports; it never sees a value.
+    signal stored()
+
+    // The D-Bus delivery failed (no service, no bus, a rejected call). The
+    // message is built here and carries the exit status only - never a cookie,
+    // an authorization value or a child's output.
+    signal deliveryFailed(string message)
 
     // The user dismissed the sheet. The page destroys the Loader, which drops
     // the WebEngine profile's in-memory cookies with it.
@@ -81,13 +116,181 @@ Item {
     property bool captureSettled: true
 
     // ------------------------------------------------------------------
+    // D-Bus delivery (unit B2)
+    //
+    // The captured headers go to the daemon's org.kde.sarvam.Meter service, not
+    // to an HTTP endpoint and not down the daemon's socket. See the header for
+    // why, and for the argv trade-off that comes with it.
+    // ------------------------------------------------------------------
+
+    readonly property string busName: "org.kde.sarvam.Meter"
+    readonly property string busPath: "/org/kde/sarvam/Meter"
+    readonly property string busInterface: "org.kde.sarvam.Meter"
+    readonly property int deliveryTimeoutMs: 8000
+
+    // The values live here only between capture and the moment the D-Bus call
+    // settles, and are cleared immediately afterwards. They are never bound to
+    // anything that is displayed.
+    property string pendingCookie: ""
+    property string pendingAuthorization: ""
+    property string pendingDelivery: ""
+    property bool delivering: false
+    // 0 = busctl, 1 = gdbus (the fallback).
+    property int deliveryAttempt: 0
+
+    P5Support.DataSource {
+        id: execSource
+        engine: "executable"
+        connectedSources: []
+        onNewData: function (sourceName, data) {
+            sheet.handleDeliveryData(sourceName, data);
+        }
+    }
+
+    // A busctl that hangs (a wedged daemon, a bus that never answers) must not
+    // leave the sheet spinning: give up, kill the child, report a failure.
+    Timer {
+        id: deliveryWatchdog
+        interval: sheet.deliveryTimeoutMs
+        repeat: false
+        running: false
+        onTriggered: sheet.failDelivery("the D-Bus call did not finish in time")
+    }
+
+    // POSIX single-quote quoting: a literal ' becomes '\''. The cookie and the
+    // authorization are the only user-supplied strings this sheet ever quotes,
+    // and they are always wrapped, so neither can end the argument or start a
+    // new command.
+    function shellQuote(text) {
+        return "'" + String(text).replace(/'/g, "'\\''") + "'";
+    }
+
+    function busctlCommand(cookie, authorization) {
+        return "busctl --user call " + sheet.busName + " " + sheet.busPath
+            + " " + sheet.busInterface + " SetSession ss "
+            + sheet.shellQuote(cookie) + " " + sheet.shellQuote(authorization);
+    }
+
+    function gdbusCommand(cookie, authorization) {
+        return "gdbus call --session --dest " + sheet.busName
+            + " --object-path " + sheet.busPath
+            + " --method " + sheet.busInterface + ".SetSession "
+            + sheet.shellQuote(cookie) + " " + sheet.shellQuote(authorization);
+    }
+
+    // Hand the two headers to the daemon. Both are secret from here on: they are
+    // used to build one command line and are wiped the moment it settles.
+    function startDelivery(cookieHeader, authorizationHeader) {
+        sheet.pendingCookie = cookieHeader;
+        sheet.pendingAuthorization = authorizationHeader;
+        sheet.deliveryAttempt = 0;
+        sheet.delivering = true;
+        sheet.busy = true;
+        sheet.statusKind = "info";
+        sheet.statusText = "Handing the session to the daemon over D-Bus ...";
+        sheet.runDelivery();
+    }
+
+    function runDelivery() {
+        var target = (sheet.deliveryAttempt === 0)
+            ? sheet.busctlCommand(sheet.pendingCookie, sheet.pendingAuthorization)
+            : sheet.gdbusCommand(sheet.pendingCookie, sheet.pendingAuthorization);
+        sheet.pendingDelivery = target;
+        deliveryWatchdog.restart();
+        try {
+            execSource.connectSource(target);
+        } catch (e) {
+            sheet.failDelivery(sheet.deliveryAttempt === 0
+                ? "cannot run busctl" : "cannot run gdbus");
+        }
+    }
+
+    function handleDeliveryData(sourceName, data) {
+        if (!sheet.delivering || String(sourceName) !== sheet.pendingDelivery) {
+            return;
+        }
+        var payload = data;
+        if (!payload || typeof payload !== "object") {
+            try {
+                payload = execSource.data[sourceName];
+            } catch (e) {
+                payload = null;
+            }
+        }
+        var exitCode = payload ? Number(payload["exit code"]) : 0;
+        if (!isFinite(exitCode)) {
+            exitCode = 0;
+        }
+        sheet.stopDelivery();
+        if (exitCode === 0) {
+            sheet.completeDelivery();
+            return;
+        }
+        if (sheet.deliveryAttempt === 0) {
+            // busctl missing, or the daemon refused: try gdbus once before
+            // reporting a failure.
+            sheet.deliveryAttempt = 1;
+            sheet.runDelivery();
+            return;
+        }
+        sheet.failDelivery("the daemon did not accept the session over D-Bus "
+            + "(busctl and gdbus both failed). Is sarvam-meter running?");
+    }
+
+    // Disconnect the source (killing a child that is still running) without
+    // touching the pending values: the gdbus fallback still needs them.
+    function stopDelivery() {
+        var target = sheet.pendingDelivery;
+        sheet.pendingDelivery = "";
+        deliveryWatchdog.stop();
+        if (target === "") {
+            return;
+        }
+        try {
+            execSource.disconnectSource(target);
+        } catch (e) {
+            // already disconnected
+        }
+    }
+
+    function clearSecret() {
+        sheet.pendingCookie = "";
+        sheet.pendingAuthorization = "";
+    }
+
+    function completeDelivery() {
+        sheet.delivering = false;
+        sheet.clearSecret();
+        sheet.busy = false;
+        sheet.statusKind = "ok";
+        sheet.statusText = "The session was handed to the daemon over D-Bus.";
+        sheet.stored();
+    }
+
+    function failDelivery(message) {
+        sheet.stopDelivery();
+        sheet.delivering = false;
+        sheet.clearSecret();
+        sheet.busy = false;
+        sheet.statusKind = "fail";
+        sheet.statusText = message;
+        sheet.deliveryFailed(message);
+    }
+
+    // ------------------------------------------------------------------
     // Cookie collection
     // ------------------------------------------------------------------
 
     Component.onCompleted: sheet.attachCookieStore()
 
-    // The profile outlives this sheet, so the connection must not.
-    Component.onDestruction: sheet.detachCookieStore()
+    // The profile outlives this sheet, so the connection must not. Any D-Bus
+    // call still in flight is dropped - and its child killed - here too.
+    Component.onDestruction: {
+        sheet.stopDelivery();
+        sheet.delivering = false;
+        sheet.clearSecret();
+        sheet.detachCookieStore();
+    }
 
     // One connection, made once. cookieAdded fires for every cookie the engine
     // adds from then on; loadAllCookies() replays the ones already stored.
@@ -397,8 +600,9 @@ Item {
             sheet.statusText = "Nothing was collected. Use the manual entry below.";
             return;
         }
-        sheet.statusKind = "ok";
-        sheet.captured(header, authorizationHeader);
+        // The values do not go to the settings page: they go straight to the
+        // daemon's D-Bus service, and this sheet reports only the outcome.
+        sheet.startDelivery(header, authorizationHeader);
     }
 
     // ---- manual fallback, usable when cookie extraction fails ----

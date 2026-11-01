@@ -194,7 +194,7 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
     def test_dashboard_window_is_never_turned_into_a_remaining(self):
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
-            source="proxy", api="chat", cost=1.0, ts="2026-11-15T04:00:00Z"
+            source="manual", api="chat", cost=1.0, ts="2026-11-15T04:00:00Z"
         )
         sarvam = self.status(snapshot(), config=self.enabled)["sarvam"]
         # The window total is reported where it belongs: in the dashboard block.
@@ -225,7 +225,7 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
     def test_ledger_only_install_reports_an_unknown_balance_and_its_spend(self):
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
-            source="proxy", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
+            source="manual", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
         )
         balance = self.status(config=self.enabled)["sarvam"]["balance"]
         self.assertEqual(balance["spent_total"], 12.35)
@@ -310,7 +310,7 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
     def test_unreachable_snapshot_falls_back_to_the_ledger_spend(self):
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
-            source="proxy", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
+            source="manual", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
         )
         payload = self.status(
             snapshot(
@@ -362,10 +362,10 @@ class SpendSourceTest(DashboardStatusTestBase):
     def setUp(self):
         super().setUp()
         self.ledger.record_event(
-            source="proxy", api="chat", cost=12.3, ts="2026-11-15T04:00:00Z"
+            source="manual", api="chat", cost=12.3, ts="2026-11-15T04:00:00Z"
         )
         self.ledger.record_event(
-            source="proxy", api="stt", cost=75.1, ts="2026-11-05T04:00:00Z"
+            source="manual", api="stt", cost=75.1, ts="2026-11-05T04:00:00Z"
         )
 
     def test_today_prefers_the_dashboard(self):

@@ -53,11 +53,15 @@ Recommends:     qt6-qtwebengine
 sarvam-meter is a KDE Plasma 6 applet (widget) plus a small local Python
 daemon that reports Sarvam AI credit usage and CLIProxyAPI OAuth quota.
 
-Sarvam AI publishes no usage or credit-balance REST endpoint, so usage is
-metered locally: a bundled recording reverse proxy prices every Sarvam API call
-against a rate card and stores it in a local SQLite ledger under
-~/.local/share/sarvam-meter/. The applet reads the resulting status JSON from
-the daemon on 127.0.0.1:8787 and performs no network access of its own.
+Sarvam AI publishes no usage or credit-balance REST endpoint, so the package
+scrapes Sarvam's own dashboard with a session the user captures once, and
+reports the authoritative spend and the real credit balance from it. A local
+SQLite ledger under ~/.local/share/sarvam-meter/ holds entries recorded by hand
+with `sarvam-meter record`. The applet reads the resulting status JSON from the
+daemon over its local socket and performs no network access of its own.
+
+Nothing in this package relays API traffic: it is not a proxy and it opens no
+TCP port for one.
 
 The package also ships a systemd *user* unit for the daemon and an example
 configuration file.

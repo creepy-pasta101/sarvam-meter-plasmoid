@@ -6,6 +6,10 @@ the Plasma widget.  The shape is exact; only the objects explicitly marked
 extensible in the spec may grow new keys.  Schema 2 adds the dashboard source:
 ``balance.source``/``spend.source`` and the ``sarvam.dashboard`` block.
 
+Every money figure is either the dashboard's (the authoritative spend and the
+reported credit balance) or the local ledger's (manual ``record`` entries).
+Nothing here measures API traffic: this project relays none.
+
 :func:`build_status` must never raise: a failing ledger read is reported inside
 ``errors`` with every number zeroed.
 """
@@ -13,8 +17,7 @@ extensible in the spec may grow new keys.  Schema 2 adds the dashboard source:
 from __future__ import annotations
 
 import math
-import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 SCHEMA_VERSION = 2
@@ -121,55 +124,6 @@ def _scrub(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# untracked (estimated) call counting
-# ---------------------------------------------------------------------------
-
-
-def _ledger_db_path(ledger: Any, config: Any) -> Optional[str]:
-    for attr in ("db_path", "path", "_db_path", "_path"):
-        try:
-            candidate = getattr(ledger, attr, None)
-        except Exception:
-            candidate = None
-        if isinstance(candidate, str) and candidate:
-            return candidate
-    try:
-        candidate = getattr(config, "db_path", None)
-    except Exception:
-        candidate = None
-    return candidate if isinstance(candidate, str) and candidate else None
-
-
-def _count_estimated(ledger: Any, config: Any, since_iso: Optional[str]) -> int:
-    """Count events recorded with ``estimated = 1``.
-
-    SPEC section 6's ``Ledger`` API has no method for this, so the count is
-    taken from the ledger database directly (a single indexed-friendly COUNT).
-    A future ``Ledger.count_estimated_since()`` is used when present.
-    """
-    boundary = since_iso or EPOCH_ISO
-    for method_name in ("count_estimated_since", "count_estimated"):
-        method = getattr(ledger, method_name, None)
-        if callable(method):
-            try:
-                return int(method(boundary))
-            except TypeError:
-                continue
-    path = _ledger_db_path(ledger, config)
-    if not path or path == ":memory:":
-        # An in-memory ledger cannot be reached by a second connection; opening
-        # it again would create an empty database and zero the whole payload.
-        return 0
-    sql = "SELECT COUNT(*) FROM events WHERE estimated = 1 AND ts >= ?"
-    connection = sqlite3.connect(path, timeout=5.0)
-    try:
-        row = connection.execute(sql, (boundary,)).fetchone()
-    finally:
-        connection.close()
-    return int(row[0]) if row else 0
-
-
-# ---------------------------------------------------------------------------
 # payload blocks
 # ---------------------------------------------------------------------------
 
@@ -191,10 +145,6 @@ def _empty_sarvam(
         "spend": {"today": 0.0, "month": 0.0, "source": "ledger"},
         "calls": {"today": 0},
         "by_api": [],
-        "rate_limits": {"count_24h": 0, "last_at": None},
-        "quota_exhausted": False,
-        "quota_exhausted_at": None,
-        "untracked_calls": {"today": 0, "total": 0},
         "dashboard": dashboard if dashboard is not None else _empty_dashboard(False),
     }
 
@@ -378,7 +328,6 @@ def _sarvam_block(
     empty = _empty_sarvam(configured, currency, dashboard_block)
     dashboard_reachable = bool(dashboard_block.get("reachable"))
 
-    since_24h = _utc_iso(now_utc - timedelta(hours=24))
     try:
         balance = ledger.get_balance()
         spend_today = _as_float(ledger.spend_since(day_start_iso)) or 0.0
@@ -386,13 +335,6 @@ def _sarvam_block(
         spend_total = _as_float(ledger.spend_since(EPOCH_ISO)) or 0.0
         calls_today = int(_as_float(ledger.calls_since(day_start_iso)) or 0)
         by_api = ledger.spend_by_api_since(month_start_iso)
-        rate_limit_count = int(
-            _as_float(ledger.count_status_since(429, since_24h)) or 0
-        )
-        rate_limit_last = ledger.last_status_ts(429)
-        quota_at = ledger.get_kv("quota_exhausted_at")
-        untracked_today = _count_estimated(ledger, config, day_start_iso)
-        untracked_total = _count_estimated(ledger, config, None)
     except Exception as exc:  # noqa: BLE001 - status must never raise
         message = str(exc) or exc.__class__.__name__
         return empty, {"source": "ledger", "code": "read_failed", "message": message}
@@ -431,9 +373,9 @@ def _sarvam_block(
         }
     else:
         # The balance is *only* ever the figure Sarvam reports.  It is never
-        # derived from locally measured spend any more: a proxy-side estimate
-        # silently disagreed with the real wallet (top-ups, other machines,
-        # non-proxied calls), and a wrong "left" number is worse than none.
+        # derived from locally measured spend: a local estimate silently
+        # disagreed with the real wallet (top-ups, other machines, calls made
+        # elsewhere), and a wrong "left" number is worse than none.
         balance_block = {
             "known": False,
             "remaining": None,
@@ -449,8 +391,8 @@ def _sarvam_block(
         if today_value is not None:
             spend_today = today_value
         # The ledger's month total is not comparable once the dashboard is the
-        # source: it only sees proxied calls.  Prefer the dashboard's own
-        # month-to-date figure when it is present.
+        # source: it only sees the events this machine recorded.  Prefer the
+        # dashboard's own month-to-date figure when it is present.
         month_value = _as_float(dashboard_spend.get("month"))
         if month_value is not None:
             spend_month = month_value
@@ -466,16 +408,6 @@ def _sarvam_block(
         },
         "calls": {"today": calls_today},
         "by_api": _normalise_by_api(by_api),
-        "rate_limits": {
-            "count_24h": rate_limit_count,
-            "last_at": rate_limit_last if isinstance(rate_limit_last, str) else None,
-        },
-        "quota_exhausted": bool(quota_at),
-        "quota_exhausted_at": quota_at if isinstance(quota_at, str) else None,
-        "untracked_calls": {
-            "today": int(untracked_today),
-            "total": int(untracked_total),
-        },
         "dashboard": dashboard_block,
     }
     return block, None

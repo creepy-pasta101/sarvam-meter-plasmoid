@@ -1,10 +1,13 @@
 # The dashboard source
 
-Version 0.1.0 meters usage locally because Sarvam publishes no usage or
-credit-balance REST endpoint. The second source — the one this document is about —
-reads the numbers the dashboard itself shows, from the user's own signed-in
-session. It is implemented, it is **off by default**, and it is **unsupported**.
-Local metering remains the fallback for every number it cannot supply.
+Sarvam publishes no usage or credit-balance REST endpoint, so the dashboard — the
+source this document is about — is where every real figure comes from: it reads the
+numbers the dashboard itself shows, from the user's own signed-in session. It is
+implemented, it is **on by default**, and it is **unsupported**.
+
+Nothing in this project measures API traffic: it relays nothing and listens on no
+TCP port. What the dashboard cannot supply, the local ledger's manual
+`sarvam-meter record` entries supply, and nothing more.
 
 The plumbing is described in [architecture.md](architecture.md#4a-the-dashboard-source);
 the config keys are in [configuration.md](configuration.md#dashboard). This document
@@ -98,7 +101,7 @@ quantities. It produces `sarvam.spend.source = "dashboard"`, `sarvam.balance.sou
 "dashboard"`, a `sarvam.dashboard` block with `by_model`, and, when it cannot read
 the dashboard, one error code. It does **not**:
 
-- replace the recording proxy or the ledger, or claim to;
+- replace the ledger or the `record` subcommand, or claim to;
 - see per-call detail, individual requests, or anything Sarvam does not aggregate;
 - write anything: every request is a `GET`, and the adapter has no code path for a
   purchase, top-up or settings call;
@@ -140,7 +143,7 @@ capture a fresh session. There is no refresh flow and none is planned.
 ## The caveats that did not go away
 
 Being implemented does not make the endpoint supported, and these are the reasons
-the source is opt-in and quiet about failure:
+the source is quiet about failure:
 
 1. **It is unsupported.** `/api/dhan/org/usage/*` is an internal endpoint of a
    private front-end, not a published API. It can change shape or disappear without
@@ -158,14 +161,15 @@ the source is opt-in and quiet about failure:
    goodwill. Treat the figures as "as of the last successful snapshot"
    (`sarvam.dashboard.as_of`).
 5. **It cannot be tested offline.** The local ledger is deterministic and fully
-   covered by tests. The dashboard adapter is tested against the two captured
+   covered by tests, but it only holds what you recorded by hand. The dashboard
+   adapter is tested against the two captured
    fixtures and a stubbed transport — including `401`, non-JSON, transport failure,
    a missing session and a non-numeric number — but no test can prove that the live
    endpoint still behaves like the capture. That gap is real and permanent.
 
-Because of all five, the design is additive: the dashboard is preferred when it
-works, and the ledger (or "unknown") is what you see when it does not. The widget
-never shows a dashboard figure it did not receive.
+Because of all five, the design is honest rather than clever: the dashboard is
+shown when it works, and the ledger (or "unknown") is what you see when it does
+not. The widget never shows a dashboard figure it did not receive.
 
 ## Reproducing the discovery
 

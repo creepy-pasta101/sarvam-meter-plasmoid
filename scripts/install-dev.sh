@@ -103,7 +103,7 @@ Remaining steps (this script never restarts your session or the desktop):
         sarvam-meter balance set 500
 
   * Run the daemon in the foreground, or as a user service:
-        sarvam-meter serve --with-proxy
+        sarvam-meter serve
         install -D -m 0644 packaging/sarvam-meter.service \
             ~/.config/systemd/user/sarvam-meter.service
         systemctl --user daemon-reload

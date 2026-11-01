@@ -26,8 +26,8 @@ prints the path it used. The packaged systemd user unit sets
 | `SARVAM_METER_CLIPROXY_KEY` | If non-empty, replaces `cliproxy.management_key`. This is the recommended way to keep the management key out of the config file. |
 
 Nothing else is configurable by environment. In particular there is no way to
-override the daemon or proxy port except by editing the config, or by the
-`--port` flag on `serve` / `proxy` for that one run.
+override the daemon's socket settings except by editing the config, or by the
+`--port` flag on `serve` for that one run.
 
 ## The default document
 
@@ -39,15 +39,13 @@ This is exactly what `sarvam-meter init` writes, and what
   "version": 1,
   "db_path": "~/.local/share/sarvam-meter/usage.db",
   "daemon": { "host": "127.0.0.1", "port": 8787, "refresh_seconds": 60, "request_timeout_seconds": 10 },
-  "proxy":  { "enabled": false, "host": "127.0.0.1", "port": 8788,
-              "upstream_base": "https://api.sarvam.ai", "max_body_bytes": 268435456 },
   "sarvam": { "enabled": true, "currency": "INR", "starting_balance": null,
               "rate_overrides": {} },
   "cliproxy": { "enabled": false, "base_url": "http://127.0.0.1:8317",
                 "management_key": "", "api_version": "v8", "quota_fetch": true,
                 "quota_fetch_interval_seconds": 300, "include_api_key_usage": false,
                 "allow_remote": false },
-  "dashboard": { "enabled": false, "base_url": "https://indus.sarvam.ai",
+  "dashboard": { "enabled": true, "base_url": "https://indus.sarvam.ai",
                  "session_file": "~/.config/sarvam-meter/session.json",
                  "poll_seconds": 300, "product": "sarvam-api-platform" }
 }
@@ -61,8 +59,7 @@ This is exactly what `sarvam-meter init` writes, and what
 | --- | --- | --- | --- |
 | `version` | int | `1` | Config document version. Must be `1`; anything else is rejected. |
 | `db_path` | string | `~/.local/share/sarvam-meter/usage.db` | SQLite ledger path. `~` is expanded. Parent directories are created by the ledger. |
-| `daemon` | object | see below | The status server. |
-| `proxy` | object | see below | The recording reverse proxy. |
+| `daemon` | object | see below | The daemon that serves the widget. |
 | `sarvam` | object | see below | Balance, currency, rate card overrides. |
 | `cliproxy` | object | see below | The CLIProxyAPI adapter. |
 | `dashboard` | object | see below | The Sarvam dashboard source (unsupported internal API; off by default). |
@@ -75,8 +72,8 @@ over the default.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host` | string | `127.0.0.1` | Bind address for the status server. Keep it on loopback; the API has no authentication. |
-| `port` | int | `8787` | Bind port, `1..65535`. This is the port the widget polls. |
+| `host` | string | `127.0.0.1` | Bind address for the daemon's local socket. Keep it on loopback; the status API has no authentication. |
+| `port` | int | `8787` | Bind port of that socket, `1..65535`. This is what the widget reads. It is the daemon's own endpoint only: nothing of yours is relayed through it. |
 | `refresh_seconds` | int | `60` | Refresh cadence in seconds, `>= 5`. The widget's own poll interval is a separate setting (`refreshSeconds`, below). |
 | `request_timeout_seconds` | int | `10` | Timeout for outbound requests the daemon makes (the CLIProxyAPI calls), `>= 1`. |
 
@@ -86,24 +83,12 @@ Example — move the daemon because 8787 is taken:
 "daemon": { "host": "127.0.0.1", "port": 18787, "refresh_seconds": 30, "request_timeout_seconds": 10 }
 ```
 
-Then set the widget's daemon URL to `http://127.0.0.1:18787`.
+Then set the widget's daemon URL to match.
 
-### `proxy`
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `enabled` | bool | `false` | Whether the recording proxy is part of `serve`. Off means nothing is metered. |
-| `host` | string | `127.0.0.1` | Bind address for the proxy. |
-| `port` | int | `8788` | Bind port, `1..65535`. This is the URL your Sarvam client must point at. |
-| `upstream_base` | string | `https://api.sarvam.ai` | Where requests are forwarded. Must be an `http://` or `https://` URL with a host. |
-| `max_body_bytes` | int | `268435456` | Largest accepted request body (256 MiB). Bigger uploads get `413` and are not forwarded. |
-
-Example — raise the upload ceiling for long audio and listen on a different port:
-
-```json
-"proxy": { "enabled": true, "host": "127.0.0.1", "port": 18788,
-           "upstream_base": "https://api.sarvam.ai", "max_body_bytes": 536870912 }
-```
+There is no `proxy` section. It was removed with the recording reverse proxy: this
+project relays no API traffic, so it has no upstream to forward to and no port for
+a client to point at. A config file that still carries a `proxy` object is not an
+error — unknown sections are ignored — but nothing reads it.
 
 ### `sarvam`
 
@@ -147,8 +132,9 @@ Details of what those endpoints return: [cliproxyapi.md](cliproxyapi.md).
 
 The dashboard source reads the authoritative, organisation-wide spend figures from
 the Sarvam web dashboard using a session you captured from your own browser. It is
-**off by default**, it is **unsupported**, and local metering stays the fallback.
-Read [dashboard-scrape.md](dashboard-scrape.md) before you enable it.
+**on by default** and it is **unsupported** (an internal endpoint behind bot
+management). It is the only way this project learns real spend or the real credit
+balance. Read [dashboard-scrape.md](dashboard-scrape.md) before you rely on it.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -289,11 +275,11 @@ known, exhausted balance — the widget shows it as such rather than as "unknown
 
 Without a reported balance the widget shows spend only: `known` is `false`,
 `remaining`/`starting` are `null`, and `spent_total` carries the ledger's all-time
-spend with `source: "ledger"`. **The balance is never computed from locally
-measured spend** — a proxy-side estimate disagreed with the real wallet (top-ups,
-other machines, calls that bypassed the proxy), and a wrong "left" number is worse
-than none. `sarvam-meter balance set` still records a starting balance and the
-proxy still records spend, but neither produces a `remaining` figure any more.
+total with `source: "ledger"`. **The balance is never computed from local
+entries** — a local estimate disagreed with the real wallet (top-ups, other
+machines, calls made elsewhere), and a wrong "left" number is worse than none.
+`sarvam-meter balance set` still records a starting balance and `sarvam-meter
+record` still writes ledger entries, but neither produces a `remaining` figure.
 `spend.today` and `spend.month` likewise come from the dashboard when it is reachable
 and from the ledger otherwise.
 
@@ -310,13 +296,13 @@ the offending key, so you can fix it without reading source.
 | Rule | Failure |
 | --- | --- |
 | `version` must be `1` | `ConfigError` naming `version` |
-| `daemon.port`, `proxy.port` in `1..65535` | `ConfigError` naming the port key |
+| `daemon.port` in `1..65535` | `ConfigError` naming `daemon.port` |
 | `daemon.refresh_seconds >= 5` | `ConfigError` naming the key |
 | `daemon.request_timeout_seconds >= 1` | `ConfigError` naming the key |
 | `cliproxy.api_version` in `{"v8","v0"}` | `ConfigError` naming the key |
 | `sarvam.currency` is a 3-letter uppercase code | `ConfigError` naming the key |
 | `sarvam.starting_balance` is `null` or a finite number `>= 0` | `ConfigError` naming the key |
-| `proxy.upstream_base` and `cliproxy.base_url` are `http(s)://` URLs with a host | `ConfigError` naming the key |
+| `cliproxy.base_url` is an `http(s)://` URL with a host | `ConfigError` naming `cliproxy.base_url` |
 | `dashboard.base_url` is `https://` with a host and no userinfo | `ConfigError` naming `dashboard.base_url` |
 | `dashboard.poll_seconds >= 60` | `ConfigError` naming the key |
 | `dashboard.product` is a non-empty string | `ConfigError` naming the key |
@@ -343,11 +329,10 @@ Two rules worth spelling out because they are easy to trip over:
   `"startin_balance"` will not error — it is silently ignored and the default
   (`null`) is used. Run `sarvam-meter doctor` or `GET /v1/config` to see the
   effective configuration.
-- **`allow_remote` is per section, and only `cliproxy` has it.** SPEC.md applies
-  the same guard to `proxy.upstream_base`, but `ProxyConfig` defines no
-  `allow_remote` field and the shipped `upstream_base` default is itself remote,
-  so in practice the guard is enforced for `cliproxy.base_url`. Do not widen
-  `upstream_base` casually.
+- **`allow_remote` is per section, and only `cliproxy` has it.** `cliproxy.base_url`
+  is the only configurable remote URL left, so it is the only one the guard
+  applies to. `dashboard.base_url` is remote by design and is instead required to
+  be `https://` with no userinfo.
 
 ## Rate card overrides
 
@@ -370,9 +355,9 @@ Costs come from a hardcoded pay-as-you-go rate card in `sarvam_meter/rates.py`
 
 Model lookup is exact match first, then the `"default"` entry for that api.
 `cached_quantity` and `out_quantity` apply to `chat` only. Output tokens cost four
-times input tokens on the Sarvam models, so the recording proxy always passes
-`out_quantity`; without it the blended path prices every non-cached token at the
-input rate and understates the call by up to 4x. A price that would overflow to
+times input tokens on the Sarvam models, so a caller that prices a chat call must
+pass `out_quantity`; without it the blended path prices every non-cached token at
+the input rate and understates the call by up to 4x. A price that would overflow to
 infinity raises `ValueError` rather than being stored.
 
 `sarvam.rate_overrides` is handed to `rate_card(overrides)` and merged over the
@@ -395,11 +380,11 @@ Example — you negotiated a cheaper TTS rate and you know your translate price:
 ```
 
 **A price of `null` means "not published", and that is deliberate.** For such an
-api, `cost_for` returns `0.0` and `rate_known` returns `False`. The event is
-still recorded — with the measured quantity — but with cost `0` and flagged as an
-untracked call, so the widget's `untracked_calls` counter tells you the balance
-figure is incomplete. The same happens for an api name the card does not know at
-all. Nothing is ever priced by guesswork.
+api, `cost_for` returns `0.0` and `rate_known` returns `False`. `sarvam-meter
+record` still stores the entry — with the quantity you gave it — but with cost `0`
+and `estimated = 1`, so the ledger says plainly that the entry is not priced. The
+same happens for an api name the card does not know at all. Nothing is ever priced
+by guesswork.
 
 A negative or non-finite quantity raises `ValueError` in `cost_for` — that is a
 programming error in a caller, not something a user can trigger through config.

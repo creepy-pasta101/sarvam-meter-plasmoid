@@ -1,40 +1,43 @@
 # SPDX-License-Identifier: MIT
-"""Tests for ``POST /v1/session`` and ``GET /v1/session`` (unit C).
+"""Tests for the ``session.set`` and ``session.get`` ops (unit C).
 
 The plasmoid signs the user in to the Sarvam dashboard in a webview and hands
-the resulting cookies to the daemon; this endpoint is how they arrive.  Every
-request goes over a real loopback socket bound to port ``0``, exactly like
-``tests/test_config_endpoint.py``.  What is pinned down here:
+the resulting cookies to the daemon; this op is how they arrive.  Every request
+goes over the daemon's ``AF_UNIX`` socket, exactly like
+``tests/test_config_endpoint.py``: :func:`sarvam_meter.client.call` for the
+ordinary round trips, one raw request line where the reply envelope itself is
+the subject.  What is pinned down here:
 
 * a cookie-only capture writes ``{"Cookie": "..."}`` at mode ``0600`` and the
   dashboard client's own :func:`dashboard.load_session` reads it back;
 * both headers together, and an authorization-only capture, work the same way;
 * the mode is ``0600`` even when the file pre-existed as ``0644``;
-* an unknown key, an oversized value, a CR/LF/NUL value and a malformed body are
-  rejected with ``400 invalid_session`` and leave the file byte-identical;
-* ``GET`` reports ``configured``/``path``/``mode``/header *names* and never a
-  value -- not even a prefix of one -- and never a value in a log record;
+* an unknown key, an oversized value, a CR/LF/NUL value and a malformed request
+  are rejected with ``invalid_session`` (``bad_request`` for a line that is not
+  a JSON object at all) and leave the file byte-identical;
+* ``session.get`` reports ``configured``/``path``/``mode``/header *names* and
+  never a value -- not even a prefix of one -- and never a value in a log record;
 * the cached dashboard snapshot is dropped, and a running-but-failing poller
   picks the new file up on its next tick without a restart.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import http.client
 import json
 import logging
 import os
 import shutil
+import socket
 import stat
 import tempfile
 import unittest
 
+from sarvam_meter import client as client_module
 from sarvam_meter import config as config_mod
+from sarvam_meter.client import ClientError
 from sarvam_meter.daemon import (
     Daemon,
     SESSION_FIELD_LIMITS,
-    SESSION_PATH,
     SessionUpdateError,
     check_session_request,
     read_session_header_names,
@@ -48,13 +51,6 @@ AUTHORIZATION = "Bearer AUTH-DO-NOT-LEAK-77c1"
 
 #: Loopback port nothing listens on: a poll fails fast and never leaves the box.
 DEAD_BASE_URL = "http://127.0.0.1:9"
-
-
-def ephemeral_port(config):
-    """Copy of *config* whose daemon binds an ephemeral port (tests only)."""
-    return dataclasses.replace(
-        config, daemon=dataclasses.replace(config.daemon, port=0)
-    )
 
 
 class _ListHandler(logging.Handler):
@@ -86,13 +82,17 @@ class SessionEndpointTestCase(unittest.TestCase):
         document["dashboard"].update(self.dashboard)
         self.write_document(document)
 
-        self.config = ephemeral_port(config_mod.load_config(self.path))
+        self.config = config_mod.load_config(self.path)
         self.logs = []
         self.records = []
+        self.socket_path = os.path.join(self.tmp, "run", "daemon.sock")
         self.daemon = Daemon(
-            self.config, logger=self.make_logger(), config_path=self.path
+            self.config,
+            logger=self.make_logger(),
+            config_path=self.path,
+            socket_path=self.socket_path,
         )
-        self.port = self.daemon.start()
+        self.bound = self.daemon.start()
         self.addCleanup(self.daemon.shutdown)
 
     # -- helpers ---------------------------------------------------------
@@ -120,53 +120,54 @@ class SessionEndpointTestCase(unittest.TestCase):
         with open(self.session_path, "w", encoding="utf-8") as handle:
             handle.write(text)
 
-    def request(self, method, path, body=None, send_body=True):
-        headers = {}
-        payload = None
-        if send_body and body is not None:
-            payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-            headers["Content-Length"] = str(len(payload))
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+    def call(self, op, **args):
+        return client_module.call(op, socket_path=self.bound, timeout=10.0, **args)
+
+    def send_raw(self, request, timeout=10.0):
+        """Send *request* verbatim as one line; return the parsed reply."""
+        payload = (
+            request if isinstance(request, bytes) else json.dumps(request).encode("utf-8")
+        )
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(timeout)
         try:
-            connection.request(method, path, body=payload, headers=headers)
-            response = connection.getresponse()
-            raw = response.read()
-            headers_out = {key.lower(): value for key, value in response.getheaders()}
-            return response.status, headers_out, raw
+            connection.connect(self.bound)
+            connection.sendall(payload + b"\n")
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                buffer += chunk
         finally:
             connection.close()
+        return json.loads(buffer.split(b"\n", 1)[0].decode("utf-8"))
 
-    def post_session(self, body, send_body=True):
-        status, headers, raw = self.request("POST", SESSION_PATH, body, send_body)
-        payload = json.loads(raw.decode("utf-8")) if raw else None
-        return status, headers, raw, payload
+    def post_session(self, body):
+        """``session.set`` with *body*; raises :class:`ClientError` when refused."""
+        return self.call("session.set", **body)
 
     def get_session(self):
-        status, headers, raw = self.request("GET", SESSION_PATH)
-        self.assertEqual(status, 200, raw)
-        return headers, raw, json.loads(raw.decode("utf-8"))
+        return self.call("session.get")
 
-    def assert_rejected(self, body, expected_message, send_body=True):
-        """``400 invalid_session`` naming *expected_message*, file untouched."""
+    def assert_rejected(self, body, expected_message):
+        """``invalid_session`` naming *expected_message*, file untouched."""
         before = self.file_bytes() if os.path.exists(self.session_path) else None
-        status, headers, raw, payload = self.post_session(body, send_body)
-        self.assertEqual(status, 400, raw)
-        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
-        self.assertEqual(payload["error"]["code"], "invalid_session")
-        self.assertIn(expected_message, payload["error"]["message"])
-        self.assertEqual(set(payload), {"error"})
-        self.assertEqual(set(payload["error"]), {"message", "code"})
+        reply = self.send_raw(dict({"op": "session.set"}, **body))
+        self.assertIs(reply.get("ok"), False, reply)
+        self.assertEqual(set(reply), {"ok", "error"})
+        error = reply["error"]
+        self.assertEqual(set(error), {"message", "code"})
+        self.assertEqual(error["code"], "invalid_session")
+        self.assertIn(expected_message, error["message"])
         after = self.file_bytes() if os.path.exists(self.session_path) else None
         self.assertEqual(after, before)
-        return payload
+        return error
 
 
 class CookieOnlyTest(SessionEndpointTestCase):
     def test_cookie_only_writes_the_canonical_key_and_is_readable(self):
-        status, headers, raw, payload = self.post_session({"cookie": COOKIE})
-        self.assertEqual(status, 200, raw)
-        self.assertEqual(headers["cache-control"], "no-store")
+        payload = self.post_session({"cookie": COOKIE})
         self.assertEqual(
             payload,
             {"stored": ["cookie"], "path": self.session_path, "mode": "0600"},
@@ -183,19 +184,13 @@ class CookieOnlyTest(SessionEndpointTestCase):
         self.assertEqual(load_session(self.session_path), {"cookie": COOKIE})
 
     def test_authorization_only(self):
-        status, _headers, raw, payload = self.post_session(
-            {"authorization": AUTHORIZATION}
-        )
-        self.assertEqual(status, 200, raw)
+        payload = self.post_session({"authorization": AUTHORIZATION})
         self.assertEqual(payload["stored"], ["authorization"])
         self.assertEqual(self.file_document(), {"Authorization": AUTHORIZATION})
         self.assertEqual(load_session(self.session_path), {"authorization": AUTHORIZATION})
 
     def test_both_headers_together(self):
-        status, _headers, raw, payload = self.post_session(
-            {"cookie": COOKIE, "authorization": AUTHORIZATION}
-        )
-        self.assertEqual(status, 200, raw)
+        payload = self.post_session({"cookie": COOKIE, "authorization": AUTHORIZATION})
         self.assertEqual(payload["stored"], ["cookie", "authorization"])
         self.assertEqual(
             self.file_document(), {"Cookie": COOKIE, "Authorization": AUTHORIZATION}
@@ -207,15 +202,13 @@ class CookieOnlyTest(SessionEndpointTestCase):
 
     def test_second_post_replaces_the_first(self):
         self.post_session({"cookie": COOKIE, "authorization": AUTHORIZATION})
-        status, _headers, raw, _payload = self.post_session({"cookie": "sid=new"})
-        self.assertEqual(status, 200, raw)
+        self.post_session({"cookie": "sid=new"})
         # A header that was not supplied is omitted, not carried over.
         self.assertEqual(self.file_document(), {"Cookie": "sid=new"})
         self.assertEqual(load_session(self.session_path), {"cookie": "sid=new"})
 
     def test_value_is_stripped_like_the_dashboard_client_strips_it(self):
-        status, _headers, raw, _payload = self.post_session({"cookie": "  sid=abc  "})
-        self.assertEqual(status, 200, raw)
+        self.post_session({"cookie": "  sid=abc  "})
         self.assertEqual(self.file_document(), {"Cookie": "sid=abc"})
 
     def test_missing_parent_directory_is_created_at_0700(self):
@@ -226,27 +219,17 @@ class CookieOnlyTest(SessionEndpointTestCase):
         document["dashboard"]["enabled"] = False
         self.write_document(document)
         daemon = Daemon(
-            ephemeral_port(config_mod.load_config(self.path)),
+            config_mod.load_config(self.path),
             logger=self.logs.append,
             config_path=self.path,
+            socket_path=os.path.join(self.tmp, "run", "nested.sock"),
         )
-        port = daemon.start()
+        path = daemon.start()
         self.addCleanup(daemon.shutdown)
 
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-        try:
-            body = json.dumps({"cookie": COOKIE}).encode("utf-8")
-            connection.request(
-                "POST",
-                SESSION_PATH,
-                body=body,
-                headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
-            )
-            response = connection.getresponse()
-            payload = json.loads(response.read().decode("utf-8"))
-        finally:
-            connection.close()
-        self.assertEqual(response.status, 200)
+        payload = client_module.call(
+            "session.set", socket_path=path, timeout=10.0, cookie=COOKIE
+        )
         self.assertEqual(payload["path"], os.path.join(nested, "session.json"))
         target = os.path.join(nested, "session.json")
         self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o600)
@@ -254,7 +237,8 @@ class CookieOnlyTest(SessionEndpointTestCase):
 
     def test_no_temp_file_survives_a_write_or_a_rejection(self):
         self.post_session({"cookie": COOKIE})
-        self.post_session({"cookie": COOKIE, "token": "nope"})
+        with self.assertRaises(ClientError):
+            self.post_session({"cookie": COOKIE, "token": "nope"})
         leftovers = [
             name
             for name in os.listdir(self.tmp)
@@ -268,8 +252,7 @@ class FileModeTest(SessionEndpointTestCase):
         self.write_raw_session('{"Cookie": "old"}\n')
         os.chmod(self.session_path, 0o644)
         self.assertEqual(self.file_mode(), 0o644)
-        status, _headers, raw, payload = self.post_session({"cookie": COOKIE})
-        self.assertEqual(status, 200, raw)
+        payload = self.post_session({"cookie": COOKIE})
         self.assertEqual(payload["mode"], "0600")
         self.assertEqual(self.file_mode(), 0o600)
         self.assertEqual(self.file_document(), {"Cookie": COOKIE})
@@ -299,7 +282,7 @@ class RejectedKeyTest(SessionEndpointTestCase):
             {"cookie": "sid=attacker", "token": "attacker-supplied"},
             "token is not a session field",
         )
-        self.assertEqual(payload["error"]["message"], "token is not a session field")
+        self.assertEqual(payload["message"], "token is not a session field")
         # The valid key in the same request was not applied.
         self.assertEqual(self.file_document(), {"Cookie": COOKIE})
 
@@ -324,10 +307,7 @@ class RejectedKeyTest(SessionEndpointTestCase):
         )
 
     def test_empty_cookie_with_a_real_authorization_stores_only_the_latter(self):
-        status, _headers, raw, payload = self.post_session(
-            {"cookie": "", "authorization": AUTHORIZATION}
-        )
-        self.assertEqual(status, 200, raw)
+        payload = self.post_session({"cookie": "", "authorization": AUTHORIZATION})
         self.assertEqual(payload["stored"], ["authorization"])
         self.assertEqual(self.file_document(), {"Authorization": AUTHORIZATION})
 
@@ -347,8 +327,7 @@ class ValidationTest(SessionEndpointTestCase):
 
     def test_cookie_at_the_cap_is_accepted(self):
         limit = SESSION_FIELD_LIMITS["cookie"]
-        status, _headers, raw, payload = self.post_session({"cookie": "a" * limit})
-        self.assertEqual(status, 200, raw)
+        payload = self.post_session({"cookie": "a" * limit})
         self.assertEqual(payload["stored"], ["cookie"])
         self.assertEqual(len(self.file_document()["Cookie"]), limit)
 
@@ -362,8 +341,7 @@ class ValidationTest(SessionEndpointTestCase):
 
     def test_authorization_at_the_cap_is_accepted(self):
         limit = SESSION_FIELD_LIMITS["authorization"]
-        status, _headers, raw, _payload = self.post_session({"authorization": "b" * limit})
-        self.assertEqual(status, 200, raw)
+        self.post_session({"authorization": "b" * limit})
         self.assertEqual(len(self.file_document()["Authorization"]), limit)
 
     def test_crlf_and_nul_are_rejected(self):
@@ -382,22 +360,36 @@ class ValidationTest(SessionEndpointTestCase):
         for value in (5, True, ["a"], {"a": 1}, None):
             self.assert_rejected({"cookie": value}, "cookie: must be a string")
 
-    def test_malformed_bodies_are_rejected(self):
-        for body in (b"", b"not json", b"[1, 2, 3]", b'"a string"', b"null", b"5"):
-            status, _headers, raw, payload = self.post_session(body)
-            self.assertEqual(status, 400, (body, raw))
-            self.assertEqual(payload["error"]["code"], "invalid_session")
-        # No body at all (no Content-Length).
-        status, _headers, raw, payload = self.post_session(None, send_body=False)
-        self.assertEqual(status, 400, raw)
-        self.assertEqual(payload["error"]["code"], "invalid_session")
-        self.assertEqual(payload["error"]["message"], "request body must be a JSON object")
+    def test_malformed_requests_are_rejected(self):
+        # A line that is not a JSON object never reaches the op, so the daemon
+        # answers ``bad_request`` (the transport-level code) instead of
+        # ``invalid_session``.  Either way nothing is written.
+        before = self.file_bytes() if os.path.exists(self.session_path) else None
+        for line in (b"", b"not json", b"[1, 2, 3]", b'"a string"', b"null", b"5"):
+            reply = self.send_raw(line)
+            self.assertIs(reply["ok"], False, line)
+            self.assertEqual(reply["error"]["code"], "bad_request", line)
+        # A request with no header at all is a JSON object, so it is the op that
+        # refuses it -- with the same message the route used to produce.
+        with self.assertRaises(ClientError) as raised:
+            self.call("session.set")
+        self.assertEqual(raised.exception.code, "invalid_session")
+        self.assertEqual(
+            raised.exception.message,
+            "at least one of cookie or authorization is required",
+        )
+        after = self.file_bytes() if os.path.exists(self.session_path) else None
+        self.assertEqual(after, before)
 
 
 class GetTest(SessionEndpointTestCase):
+    def test_get_works_without_a_session(self):
+        payload = self.get_session()
+        self.assertFalse(payload["configured"])
+
     def test_no_session_file_reports_not_configured(self):
         self.assertFalse(os.path.exists(self.session_path))
-        headers, raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertEqual(
             payload,
             {
@@ -408,17 +400,16 @@ class GetTest(SessionEndpointTestCase):
             },
         )
         self.assertEqual(set(payload), {"configured", "path", "mode", "headers"})
-        self.assertEqual(headers["cache-control"], "no-store")
 
     def test_configured_session_reports_names_but_never_a_value(self):
         self.post_session({"cookie": COOKIE})
-        _headers, raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertTrue(payload["configured"])
         self.assertEqual(payload["path"], self.session_path)
         self.assertEqual(payload["mode"], "0600")
         self.assertEqual(payload["headers"], ["cookie"])
 
-        text = raw.decode("utf-8")
+        text = json.dumps(payload)
         self.assertNotIn(COOKIE, text)
         self.assertNotIn(COOKIE[:8], text)  # not even a prefix of the value
         self.assertNotIn("sid=", text)
@@ -426,9 +417,9 @@ class GetTest(SessionEndpointTestCase):
 
     def test_both_headers_are_reported_in_canonical_order(self):
         self.post_session({"authorization": AUTHORIZATION, "cookie": COOKIE})
-        _headers, raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertEqual(payload["headers"], ["cookie", "authorization"])
-        text = raw.decode("utf-8")
+        text = json.dumps(payload)
         self.assertNotIn(AUTHORIZATION, text)
         self.assertNotIn(COOKIE, text)
         self.assertNotIn("Bearer", text)
@@ -436,20 +427,20 @@ class GetTest(SessionEndpointTestCase):
     def test_reports_the_actual_mode(self):
         self.post_session({"cookie": COOKIE})
         os.chmod(self.session_path, 0o644)
-        _headers, _raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertEqual(payload["mode"], "0644")
         self.assertTrue(payload["configured"])
 
     def test_headers_agree_with_the_dashboard_reader(self):
         self.post_session({"cookie": COOKIE})
-        _headers, _raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertEqual(payload["headers"], sorted(load_session(self.session_path)))
         self.assertEqual(payload["headers"], read_session_header_names(self.session_path))
 
     def test_unreadable_file_is_configured_but_holds_no_headers(self):
         self.write_raw_session("this is not json")
         os.chmod(self.session_path, 0o600)
-        _headers, _raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertTrue(payload["configured"])
         self.assertEqual(payload["headers"], [])
         self.assertEqual(payload["mode"], "0600")
@@ -459,42 +450,15 @@ class GetTest(SessionEndpointTestCase):
             json.dumps({"Cookie": COOKIE, "Set-Cookie": "other", "Token": "x"})
         )
         os.chmod(self.session_path, 0o600)
-        _headers, _raw, payload = self.get_session()
+        payload = self.get_session()
         self.assertEqual(payload["headers"], ["cookie"])
-
-
-class MethodTest(SessionEndpointTestCase):
-    def test_get_works_without_a_session(self):
-        _headers, _raw, payload = self.get_session()
-        self.assertFalse(payload["configured"])
-
-    def test_head_is_answered_like_get(self):
-        status, headers, raw = self.request("HEAD", SESSION_PATH)
-        self.assertEqual(status, 200)
-        self.assertEqual(raw, b"")
-        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
-
-    def test_other_verbs_stay_405_and_write_nothing(self):
-        self.post_session({"cookie": COOKIE})
-        before = self.file_bytes()
-        for method in ("PUT", "PATCH", "DELETE", "OPTIONS"):
-            status, _headers, raw = self.request(method, SESSION_PATH, {"cookie": "sid=x"})
-            self.assertEqual(status, 405, (method, raw))
-            payload = json.loads(raw.decode("utf-8"))
-            self.assertEqual(payload["error"]["code"], "method_not_allowed")
-        self.assertEqual(self.file_bytes(), before)
-
-    def test_trailing_slash_is_the_same_route(self):
-        status, _headers, raw = self.request("GET", SESSION_PATH + "/")
-        self.assertEqual(status, 200, raw)
 
 
 class CacheTest(SessionEndpointTestCase):
     def test_dashboard_cache_is_dropped_after_a_successful_post(self):
         self.daemon.refresh_dashboard()
         self.assertIsNotNone(self.daemon.dashboard_snapshot)
-        status, _headers, raw, _payload = self.post_session({"cookie": COOKIE})
-        self.assertEqual(status, 200, raw)
+        self.post_session({"cookie": COOKIE})
         self.assertIsNone(self.daemon.dashboard_snapshot)
         self.assertFalse(self.daemon.dashboard_snapshot_is_fresh())
 
@@ -517,8 +481,7 @@ class PollPickupTest(SessionEndpointTestCase):
         before = self.daemon.refresh_dashboard()
         self.assertEqual(before["error"]["code"], "no_session")
 
-        status, _headers, raw, _payload = self.post_session({"cookie": COOKIE})
-        self.assertEqual(status, 200, raw)
+        self.post_session({"cookie": COOKIE})
 
         # Same daemon, same thread, no restart: the very next poll loads the file
         # and gets as far as the (unreachable) network, so the error moved on.
@@ -530,41 +493,41 @@ class PollPickupTest(SessionEndpointTestCase):
 
 class SecretSafetyTest(SessionEndpointTestCase):
     def test_no_value_appears_in_any_response(self):
-        status, _headers, raw, payload = self.post_session(
-            {"cookie": COOKIE, "authorization": AUTHORIZATION}
+        reply = self.send_raw(
+            {"op": "session.set", "cookie": COOKIE, "authorization": AUTHORIZATION}
         )
-        self.assertEqual(status, 200)
-        text = raw.decode("utf-8")
+        self.assertIs(reply["ok"], True)
+        text = json.dumps(reply)
         self.assertNotIn(COOKIE, text)
         self.assertNotIn(AUTHORIZATION, text)
         self.assertNotIn("DO-NOT-LEAK", text)
-        self.assertEqual(payload["stored"], ["cookie", "authorization"])
+        self.assertEqual(reply["result"]["stored"], ["cookie", "authorization"])
 
-        _h, get_raw, _p = self.get_session()
-        get_text = get_raw.decode("utf-8")
+        get_text = json.dumps(self.get_session())
         self.assertNotIn(COOKIE, get_text)
         self.assertNotIn(AUTHORIZATION, get_text)
         self.assertNotIn("DO-NOT-LEAK", get_text)
 
     def test_rejected_value_is_not_echoed(self):
-        status, _headers, raw, payload = self.post_session({"token": COOKIE})
-        self.assertEqual(status, 400)
-        self.assertNotIn(COOKIE, raw.decode("utf-8"))
+        reply = self.send_raw({"op": "session.set", "token": COOKIE})
+        self.assertIs(reply["ok"], False)
+        self.assertNotIn(COOKIE, json.dumps(reply))
         self.assertEqual(
-            payload,
-            {"error": {"message": "token is not a session field", "code": "invalid_session"}},
+            reply["error"],
+            {"message": "token is not a session field", "code": "invalid_session"},
         )
 
         # An oversized value is named by field only, never quoted.
-        status, _headers, raw, payload = self.post_session(
-            {"cookie": "Z" * (SESSION_FIELD_LIMITS["cookie"] + 1)}
+        reply = self.send_raw(
+            {"op": "session.set", "cookie": "Z" * (SESSION_FIELD_LIMITS["cookie"] + 1)}
         )
-        self.assertEqual(status, 400)
-        self.assertNotIn("ZZZZ", raw.decode("utf-8"))
+        self.assertIs(reply["ok"], False)
+        self.assertNotIn("ZZZZ", json.dumps(reply))
 
     def test_log_lines_name_headers_and_path_only(self):
         self.post_session({"cookie": COOKIE, "authorization": AUTHORIZATION})
-        self.post_session({"cookie": COOKIE, "token": "x"})
+        with self.assertRaises(ClientError):
+            self.post_session({"cookie": COOKIE, "token": "x"})
         lines = [line for line in self.logs if "session stored" in line]
         self.assertTrue(lines)
         for line in lines:
@@ -589,11 +552,9 @@ class LogRecordTest(SessionEndpointTestCase):
         return logger
 
     def test_no_secret_in_any_log_record(self):
-        status, _headers, raw, _payload = self.post_session(
-            {"cookie": COOKIE, "authorization": AUTHORIZATION}
-        )
-        self.assertEqual(status, 200, raw)
-        self.post_session({"cookie": COOKIE, "token": "x"})
+        self.post_session({"cookie": COOKIE, "authorization": AUTHORIZATION})
+        with self.assertRaises(ClientError):
+            self.post_session({"cookie": COOKIE, "token": "x"})
         self.get_session()
 
         self.assertTrue(self.records)

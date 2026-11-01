@@ -18,6 +18,8 @@ import tempfile
 import threading
 from typing import Any, List, Optional, Sequence, Tuple
 
+from . import client as client_module
+from .client import ClientError
 from .config import ConfigError, load_config, write_default_config
 from .ledger import Ledger
 from .rates import UNITS, cost_for, rate_card, rate_known
@@ -522,75 +524,34 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _with_port(config: Any, port: Optional[int], section: str = "daemon") -> Any:
-    """Return a config whose ``section`` port is overridden (frozen dataclasses)."""
-    if port is None:
-        return config
-    target = getattr(config, section)
-    try:
-        import dataclasses
-
-        return dataclasses.replace(
-            config, **{section: dataclasses.replace(target, port=int(port))}
-        )
-    except Exception:  # noqa: BLE001 - non-dataclass config (tests)
-        setattr(target, "port", int(port))
-        return config
-
-
-def should_start_proxy(args: Any, config: Any) -> bool:
-    """True when `serve` should also run the recording proxy.
-
-    The config is authoritative: `proxy.enabled` turns the proxy on even without
-    `--with-proxy`, so the packaged systemd unit can just run `serve` and the
-    user's setting (or the settings page) decides.  The flag still forces it on,
-    which keeps `serve --with-proxy` working for a one-off run.
-    """
-    if bool(getattr(args, "with_proxy", False)):
-        return True
-    return bool(getattr(getattr(config, "proxy", None), "enabled", False))
-
-
 def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the status daemon: the socket listener and nothing else.
+
+    There is no recording proxy to start any more -- it was removed -- so this
+    command only binds the daemon's ``AF_UNIX`` socket and waits for a signal.
+    """
     from .daemon import Daemon
 
-    config = _with_port(_load(args), getattr(args, "port", None), section="daemon")
+    config = _load(args)
     ledger = _open_ledger(config)
-    proxy = None
-    proxy_port = None
-    if should_start_proxy(args, config):
-        from .proxy import ProxyServer
-
-        proxy = ProxyServer(config, ledger)
-        try:
-            # Bind in this thread first: a taken port must fail loudly, not kill
-            # a background thread and leave the user thinking the proxy runs.
-            proxy_port = proxy.port
-        except OSError as exc:
-            _err(
-                "cannot bind recording proxy on %s:%s: %s"
-                % (config.proxy.host, config.proxy.port, exc)
-            )
-            _close_ledger(ledger)
-            return EXIT_RUNTIME
-        threading.Thread(
-            target=proxy.serve_forever, name="sarvam-meter-proxy", daemon=True
-        ).start()
     # Pass the resolved path too: the widget's settings page writes through
-    # POST /v1/config, and that must edit the file this process actually loaded.
-    daemon = Daemon(config, ledger=ledger, config_path=_config_path(args))
+    # config.set, and that must edit the file this process actually loaded.
+    daemon = Daemon(
+        config,
+        ledger=ledger,
+        config_path=_config_path(args),
+        socket_path=getattr(args, "socket", None),
+    )
     try:
-        port = daemon.start()
+        bound_path = daemon.start()
     except OSError as exc:
-        _err("cannot bind daemon on %s:%s: %s" % (daemon.host, config.daemon.port, exc))
-        if proxy is not None:
-            proxy.shutdown()
+        _err(
+            "cannot bind daemon socket %s: %s"
+            % (daemon.socket_path, exc.strerror or exc)
+        )
         _close_ledger(ledger)
         return EXIT_RUNTIME
-    _err(
-        "daemon listening on http://%s:%d (proxy %s)"
-        % (daemon.host, port, ("enabled on port %s" % proxy_port) if proxy is not None else "disabled")
-    )
+    _err("daemon listening on %s" % (bound_path,))
     if getattr(args, "print_status", False):
         _out(json.dumps(daemon.status(), indent=2, sort_keys=False))
     stop = threading.Event()
@@ -615,34 +576,126 @@ def cmd_serve(args: argparse.Namespace) -> int:
             except (ValueError, OSError):  # pragma: no cover - defensive
                 pass
         daemon.shutdown()
-        if proxy is not None:
-            proxy.shutdown()
         _close_ledger(ledger)
     return EXIT_OK
 
 
-def cmd_proxy(args: argparse.Namespace) -> int:
-    from .proxy import ProxyServer
+# -- query (talk to a running daemon over its socket) ------------------------
 
-    config = _with_port(_load(args), getattr(args, "port", None), section="proxy")
-    ledger = _open_ledger(config)
-    server = ProxyServer(config, ledger)
-    _err(
-        "recording proxy listening on http://%s:%d"
-        % (config.proxy.host, getattr(server, "port", config.proxy.port))
-    )
+
+class _UsageError(Exception):
+    """A ``query`` invocation the user has to fix (exit code 2 by default)."""
+
+    def __init__(self, message: str, code: int = EXIT_CONFIG) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: ``query <name>`` -> the op it sends, for the ops that take no arguments.
+_QUERY_SIMPLE_OPS = {
+    "status": "status",
+    "health": "health",
+    "refresh": "refresh",
+    "config": "config.get",
+    "session": "session.get",
+}
+
+
+def _query_socket(args: argparse.Namespace) -> str:
+    """The socket path a ``query`` invocation should use.
+
+    An explicit ``--socket`` wins; otherwise the path is resolved from the
+    config the daemon would have loaded (so ``--config`` selects the same
+    socket the daemon started from that file would bind).
+    """
+    explicit = getattr(args, "socket", None)
+    if explicit is not None and str(explicit).strip():
+        return os.path.expanduser(str(explicit).strip())
+    config = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:  # pragma: no cover - interactive
-        pass
-    finally:
-        shutdown = getattr(server, "shutdown", None)
-        if callable(shutdown):
+        config = _load(args)
+    except ConfigError:
+        # A broken or missing config must not stop a plain ``query status``:
+        # the default location is still the right guess.
+        config = None
+    return client_module.socket_path(config)
+
+
+def _query_request(args: argparse.Namespace) -> Tuple[str, dict]:
+    """``(op, arguments)`` for the requested query, or raise :class:`_UsageError`."""
+    command = getattr(args, "query_command", None)
+    if command in _QUERY_SIMPLE_OPS:
+        return _QUERY_SIMPLE_OPS[command], {}
+    if command == "set-config":
+        text = str(getattr(args, "config_json", "") or "")
+        if text.strip() == "-":
+            text = sys.stdin.read()
+        if not text.strip():
+            raise _UsageError(
+                "set-config expects a JSON object, e.g. "
+                "'{\"dashboard\": {\"poll_seconds\": 60}}'"
+            )
+        try:
+            document = json.loads(text)
+        except ValueError:
+            raise _UsageError(
+                "set-config expects a JSON object, e.g. "
+                "'{\"dashboard\": {\"poll_seconds\": 60}}'"
+            ) from None
+        if not isinstance(document, dict):
+            raise _UsageError("set-config expects a JSON object")
+        return "config.set", {"config": document}
+    if command == "set-session":
+        body = {}
+        cookie = getattr(args, "cookie", None)
+        cookie_file = getattr(args, "cookie_file", None)
+        if cookie_file:
             try:
-                shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-        _close_ledger(ledger)
+                with open(os.path.expanduser(cookie_file), "r", encoding="utf-8") as handle:
+                    cookie = handle.read()
+            except OSError as exc:
+                raise _UsageError(
+                    "cannot read cookie file %s: %s" % (cookie_file, exc.strerror or exc),
+                    EXIT_RUNTIME,
+                ) from None
+        if cookie is not None and str(cookie).strip():
+            body["cookie"] = str(cookie).strip()
+        authorization = getattr(args, "authorization", None)
+        if authorization is not None and str(authorization).strip():
+            body["authorization"] = str(authorization).strip()
+        if not body:
+            raise _UsageError(
+                "one of --cookie, --cookie-file or --authorization is required"
+            )
+        return "session.set", body
+    raise _UsageError("a query op is required")
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    """``sarvam-meter query <op>``: one request, the result as JSON on stdout.
+
+    Exit ``0`` with the result on stdout, ``1`` when the daemon refuses or
+    cannot be reached (``sarvam-meter: <message>`` on stderr), ``2`` for a bad
+    op or bad usage.
+    """
+    try:
+        op, payload = _query_request(args)
+        path = _query_socket(args)
+    except _UsageError as exc:
+        _err(str(exc))
+        return exc.code
+    try:
+        result = client_module.call(
+            op,
+            socket_path=path,
+            timeout=float(getattr(args, "timeout", 10.0) or 10.0),
+            **payload
+        )
+    except ClientError as exc:
+        # The daemon's own message: it never carries a stored value.
+        _err(str(exc))
+        return EXIT_RUNTIME
+    _out(json.dumps(result, indent=2, sort_keys=False))
     return EXIT_OK
 
 
@@ -660,19 +713,51 @@ def _check(name: str, ok: bool, detail: str = "") -> Tuple[str, bool]:
     return name, ok
 
 
-def _port_is_free(host: str, port: int) -> Tuple[bool, str]:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _socket_is_free(path: str) -> Tuple[bool, str]:
+    """``daemon socket free``: nothing answers on *path* and it can be bound.
+
+    A stale socket file left by a crashed daemon is *free* -- the next start
+    unlinks it -- while a file that is not a socket at all, or a socket a live
+    daemon answers on, is not.
+    """
+    expanded = os.path.expanduser(str(path))
     try:
-        probe.settimeout(2.0)
-        # Both servers bind with allow_reuse_address, so a port in TIME_WAIT is
-        # genuinely free for them; the probe must not disagree.
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind((host, int(port)))
+        info = os.lstat(expanded)
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        return False, "cannot stat %s (%s)" % (expanded, exc.strerror or exc)
+    if info is not None:
+        if not stat.S_ISSOCK(info.st_mode):
+            return False, "%s exists and is not a socket" % (expanded,)
+        if client_module.is_running(expanded, timeout=1.0):
+            return False, "%s in use (a daemon is already listening)" % (expanded,)
+    directory = os.path.dirname(os.path.abspath(expanded)) or "."
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe_path = ""
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        # Bind a throwaway name in the real directory: that proves the socket
+        # can be created there without touching the daemon's own path.
+        probe_path = os.path.join(
+            directory, ".sarvam-meter-probe-%d.sock" % (os.getpid(),)
+        )
+        try:
+            os.unlink(probe_path)
+        except OSError:
+            pass
+        probe.bind(probe_path)
+        probe.listen(1)
         return True, ""
     except OSError as exc:
-        return False, "port %s in use (%s)" % (port, exc.strerror or exc)
+        return False, "cannot bind in %s (%s)" % (directory, exc.strerror or exc)
     finally:
         probe.close()
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
 
 
 def _dir_writable(path: str) -> Tuple[bool, str]:
@@ -788,8 +873,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for name in (
             "data dir writable",
             "db opens",
-            "daemon port free",
-            "proxy port free",
+            "daemon socket free",
             "cliproxy reachable",
             "dashboard session",
             "dashboard reachable",
@@ -818,14 +902,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if ledger is not None:
             _close_ledger(ledger)
 
-    daemon_cfg = config.daemon
-    ok, detail = _port_is_free(str(daemon_cfg.host), int(daemon_cfg.port))
-    results.append(_check("daemon port free", ok, detail)[1])
-
-    proxy_cfg = getattr(config, "proxy", None)
-    if bool(getattr(proxy_cfg, "enabled", False)):
-        ok, detail = _port_is_free(str(proxy_cfg.host), int(proxy_cfg.port))
-        results.append(_check("proxy port free", ok, detail)[1])
+    ok, detail = _socket_is_free(client_module.socket_path(config))
+    results.append(_check("daemon socket free", ok, detail)[1])
 
     cliproxy_cfg = getattr(config, "cliproxy", None)
     if bool(getattr(cliproxy_cfg, "enabled", False)):
@@ -863,8 +941,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser("serve", help="run the status daemon")
     serve.add_argument("--config", default=None, metavar="PATH")
-    serve.add_argument("--with-proxy", action="store_true", dest="with_proxy")
-    serve.add_argument("--port", type=int, default=None, metavar="N")
+    serve.add_argument(
+        "--socket",
+        default=None,
+        metavar="PATH",
+        help="socket path to bind (default: $XDG_RUNTIME_DIR/sarvam-meter/daemon.sock)",
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="N",
+        help="ignored: the daemon no longer listens on TCP",
+    )
     serve.add_argument("--print-status", action="store_true", dest="print_status")
     serve.set_defaults(func=cmd_serve)
 
@@ -893,11 +982,6 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--config", default=None, metavar="PATH")
     record.set_defaults(func=cmd_record)
 
-    proxy = subparsers.add_parser("proxy", help="run the recording proxy")
-    proxy.add_argument("--config", default=None, metavar="PATH")
-    proxy.add_argument("--port", type=int, default=None, metavar="N")
-    proxy.set_defaults(func=cmd_proxy)
-
     session = subparsers.add_parser("session", help="manage the dashboard session")
     session_sub = session.add_subparsers(dest="session_command", metavar="command")
 
@@ -917,6 +1001,84 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--config", default=None, metavar="PATH")
     dashboard.add_argument("--json", action="store_true", dest="json")
     dashboard.set_defaults(func=cmd_dashboard)
+
+    query = subparsers.add_parser(
+        "query", help="ask a running daemon over its socket"
+    )
+    query.add_argument(
+        "--socket",
+        default=None,
+        metavar="PATH",
+        help="socket path (default: resolved the way the daemon resolves it)",
+    )
+    query.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="config file used to resolve the socket path",
+    )
+    query.add_argument(
+        "--timeout", type=float, default=10.0, metavar="SECONDS",
+        help="how long to wait for the daemon to answer",
+    )
+    query_sub = query.add_subparsers(
+        dest="query_command", metavar="op", required=True
+    )
+    for name, summary in (
+        ("status", "print the status payload"),
+        ("health", "print the daemon's health"),
+        ("refresh", "force a re-poll of every source, then print the status"),
+        ("config", "print the sanitised config"),
+        ("session", "print the dashboard session state (header names only)"),
+    ):
+        leaf = query_sub.add_parser(name, help=summary)
+        # SUPPRESS keeps a value given *before* the op name from being clobbered
+        # by the subparser's own default.
+        leaf.add_argument("--socket", default=argparse.SUPPRESS, metavar="PATH")
+        leaf.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH")
+        leaf.add_argument(
+            "--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS"
+        )
+        leaf.set_defaults(func=cmd_query)
+
+    query_set_config = query_sub.add_parser(
+        "set-config", help="apply a writable-subset config update"
+    )
+    query_set_config.add_argument(
+        "config_json",
+        metavar="<json>",
+        help="a JSON object of writable keys, or - to read it from stdin",
+    )
+    query_set_config.add_argument(
+        "--socket", default=argparse.SUPPRESS, metavar="PATH"
+    )
+    query_set_config.add_argument(
+        "--config", default=argparse.SUPPRESS, metavar="PATH"
+    )
+    query_set_config.add_argument(
+        "--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS"
+    )
+    query_set_config.set_defaults(func=cmd_query)
+
+    query_set_session = query_sub.add_parser(
+        "set-session", help="store a captured dashboard session"
+    )
+    session_source = query_set_session.add_mutually_exclusive_group()
+    session_source.add_argument("--cookie", default=None, metavar="VALUE")
+    session_source.add_argument(
+        "--cookie-file", default=None, dest="cookie_file", metavar="PATH"
+    )
+    query_set_session.add_argument("--authorization", default=None, metavar="VALUE")
+    query_set_session.add_argument(
+        "--socket", default=argparse.SUPPRESS, metavar="PATH"
+    )
+    query_set_session.add_argument(
+        "--config", default=argparse.SUPPRESS, metavar="PATH"
+    )
+    query_set_session.add_argument(
+        "--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS"
+    )
+    query_set_session.set_defaults(func=cmd_query)
 
     doctor = subparsers.add_parser("doctor", help="check the installation")
     doctor.add_argument("--config", default=None, metavar="PATH")

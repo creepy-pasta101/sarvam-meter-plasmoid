@@ -4,13 +4,15 @@
 The unit tests inject snapshot dicts; these drive the actual wire path — session
 file, HTTP request, response parsing, daemon cache, status payload — against a
 local server that replays the captured fixtures. No internet access.
+
+The *upstream* dashboard is still HTTP (that is what the source speaks); the
+daemon itself is reached over its Unix socket, through
+:func:`sarvam_meter.client.call`.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import datetime
-import http.client
 import json
 import os
 import stat
@@ -25,6 +27,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from sarvam_meter import client as client_module  # noqa: E402
 from sarvam_meter import config as config_mod  # noqa: E402
 from sarvam_meter.daemon import Daemon  # noqa: E402
 from sarvam_meter.ledger import Ledger  # noqa: E402
@@ -122,10 +125,7 @@ class DashboardEndToEndTest(unittest.TestCase):
         self.config_path = os.path.join(self.tmp, "config.json")
         with open(self.config_path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
-        loaded = config_mod.load_config(self.config_path)
-        self.config = dataclasses.replace(
-            loaded, daemon=dataclasses.replace(loaded.daemon, port=0)
-        )
+        self.config = config_mod.load_config(self.config_path)
 
         self.ledger = Ledger(self.db_path)
         self.ledger.set_balance(500.0)
@@ -137,8 +137,11 @@ class DashboardEndToEndTest(unittest.TestCase):
         self.ledger._execute("UPDATE balance SET set_at = ? WHERE id = 1", (backdated,))
         self.ledger.record_event(source="manual", api="chat", quantity=1000.0,
                                  unit="tokens", cost=1.0)
-        self.daemon = Daemon(self.config, ledger=self.ledger)
-        self.port = self.daemon.start()
+        self.socket_path = os.path.join(self.tmp, "run", "daemon.sock")
+        self.daemon = Daemon(
+            self.config, ledger=self.ledger, socket_path=self.socket_path
+        )
+        self.bound = self.daemon.start()
 
     def tearDown(self):
         try:
@@ -148,22 +151,12 @@ class DashboardEndToEndTest(unittest.TestCase):
             self.server.shutdown()
             self.server.server_close()
 
+    def call(self, op, **args):
+        return client_module.call(op, socket_path=self.bound, timeout=20.0, **args)
+
     def _refresh_and_status(self):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-        try:
-            connection.request("POST", "/v1/refresh")
-            first = connection.getresponse()
-            first.read()
-            self.assertEqual(first.status, 200)
-        finally:
-            connection.close()
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-        try:
-            connection.request("GET", "/v1/status")
-            response = connection.getresponse()
-            return json.loads(response.read())
-        finally:
-            connection.close()
+        self.call("refresh")
+        return self.call("status")
 
     def test_status_carries_the_dashboard_numbers(self):
         status = self._refresh_and_status()
@@ -202,13 +195,7 @@ class DashboardEndToEndTest(unittest.TestCase):
         self.assertEqual(_FakeDashboard.requests[0]["cookie"], COOKIE)
         blob = json.dumps(status)
         self.assertNotIn("SuperSecretCookieValue", blob)
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-        try:
-            connection.request("GET", "/v1/config")
-            response = connection.getresponse()
-            config_blob = response.read().decode("utf-8")
-        finally:
-            connection.close()
+        config_blob = json.dumps(self.call("config.get"))
         self.assertNotIn("SuperSecretCookieValue", config_blob)
 
     def test_a_401_falls_back_to_the_ledger_spend_without_a_balance(self):

@@ -2,10 +2,24 @@
 //
 // Sarvam Meter - Plasma 6 applet root (SPEC.md sections 10 and 13).
 //
-// The applet polls GET <daemonUrl>/v1/status and keeps the parsed model here;
+// The applet runs `<command> query status` and keeps the parsed model here;
 // CompactRepresentation.qml and FullRepresentation.qml read it through the
-// `meter` property that this file assigns.  Nothing in this file blocks: the
-// only network call is an asynchronous XMLHttpRequest.
+// `meter` property that this file assigns.
+//
+// HOW IT TALKS TO THE DAEMON (transport change, unit B2)
+// The daemon no longer listens on a TCP port: it serves newline-delimited JSON
+// on a Unix socket under $XDG_RUNTIME_DIR, and `sarvam-meter query <op>` is the
+// client that prints the reply's `result` as JSON on stdout.  So the widget does
+// not speak HTTP at all any more - there is no XMLHttpRequest anywhere in this
+// package.  Instead it runs the CLI through Plasma's executable data source
+// (org.kde.plasma.plasma5support, `engine: "executable"`), which starts the
+// child process off the GUI thread and hands the answer back through the
+// `newData` signal as a map of "stdout", "stderr" and "exit code".
+//
+// `command` is the program that is executed, and it is *executed*, so it is
+// restricted to a bare program name or an absolute path - no spaces, no quotes,
+// no shell metacharacters - and an unacceptable value falls back to the default
+// instead of being run.
 //
 // Defensive-parsing contract: the payload may be missing keys, contain nulls or
 // arrive malformed.  Every access below goes through a typeof/null guard, so a
@@ -18,6 +32,7 @@
 import QtQuick
 import org.kde.plasma.plasmoid
 import org.kde.kirigami as Kirigami
+import org.kde.plasma.plasma5support as P5Support
 
 PlasmoidItem {
     id: root
@@ -29,17 +44,47 @@ PlasmoidItem {
     // Configuration.  These are the only five keys the widget may read.
     // ------------------------------------------------------------------
 
-    readonly property string daemonUrl: {
-        var raw = Plasmoid.configuration.daemonUrl;
+    // The program this widget executes, resolved on PATH ("sarvam-meter") or an
+    // absolute path to it.  This string ends up in a command line, so anything
+    // that is not a bare program name or an absolute path is refused and the
+    // default is used instead: no spaces, no quotes, no metacharacters, and no
+    // leading dash (which would be read as an option).
+    readonly property string defaultCommand: "sarvam-meter"
+
+    readonly property string command: {
+        var raw = Plasmoid.configuration.command;
         if (typeof raw === "undefined" || raw === null)
-            return "http://127.0.0.1:8787";
-        var url = String(raw);
-        if (url.length === 0)
-            return "http://127.0.0.1:8787";
-        // Tolerate a trailing slash in the configured base URL.
-        while (url.length > 1 && url.charAt(url.length - 1) === "/")
-            url = url.substring(0, url.length - 1);
-        return url;
+            return root.defaultCommand;
+        return root.safeCommand(String(raw));
+    }
+
+    // "" when the string is safe to execute, otherwise the reason it is not.
+    function commandError(raw) {
+        var text = String(raw).trim();
+        if (text.length === 0)
+            return "the command is empty. Use sarvam-meter, or an absolute path to it.";
+        if (text.length > 512)
+            return "the command is too long.";
+        // A whitelist, not a blacklist: letters, digits, dot, underscore,
+        // dash, plus and slash.  Nothing else survives - in particular no
+        // space, quote, backtick, $, ;, &, |, <, >, ( or ).
+        if (!/^[A-Za-z0-9._\/+-]+$/.test(text))
+            return "the command must be a bare program name or an absolute path: "
+                + "no spaces, quotes or shell metacharacters.";
+        if (text.charAt(0) === "-")
+            return "the command must not start with a dash.";
+        if (text.indexOf("/") > 0 && text.charAt(0) !== "/")
+            return "the command must be a bare program name or an absolute path, "
+                + "not a relative path.";
+        return "";
+    }
+
+    // The value that is actually executed: the configured command when it is
+    // acceptable, the default when it is not.  Never returns a broken string.
+    function safeCommand(raw) {
+        if (root.commandError(raw) !== "")
+            return root.defaultCommand;
+        return String(raw).trim();
     }
 
     readonly property int refreshSeconds: {
@@ -98,20 +143,36 @@ PlasmoidItem {
     // ---- plasmashell safety -------------------------------------------
     // This applet runs *inside* plasmashell, on the same GUI thread as every
     // panel and every other widget.  Anything that blocks or runs unbounded
-    // there freezes the whole desktop, so every request here is bounded four
-    // ways: an async-only XHR, a hard timeout, an independent watchdog that
-    // aborts it, and a single-flight guard so a slow daemon cannot stack up
-    // requests.  The response size is capped before JSON.parse, and every list
-    // the delegate model sees is sliced.  Nothing below loops unboundedly.
+    // there freezes the whole desktop, so the one call this widget makes is
+    // bounded four ways: it goes through Plasma's executable data source (which
+    // starts the child asynchronously and answers through a signal, never a
+    // blocking read), a hard watchdog that gives up on a wedged child and kills
+    // it, a single-flight guard so a slow daemon cannot stack processes up, and
+    // an explicit disconnectSource() when the request settles or the widget goes
+    // away.  The answer is size-capped before JSON.parse, and every list the
+    // delegate model sees is sliced.  Nothing below loops unboundedly.
     readonly property int requestTimeoutMs: 4000
     readonly property int maxResponseChars: 512 * 1024
     readonly property int maxAccountsShown: 12
     readonly property int maxErrorsShown: 5
 
-    // The in-flight request and a mutable "already handled" flag shared with its
-    // callbacks, so abort() and a late event can never both settle it.
-    property var activeRequest: null
-    property var activeRequestState: null
+    // The command whose answer is outstanding ("" = idle).  A non-empty value
+    // *is* the single-flight guard: no second request starts while it is set.
+    property string pendingCommand: ""
+    property bool pendingFallback: false
+
+    // The only process this widget ever spawns.  `connectedSources` starts empty
+    // and holds exactly one entry per request; the entry is removed - and the
+    // child killed - the moment the request settles, the watchdog fires or the
+    // widget is destroyed.
+    P5Support.DataSource {
+        id: execSource
+        engine: "executable"
+        connectedSources: []
+        onNewData: function (sourceName, data) {
+            root.handleNewData(sourceName, data);
+        }
+    }
 
     Timer {
         id: refreshTimer
@@ -122,7 +183,7 @@ PlasmoidItem {
         onTriggered: root.refresh()
     }
 
-    // Re-evaluates the balance age text.  No network, no allocation worth
+    // Re-evaluates the balance age text.  No process, no allocation worth
     // mentioning: one Date.now() and a string format every 30 seconds, and only
     // while there is an as_of timestamp to age.
     Timer {
@@ -133,8 +194,10 @@ PlasmoidItem {
         onTriggered: root.clockTick = Date.now()
     }
 
-    // Belt and braces: Qt's own xhr.timeout covers the transfer, not every way a
-    // server can go quiet.  If the request has not settled by then, kill it.
+    // The data source has no timeout of its own: a child that hangs (a wedged
+    // daemon, a CLI waiting on a lock) would leave the widget in `loading` for
+    // ever.  This is the independent watchdog that gives up, kills the child and
+    // records a failure.
     Timer {
         id: requestWatchdog
         interval: root.requestTimeoutMs + 2000
@@ -145,11 +208,11 @@ PlasmoidItem {
 
     Component.onCompleted: root.refresh()
 
-    // Never leave a socket, a timer or a pending callback behind.
+    // Never leave a child process or a timer behind.
     Component.onDestruction: root.abortRequest("")
 
-    // Re-poll straight away if the user repoints the widget at another daemon.
-    onDaemonUrlChanged: root.refresh()
+    // Re-poll straight away if the user repoints the widget at another program.
+    onCommandChanged: root.refresh()
 
     function handleFailure(message) {
         root.offline = true;
@@ -157,23 +220,28 @@ PlasmoidItem {
         root.backoffMultiplier = Math.min(10, root.backoffMultiplier * 2);
     }
 
-    // Drop the in-flight request, if there is one, and stop waiting on it.
-    // Called by the watchdog and on destruction; `message` empty means "do not
-    // count this as a failure" (a widget being removed is not an error).
+    // The command line for one op: "<command> query <op>".  Both halves are
+    // safe - `command` is whitelisted above and `op` is a literal below - so no
+    // quoting is needed and no user text ever reaches the shell.
+    function queryCommand(op) {
+        return root.command + " query " + op;
+    }
+
+    // Drop the outstanding request, if there is one: stop the watchdog, forget
+    // the command and disconnect the source, which kills a child that is still
+    // running.  `message` empty means "do not count this as a failure" (a widget
+    // being removed is not an error).
     function abortRequest(message) {
+        var target = root.pendingCommand;
+        root.pendingCommand = "";
+        root.pendingFallback = false;
         requestWatchdog.stop();
-        var state = root.activeRequestState;
-        var request = root.activeRequest;
-        root.activeRequestState = null;
-        root.activeRequest = null;
         root.loading = false;
-        if (state)
-            state.done = true;
-        if (request) {
+        if (target !== "") {
             try {
-                request.abort();
+                execSource.disconnectSource(target);
             } catch (e) {
-                // aborting an already-finished request is harmless
+                // already disconnected
             }
         }
         if (message !== "")
@@ -182,127 +250,147 @@ PlasmoidItem {
 
     // The timer's entry point: re-read the daemon's cached status.
     function refresh() {
-        root.startRequest("GET", "/v1/status", false);
+        root.startRequest("status", false);
     }
 
-    // The header's refresh button.  A plain GET would only re-read the daemon's
-    // cache (the dashboard is re-polled on its own 5-minute TTL), so the button
-    // asks the daemon to poll its sources now.  That call can take a while when
-    // the dashboard is slow, so a failure falls back to the cached status: the
+    // The header's refresh button.  A plain status read only returns the
+    // daemon's cache (the dashboard is re-polled on its own TTL), so the button
+    // asks the daemon to poll its sources now.  That can take a while when the
+    // dashboard is slow, so a failure falls back to the cached status: the
     // spinner always stops and the user always ends up with numbers on screen.
     function forceRefresh() {
-        root.startRequest("POST", "/v1/refresh", true);
+        root.startRequest("refresh", true);
     }
 
-    function startRequest(method, path, allowFallback) {
+    function startRequest(op, allowFallback) {
         // Single flight: while a request is outstanding, do nothing.  A daemon
-        // that stops answering therefore cannot pile requests up.
+        // that stops answering therefore cannot pile processes up.
         if (root.loading)
             return;
 
-        var url = root.daemonUrl + path;
-        var xhr = null;
-        try {
-            xhr = new XMLHttpRequest();
-        } catch (e) {
-            root.handleFailure("cannot create a request");
-            return;
-        }
-
-        var state = { "done": false };
-
-        function settle(message, parsed) {
-            if (state.done)
-                return;
-            state.done = true;
-            requestWatchdog.stop();
-            root.activeRequestState = null;
-            root.activeRequest = null;
-            root.loading = false;
-            if (message !== "") {
-                root.handleFailure(message);
-                if (allowFallback)
-                    root.startRequest("GET", "/v1/status", false);
-                return;
-            }
-            root.payload = parsed;
-            root.offline = false;
-            root.lastError = "";
-            root.backoffMultiplier = 1;
-        }
-
-        try {
-            // Third argument `true` = asynchronous.  Synchronous XHR is banned.
-            xhr.open(method, url, true);
-            xhr.setRequestHeader("Accept", "application/json");
-        } catch (e) {
-            settle("cannot reach " + url);
-            return;
-        }
-
+        var target = root.queryCommand(op);
         root.loading = true;
-        root.activeRequest = xhr;
-        root.activeRequestState = state;
-        xhr.timeout = root.requestTimeoutMs;
+        root.pendingCommand = target;
+        root.pendingFallback = allowFallback;
         requestWatchdog.restart();
-
-        xhr.onreadystatechange = function () {
-            if (xhr.readyState !== 4)
-                return;
-            if (state.done)
-                return;
-
-            if (xhr.status !== 200) {
-                settle("HTTP " + xhr.status);
-                return;
-            }
-
-            var body = "";
-            try {
-                body = xhr.responseText || "";
-            } catch (e) {
-                settle("daemon returned an unreadable response");
-                return;
-            }
-
-            // Never hand a huge string to JSON.parse on the GUI thread: that is
-            // the one way this widget could stall plasmashell.
-            if (body.length > root.maxResponseChars) {
-                settle("daemon response too large");
-                return;
-            }
-
-            var parsed = null;
-            try {
-                parsed = JSON.parse(body);
-            } catch (e) {
-                parsed = null;
-            }
-
-            if (typeof parsed !== "object" || parsed === null) {
-                settle("daemon returned malformed JSON");
-                return;
-            }
-
-            settle("", parsed);
-        };
-
-        xhr.onerror = function () {
-            settle("daemon unreachable");
-        };
-
-        xhr.ontimeout = function () {
-            settle("daemon timed out");
-        };
-
-        xhr.onabort = function () {
-            settle("daemon request aborted");
-        };
-
         try {
-            xhr.send();
+            execSource.connectSource(target);
         } catch (e) {
-            settle("cannot send the request");
+            // Nothing was started, so nothing has to be stopped.
+            root.settleFailure("cannot run " + target, allowFallback);
+        }
+    }
+
+    // The data source answered.  `data` is the map Plasma hands over:
+    // {"stdout": ..., "stderr": ..., "exit code": ...}.  Anything for a source
+    // we are no longer waiting on (a late answer from a request that already
+    // timed out) is ignored.
+    function handleNewData(sourceName, data) {
+        if (!root.loading)
+            return;
+        if (String(sourceName) !== root.pendingCommand)
+            return;
+
+        var fallback = root.pendingFallback;
+        var payload = data;
+        if (typeof payload !== "object" || payload === null) {
+            // Some engines deliver the map only through `data[source]`.
+            try {
+                payload = execSource.data[sourceName];
+            } catch (e) {
+                payload = null;
+            }
+        }
+        if (typeof payload !== "object" || payload === null) {
+            root.settleFailure("the daemon returned an unreadable answer", fallback);
+            return;
+        }
+
+        var exitCode = root.numberOr(payload["exit code"], 0);
+        var body = "";
+        var detail = "";
+        if (typeof payload["stdout"] === "string")
+            body = payload["stdout"];
+        if (typeof payload["stderr"] === "string")
+            detail = root.firstLine(payload["stderr"]);
+
+        if (exitCode !== 0) {
+            root.settleFailure(
+                detail !== "" ? ("sarvam-meter: " + detail)
+                              : ("sarvam-meter exited with status " + exitCode),
+                fallback);
+            return;
+        }
+        if (body.length === 0) {
+            root.settleFailure("the daemon returned nothing", fallback);
+            return;
+        }
+
+        // Never hand a huge string to JSON.parse on the GUI thread: that is the
+        // one way this widget could stall plasmashell.
+        if (body.length > root.maxResponseChars) {
+            root.settleFailure("daemon response too large", fallback);
+            return;
+        }
+
+        var parsed = null;
+        try {
+            parsed = JSON.parse(body);
+        } catch (e) {
+            parsed = null;
+        }
+
+        if (typeof parsed !== "object" || parsed === null) {
+            root.settleFailure("daemon returned malformed JSON", fallback);
+            return;
+        }
+
+        root.settleSuccess(parsed);
+    }
+
+    // The first line of a child's stderr, bounded and stripped of control
+    // characters.  It is the CLI's own message ("sarvam-meter: ..."), which the
+    // daemon builds without ever quoting a stored value.
+    function firstLine(text) {
+        var line = String(text).replace(/\r/g, "\n");
+        var cut = line.indexOf("\n");
+        if (cut >= 0)
+            line = line.substring(0, cut);
+        line = line.replace(/[\u0000-\u001f]/g, "").trim();
+        if (line.length > 200)
+            line = line.substring(0, 200) + "...";
+        return line;
+    }
+
+    function settleSuccess(parsed) {
+        root.clearPending();
+        root.payload = parsed;
+        root.offline = false;
+        root.lastError = "";
+        root.backoffMultiplier = 1;
+    }
+
+    function settleFailure(message, allowFallback) {
+        root.clearPending();
+        root.handleFailure(message);
+        if (allowFallback)
+            root.startRequest("status", false);
+    }
+
+    // Forget the outstanding request and disconnect its source (killing the
+    // child if it is still running).  Shared by both settlement paths.
+    function clearPending() {
+        var target = root.pendingCommand;
+        root.pendingCommand = "";
+        root.pendingFallback = false;
+        requestWatchdog.stop();
+        root.loading = false;
+        if (target === "")
+            return;
+        try {
+            execSource.disconnectSource(target);
+        } catch (e) {
+            // already disconnected
         }
     }
 
@@ -498,7 +586,7 @@ PlasmoidItem {
 
     // Schema 2: which source the balance and spend figures come from.  A schema-1
     // payload has no `spend.source`, and an older daemon's numbers are ledger
-    // numbers, so the fallback is "ledger" — never an empty or undefined hint.
+    // numbers, so the fallback is "ledger" - never an empty or undefined hint.
     readonly property string spendSource: {
         var s = root.spendObject.source;
         if (typeof s === "undefined" || s === null)
@@ -629,7 +717,7 @@ PlasmoidItem {
     // `balance_updated_at` from /api/dhan/org/balance is when the *balance value*
     // last changed, not when we last asked.  Sarvam updates it lazily, so a
     // reading can legitimately be an hour old while the widget itself polled a
-    // minute ago — and a stale "80.04 left" looks exactly like a live one.  The
+    // minute ago - and a stale "80.04 left" looks exactly like a live one.  The
     // age is shown next to the balance so the two cannot be confused.
     readonly property string balanceAsOf: {
         var block = root.dashboardObject.balance;

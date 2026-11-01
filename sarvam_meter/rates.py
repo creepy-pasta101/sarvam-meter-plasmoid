@@ -11,8 +11,8 @@ Chat pricing note: output tokens cost four times input tokens on the Sarvam
 models (Rs 60 vs Rs 15 per million), so the caller must pass the output count
 separately via ``out_quantity``.  When ``out_quantity`` is ``None`` the legacy
 behaviour applies -- every non-cached token is priced at ``in_per_million`` --
-which understates a chat call by up to 4x; the recording proxy therefore always
-passes ``out_quantity``.  ``quantity`` is the *non-cached input* token count when
+which understates a chat call by up to 4x; every caller that prices a chat call
+should pass ``out_quantity``.  ``quantity`` is the *non-cached input* token count when
 ``out_quantity`` is given, and ``cached_quantity`` is priced at
 ``cached_in_per_million``.
 """
