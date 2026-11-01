@@ -41,6 +41,20 @@ KCM.SimpleKCM {
     property string testMessage: ""
     property var testRequest: null
 
+    // The settings window can be closed while the probe is in flight; drop it so
+    // no callback outlives the page (and so the config dialog cannot be left
+    // waiting on a socket).
+    Component.onDestruction: {
+        if (testRequest) {
+            try {
+                testRequest.abort();
+            } catch (e) {
+                // already finished
+            }
+            testRequest = null;
+        }
+    }
+
     readonly property string daemonUrlError: validateDaemonUrl(daemonUrlField.text)
     readonly property bool daemonUrlInvalid: daemonUrlError !== ""
     readonly property bool daemonUrlNonLocal: !daemonUrlInvalid && !isLoopbackHost(hostOf(daemonUrlField.text))
@@ -177,6 +191,17 @@ KCM.SimpleKCM {
         var target = normalisedBaseUrl(daemonUrlField.text) + "/v1/health";
         testState = "pending";
         testMessage = "Contacting " + target + " ...";
+
+        // A second click must not leave the first request running: its callbacks
+        // would clobber the state of the one being shown.
+        if (testRequest) {
+            try {
+                testRequest.abort();
+            } catch (e) {
+                // already finished
+            }
+            testRequest = null;
+        }
 
         var request = new XMLHttpRequest();
         testRequest = request;
