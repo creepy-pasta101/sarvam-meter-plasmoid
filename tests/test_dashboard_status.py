@@ -32,6 +32,7 @@ DASHBOARD_KEYS = {
     "spend",
     "by_model",
     "error",
+    "balance",
 }
 
 
@@ -54,6 +55,7 @@ def snapshot(
     configured=True,
     error=None,
     by_model=None,
+    balance=None,
 ):
     """A dashboard snapshot shaped exactly like ``DashboardClient.snapshot()``."""
     return {
@@ -71,6 +73,15 @@ def snapshot(
             {"model": "glm5.3-flash", "cost": 53.388129},
         ],
         "usage": [],
+        "balance": balance if balance is not None else {
+            "known": False,
+            "amount": None,
+            "currency": "INR",
+            "as_of": None,
+            "state": "",
+            "billing_model": "",
+            "unit": "",
+        },
         "error": error,
     }
 
@@ -103,7 +114,8 @@ class DashboardBlockTest(DashboardStatusTestBase):
         self.assertFalse(sarvam["dashboard"]["reachable"])
         self.assertIsNone(sarvam["dashboard"]["error"])
         self.assertEqual(sarvam["dashboard"]["by_model"], [])
-        self.assertEqual(sarvam["dashboard"]["spend"], {"window": 0.0, "today": 0.0})
+        self.assertEqual(sarvam["dashboard"]["spend"],
+                         {"window": 0.0, "today": 0.0, "month": 0.0})
 
     def test_configured_follows_the_config_section(self):
         sarvam = self.status(config=self.enabled)["sarvam"]
@@ -189,7 +201,7 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
         self.assertEqual(balance["starting"], 500.0)
         self.assertEqual(balance["spent_total"], 134.23)
         self.assertEqual(balance["remaining"], 365.77)
-        self.assertEqual(balance["source"], "dashboard")
+        self.assertEqual(balance["source"], "dashboard-derived")
         self.assertIsNotNone(balance["set_at"])
 
     def test_remaining_never_goes_negative(self):
@@ -209,6 +221,66 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
         self.assertEqual(balance["spent_total"], 12.35)
         self.assertEqual(balance["remaining"], 487.65)
         self.assertEqual(balance["source"], "ledger")
+
+    def test_reported_balance_needs_no_starting_balance(self):
+        # No `balance set` at all: the dashboard reports the number itself.
+        reported = {
+            "known": True,
+            "amount": 80.03533,
+            "currency": "INR",
+            "as_of": "2026-11-01T05:55:39.713767Z",
+            "state": "provisioned",
+            "billing_model": "prepaid",
+            "unit": "rupees",
+        }
+        sarvam = self.status(snapshot(balance=reported), config=self.enabled)["sarvam"]
+        self.assertTrue(sarvam["balance"]["known"])
+        self.assertEqual(sarvam["balance"]["remaining"], 80.04)
+        self.assertIsNone(sarvam["balance"]["starting"])
+        self.assertEqual(sarvam["balance"]["source"], "dashboard")
+        self.assertEqual(sarvam["dashboard"]["balance"]["amount"], 80.03533)
+        self.assertEqual(
+            sarvam["dashboard"]["balance"]["as_of"], "2026-11-01T05:55:39.713767Z"
+        )
+
+    def test_reported_balance_wins_over_the_derived_one(self):
+        self.ledger.set_balance(500.0, "INR")
+        reported = {"known": True, "amount": 80.03533, "currency": "INR"}
+        balance = self.status(snapshot(balance=reported), config=self.enabled)[
+            "sarvam"
+        ]["balance"]
+        # 500 - 134.23 would be 365.77; the reported number wins
+        self.assertEqual(balance["remaining"], 80.04)
+        self.assertEqual(balance["starting"], 500.0)
+        self.assertEqual(balance["spent_total"], 134.23)
+        self.assertEqual(balance["source"], "dashboard")
+
+    def test_reported_balance_survives_when_the_windows_fail(self):
+        reported = {"known": True, "amount": 80.03533, "currency": "INR"}
+        payload = self.status(
+            snapshot(
+                reachable=False,
+                window=0.0,
+                today=0.0,
+                balance=reported,
+                error={"source": "dashboard", "code": "unauthorized", "message": "x"},
+            ),
+            config=self.enabled,
+        )
+        sarvam = payload["sarvam"]
+        self.assertFalse(sarvam["dashboard"]["reachable"])
+        self.assertEqual(sarvam["balance"]["source"], "dashboard")
+        self.assertEqual(sarvam["balance"]["remaining"], 80.04)
+        # spend is still ledger-sourced, because the windows did not answer
+        self.assertEqual(sarvam["spend"]["source"], "ledger")
+
+    def test_an_exhausted_reported_balance_is_known_not_unknown(self):
+        reported = {"known": True, "amount": 0.0, "currency": "INR"}
+        balance = self.status(snapshot(balance=reported), config=self.enabled)[
+            "sarvam"
+        ]["balance"]
+        self.assertTrue(balance["known"])
+        self.assertEqual(balance["remaining"], 0.0)
 
     def test_unreachable_snapshot_falls_back_to_the_ledger(self):
         self.ledger.set_balance(500.0, "INR")
