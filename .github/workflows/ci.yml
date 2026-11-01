@@ -109,6 +109,27 @@ jobs:
           test "$PYPROJECT" = "$SPEC"
           test "$PYPROJECT" = "$PKG"
 
+  qml-safety:
+    name: Plasmoid safety (real Qt engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PySide6 (Qt 6, headless)
+        run: pip install --quiet PySide6-Essentials
+
+      # Loads the real main.qml in a real Qt engine and drives it against a daemon
+      # that hangs, floods, returns garbage, or is removed mid-request.  This is
+      # the only job that actually executes the QML.
+      - name: Run the plasmashell-safety harness
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 scripts/qml-safety-harness.py
+
   rpm:
     name: Build RPM (Fedora)
     runs-on: ubuntu-latest
