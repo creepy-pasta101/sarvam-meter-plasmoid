@@ -62,9 +62,12 @@ class MainQmlSafetyTest(unittest.TestCase):
         self.assertIn("requestWatchdog.stop()", self.code)
 
     def test_requests_are_single_flight(self):
+        # Both entry points (the timer's refresh() and the header's
+        # forceRefresh()) delegate to startRequest(), which owns the guard.
         self.assertRegex(
-            self.code, r"function refresh\(\)\s*\{[^}]*if \(root\.loading\)\s*return",
-            "refresh() must not start a second request while one is in flight",
+            self.code,
+            r"function startRequest\([^)]*\)\s*\{[\s\S]{0,400}if \(root\.loading\)\s*return",
+            "startRequest() must not start a second request while one is in flight",
         )
 
     def test_the_response_size_is_capped_before_parsing(self):
@@ -122,6 +125,51 @@ class MainQmlSafetyTest(unittest.TestCase):
         remote = {url for url in urls if not url.startswith("http://127.0.0.1")}
         self.assertEqual(remote, set(),
                          "the applet must not reference a remote host: %r" % (remote,))
+
+
+class PlasmoidUiTest(unittest.TestCase):
+    """The popup follows the same structure as Plasma's own applets."""
+
+    def setUp(self):
+        self.full = read(MAIN_QML.replace("main.qml", "FullRepresentation.qml"))
+        self.main = read(MAIN_QML)
+
+    def test_the_popup_is_a_plasma_representation_with_a_heading(self):
+        self.assertIn("import org.kde.plasma.extras as PlasmaExtras", self.full)
+        self.assertRegex(self.full, r"PlasmaExtras\.Representation\s*\{")
+        self.assertRegex(self.full, r"header:\s*PlasmaExtras\.PlasmoidHeading\s*\{")
+        self.assertIn("collapseMargins: true", self.full)
+        # The root must not be a bare Item any more: that is what makes it look
+        # like the rest of the shell.
+        self.assertNotRegex(self.full, r"(?m)^Item\s*\{")
+
+    def test_the_empty_state_uses_the_standard_placeholder(self):
+        self.assertRegex(self.full, r"PlasmaExtras\.PlaceholderMessage\s*\{")
+        self.assertIn('icon.name:', self.full)
+
+    def test_the_header_carries_a_refresh_button(self):
+        self.assertRegex(self.full, r"id:\s*refreshButton")
+        self.assertIn('icon.name: "view-refresh"', self.full)
+        # It must call forceRefresh, not refresh: only the POST re-polls.
+        self.assertRegex(self.full, r"onClicked:[\s\S]{0,200}forceRefresh\(\)")
+        # And it must not be clickable while a request is in flight.
+        self.assertRegex(self.full, r"id:\s*refreshButton[\s\S]{0,300}enabled:")
+
+    def test_a_busy_indicator_is_shown_while_loading(self):
+        self.assertRegex(self.full, r"BusyIndicator\s*\{")
+        self.assertRegex(self.full, r"BusyIndicator\s*\{[\s\S]{0,200}running:\s*fullRoot\.busy")
+
+    def test_the_refresh_goes_through_the_same_safety_path(self):
+        # forceRefresh must not open its own XHR: it goes through startRequest,
+        # which owns the timeout, the watchdog and the single-flight guard.
+        self.assertRegex(
+            self.main,
+            r"function forceRefresh\(\)\s*\{\s*root\.startRequest\(\"POST\", \"/v1/refresh\", true\);\s*\}")
+        self.assertRegex(
+            self.main,
+            r"function refresh\(\)\s*\{\s*root\.startRequest\(\"GET\", \"/v1/status\", false\);\s*\}")
+        # Exactly one XMLHttpRequest constructor in the whole file.
+        self.assertEqual(self.main.count("new XMLHttpRequest()"), 1)
 
 
 class ConfigPageSafetyTest(unittest.TestCase):
