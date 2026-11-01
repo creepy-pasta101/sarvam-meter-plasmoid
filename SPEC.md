@@ -722,3 +722,210 @@ integration-test unit must test as many as it can without network:
 - What you verified yourself (e.g. "ran `python3 -m unittest tests.test_rates -v`, 14 pass").
 - Anything a reviewer must know (interface assumption, tricky part, remaining risk).
 - If you could not finish: exactly which files are missing and what is unimplemented.
+
+---
+
+# 17. The dashboard source (added after 0.1.0, schema 2)
+
+Sarvam's dashboard exposes the authoritative numbers. The captured responses in
+`tests/fixtures/` are the contract; everything below is derived from them and must
+not be guessed beyond them.
+
+## 17.1 Confirmed endpoints
+
+Base: `https://indus.sarvam.ai` (the dashboard; `dashboard.sarvam.ai` 308-redirects here).
+
+```
+GET /api/dhan/org/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=model&product=sarvam-api-platform
+GET /api/dhan/org/usage/timeseries?start=YYYY-MM-DD&end=YYYY-MM-DD&group_by=product&product=sarvam-api-platform&granularity=auto
+```
+
+Both need the signed-in session. Unauthenticated they answer `401 application/json`;
+an unknown `/api/...` path answers `404` with the SPA shell instead.
+
+Summary payload (fixture `dhan_usage_summary_by_model.json`):
+
+```json
+{
+  "org_id": "019f37be-...", "range": {"start": "2026-10-02T18:30:00Z", "end": "2026-11-01T18:29:59Z"},
+  "group_by": ["model"],
+  "subtotal": "134.2312311905", "total_discount": "0",
+  "total_cost": "134.2312311905", "total_org_cost": "134.2312311905",
+  "currency": "inr",
+  "usage": [
+    {"unit": "token", "quantity": "13046343",
+     "breakdown": [{"unit": "cached_token", "quantity": "11296128"},
+                   {"unit": "input_token", "quantity": "1513846"},
+                   {"unit": "output_token", "quantity": "236369"}]},
+    {"unit": "second", "quantity": "9086.323125"}
+  ],
+  "groups": [
+    {"model": "glm5.3-flash", "subtotal": "53.388129", "total_cost": "53.388129", "currency": "inr", "usage": [...]},
+    {"model": "saaras:v3-realtime", "total_cost": "0.1551666667", ...},
+    {"model": "saaras:v4", "total_cost": "74.0498055238", ...},
+    {"model": "sarvam-105b", "total_cost": "6.63813", ...}
+  ]
+}
+```
+
+Timeseries payload (fixture `dhan_usage_timeseries_by_product.json`) adds
+`granularity`, `available_granularities`, `groups[].product` and
+`points: [{"timestamp","subtotal","total_discount","total_cost","event_count"}]`
+(28 hourly points in the fixture), and has no per-model groups.
+
+**Every number arrives as a JSON string.** They must be parsed to float; a
+non-numeric string is an error, never a silent 0. `currency` arrives lowercase
+(`"inr"`) and is normalised to uppercase (`"INR"`).
+
+## 17.2 Session file
+
+`~/.config/sarvam-meter/session.json`, mode `0600`, written by
+`sarvam-meter session set`:
+
+```json
+{"Cookie": "...", "Authorization": "Bearer ..."}
+```
+
+Only these two keys are accepted (case-insensitive match). Values are never
+logged, never returned by `/v1/config` (rendered `"***"`), never written into the
+status payload or an error message. A missing or unreadable file is
+`DashboardError(code="no_session")`.
+
+## 17.3 `sarvam_meter/dashboard.py`
+
+```python
+class DashboardError(Exception): ...        # .code: str, .status: Optional[int]
+def load_session(path: str) -> dict          # {lower-name: value}; raises DashboardError
+class DashboardClient:
+    def __init__(self, base_url: str, session: dict, *, timeout: float = 15.0,
+                 product: str = "sarvam-api-platform", transport=None)
+    def usage_summary(self, start_date: str, end_date: str, group_by: str = "model") -> dict
+    def usage_timeseries(self, start_date: str, end_date: str, group_by: str = "product",
+                         granularity: str = "auto") -> dict
+    def snapshot(self, *, since_date: str, today: str) -> dict   # NEVER raises
+def parse_summary(payload: bytes | dict) -> dict
+def parse_timeseries(payload: bytes | dict) -> dict
+```
+
+`transport(method, url, headers, timeout) -> (status, headers, body_bytes)`,
+injectable, default urllib with `ProxyHandler({})`, certificate verification on,
+no redirects (same rules as `cliproxy.py`). Dates are `YYYY-MM-DD`.
+
+`parse_summary` returns:
+
+```python
+{"org_id": str, "currency": "INR", "group_by": "model",
+ "range": {"start": str, "end": str},
+ "total_cost": float, "subtotal": float,
+ "usage": [{"unit": str, "quantity": float,
+            "breakdown": [{"unit": str, "quantity": float}]}],
+ "by_model": [{"model": str, "cost": float, "usage": [ ... ]}]}
+```
+
+`parse_timeseries` returns the same minus `by_model`, plus
+`"points": [{"timestamp": str, "cost": float, "event_count": int}]` and
+`"granularity": str`.
+
+`snapshot(since_date, today)` returns, and never raises:
+
+```python
+{"configured": bool, "reachable": bool, "as_of": str, "org_id": str|None,
+ "currency": "INR", "window": {"start": str, "end": str},
+ "spend": {"window": float, "today": float, "month": float},
+ "by_model": [{"model": str, "cost": float}],
+ "usage": [ ... ],
+ "error": None | {"source": "dashboard", "code": str, "message": str}}
+```
+
+Error codes: `no_session`, `unauthorized` (401/403), `bad_response` (non-JSON or
+unparsable), `unreachable` (transport failure), `http_error`. Three calls per
+snapshot: the window summary, today's summary, and the month-to-date summary
+(first of the current month .. today, because the ledger's own month total is not
+comparable once the dashboard is the source). A failure of either short call
+leaves that field at `0.0` and keeps the window result, with the error recorded.
+
+## 17.4 Config section
+
+```json
+"dashboard": {
+  "enabled": false,
+  "base_url": "https://indus.sarvam.ai",
+  "session_file": "~/.config/sarvam-meter/session.json",
+  "poll_seconds": 300,
+  "product": "sarvam-api-platform"
+}
+```
+
+Validation: `base_url` must be `https://` with a host and **no** userinfo (this is
+a remote host by design, so the loopback guard does **not** apply). A plain
+`http://` URL is accepted for a **loopback** host only, so the source can be
+exercised against a local fixture server; anything reachable remotely must be
+`https://`. `poll_seconds` >= 60 (bot-management friendly); `product` a non-empty
+string; `session_file` `~`-expanded. `packaging/config.example.json` must gain
+this section.
+
+## 17.5 Status payload — schema 2
+
+`schema` becomes `2`. `sarvam` gains:
+
+```json
+"spend": {"today": 12.3, "month": 87.4, "source": "dashboard"},
+"balance": {"known": true, "remaining": 365.77, "starting": 500.0,
+            "spent_total": 134.23, "set_at": "...", "source": "dashboard"},
+"dashboard": {
+  "configured": true, "reachable": true, "as_of": "...",
+  "org_id": "...", "currency": "INR",
+  "window": {"start": "2026-10-20", "end": "2026-11-01"},
+  "spend": {"window": 134.23, "today": 12.3},
+  "by_model": [{"model": "saaras:v4", "cost": 74.05}],
+  "error": null
+}
+```
+
+Rules:
+
+- `balance.source` and `spend.source` are `"dashboard"` when the dashboard snapshot
+  is reachable, else `"ledger"`.
+- With a dashboard snapshot and a starting balance: `spent_total = dashboard.spend.window`,
+  `remaining = max(0, starting - spent_total)`, window start = the date part of
+  `balance.set_at`.
+- Without a dashboard snapshot: the existing ledger behaviour, `source = "ledger"`.
+- `spend.today` and `spend.month` come from the dashboard when reachable, else
+  from the ledger.
+- `sarvam.dashboard` is always present; `configured: false` when disabled.
+- `build_status` gains the keyword argument `dashboard_snapshot=None`.
+
+## 17.6 CLI and daemon
+
+- `sarvam-meter session set (--cookie VALUE | --cookie-file PATH) [--authorization VALUE]`
+  writes the session file `0600`; `session show` prints the path, the mode and
+  which headers are present — never a value.
+- `sarvam-meter dashboard [--json]` prints one snapshot.
+- `doctor` gains `dashboard session` (file exists, mode `0600`, only allowed keys)
+  and, when enabled, `dashboard reachable`.
+- `Daemon` keeps a dashboard snapshot with a TTL of `dashboard.poll_seconds`,
+  refreshed by the same background thread pattern as cliproxy; `/v1/status` never
+  blocks on it and `/v1/refresh` refreshes both sources.
+
+## 17.7 Widget
+
+- When `spend.source == "dashboard"`, the full representation labels the spend line
+  `spend today` and shows a small "dashboard" hint; when `"ledger"` it shows the
+  existing `spend today` with a "local meter" hint.
+- When `sarvam.dashboard.reachable`, the full representation adds up to three
+  `by_model` rows (model name and cost) under the Sarvam section, using the same
+  `Bar` component scaled against the largest cost.
+- When `sarvam.dashboard.error` is present, one muted line: `dashboard: <code>`.
+- Compact representation is unchanged.
+
+## 17.8 Tests
+
+`tests/test_dashboard.py` must parse the two committed fixtures and assert the
+exact figures: `total_cost` 134.2312311905, four models at 53.388129 /
+0.1551666667 / 74.0498055238 / 6.63813, `usage` token 13046343 with breakdown
+11296128 / 1513846 / 236369, seconds 9086.323125, `currency` normalised from
+`"inr"` to `"INR"`, and 28 timeseries points totalling 134.2312311907. Also:
+string-number parsing, a non-numeric string is an error, 401 → `unauthorized`,
+non-JSON → `bad_response`, transport failure → `unreachable`, missing session →
+`no_session`, and that no session value ever appears in a snapshot or an error
+message.
