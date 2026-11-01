@@ -93,3 +93,6 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | `SIGTERM` on `sarvam-meter serve` | `cli.cmd_serve` | the daemon, the proxy and the ledger shut down cleanly and the WAL is checkpointed, so no `-wal`/`-shm` files are left behind |
 | `proxy --port` / a taken proxy port | `cli._with_port`, `cli.cmd_serve` | the override applies to the proxy section, and a taken port fails loudly with exit 1 instead of dying in a background thread |
 | A read-only ledger database | `cli.cmd_doctor` | `doctor` reports FAIL instead of a false OK |
+| The reported balance is exactly `0.00` | `status._normalise_dashboard_balance` | `balance.known` stays true and the widget shows `₹0.00` — an exhausted wallet is a known state, not an unknown one |
+| The balance endpoint answers but the usage windows do not | `dashboard.snapshot`, `status._sarvam_block` | `balance.source` is `"dashboard"` (the reported figure is shown) while `spend.source` stays `"ledger"` and `dashboard.reachable` is false |
+| A malformed date passed to the client | `dashboard.snapshot` (fail-fast validation) | `bad_request` and no request is made at all |
