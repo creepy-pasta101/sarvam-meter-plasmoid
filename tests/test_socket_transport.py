@@ -324,10 +324,13 @@ class SocketFileTest(SocketTransportTestCase):
         stale.bind(path)
         stale.close()  # the file stays behind; nothing is listening on it
         self.assertTrue(stat.S_ISSOCK(os.lstat(path).st_mode))
-        before = self.file_identity(path)
 
         daemon = self.start_daemon(path)
-        self.assertNotEqual(self.file_identity(path), before)
+        # Not an inode comparison: after the stale file is unlinked the kernel is
+        # free to hand the same inode number straight back, which made this fail
+        # on a loaded CI runner.  What matters is that a daemon now answers where
+        # nothing was listening before.
+        self.assertTrue(stat.S_ISSOCK(os.lstat(path).st_mode))
         self.assertTrue(client.is_running(daemon.socket_path))
         self.assertTrue(client.call("health", socket_path=daemon.socket_path)["ok"])
 
