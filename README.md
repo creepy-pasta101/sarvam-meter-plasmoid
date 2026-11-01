@@ -157,7 +157,7 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
 2. Record the balance you currently see in the Sarvam dashboard:
 
    ```
-   sarvam-meter balance set 500
+   sarvam-meter balance set 500     # optional once the dashboard source is on
    ```
 
 3. Turn the recording proxy on. In `~/.config/sarvam-meter/config.json` set
