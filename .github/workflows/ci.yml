@@ -15,11 +15,17 @@ env:
 jobs:
   test:
     name: Unit tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        # 3.9 is not published for the newest ubuntu-latest image, so the oldest
+        # supported interpreter is exercised on the previous LTS runner.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-22.04
+          - python-version: "3.12"
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -71,11 +77,15 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import xml.etree.ElementTree as ET
+
+          def local(tag):
+              return tag.rsplit("}", 1)[-1]
+
           tree = ET.parse("plasmoid/io.github.creepy_pasta101.sarvammeter/contents/config/main.xml")
           entries = {}
-          for group in tree.getroot().findall("group"):
-              for entry in group.findall("entry"):
-                  default = entry.find("default")
+          for group in [c for c in tree.getroot() if local(c.tag) == "group"]:
+              for entry in [e for e in group if local(e.tag) == "entry"]:
+                  default = next((d for d in entry if local(d.tag) == "default"), None)
                   assert default is not None, "entry %s has no <default>" % entry.get("name")
                   entries[entry.get("name")] = (default.text or "").strip()
           expected = {

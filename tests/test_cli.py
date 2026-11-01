@@ -492,6 +492,8 @@ class DoctorTest(CliTestCase):
             out,
         )
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores permission bits, so the failure cannot be reproduced")
     def test_doctor_fails_when_the_data_dir_is_unwritable(self):
         readonly = os.path.join(self.tmp, "readonly")
         os.makedirs(readonly)
