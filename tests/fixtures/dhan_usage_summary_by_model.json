@@ -1,0 +1,125 @@
+{
+  "currency": "inr",
+  "group_by": [
+    "model"
+  ],
+  "groups": [
+    {
+      "currency": "inr",
+      "event_count": 451,
+      "meter_count": 3,
+      "model": "glm5.3-flash",
+      "subtotal": "53.388129",
+      "total_cost": "53.388129",
+      "total_discount": "0",
+      "usage": [
+        {
+          "breakdown": [
+            {
+              "quantity": "11296128",
+              "unit": "cached_token"
+            },
+            {
+              "quantity": "1092904",
+              "unit": "input_token"
+            },
+            {
+              "quantity": "230969",
+              "unit": "output_token"
+            }
+          ],
+          "quantity": "12620001",
+          "unit": "token"
+        }
+      ]
+    },
+    {
+      "currency": "inr",
+      "event_count": 1,
+      "meter_count": 1,
+      "model": "saaras:v3-realtime",
+      "subtotal": "0.1551666667",
+      "total_cost": "0.1551666667",
+      "total_discount": "0",
+      "usage": [
+        {
+          "quantity": "19",
+          "unit": "second"
+        }
+      ]
+    },
+    {
+      "currency": "inr",
+      "event_count": 422,
+      "meter_count": 2,
+      "model": "saaras:v4",
+      "subtotal": "74.0498055238",
+      "total_cost": "74.0498055238",
+      "total_discount": "0",
+      "usage": [
+        {
+          "quantity": "9067.323125",
+          "unit": "second"
+        }
+      ]
+    },
+    {
+      "currency": "inr",
+      "event_count": 26,
+      "meter_count": 2,
+      "model": "sarvam-105b",
+      "subtotal": "6.63813",
+      "total_cost": "6.63813",
+      "total_discount": "0",
+      "usage": [
+        {
+          "breakdown": [
+            {
+              "quantity": "420942",
+              "unit": "input_token"
+            },
+            {
+              "quantity": "5400",
+              "unit": "output_token"
+            }
+          ],
+          "quantity": "426342",
+          "unit": "token"
+        }
+      ]
+    }
+  ],
+  "org_id": "019f37be-0185-7fcb-9063-5392bd2f4e63",
+  "range": {
+    "end": "2026-11-01T18:29:59Z",
+    "start": "2026-10-02T18:30:00Z"
+  },
+  "subtotal": "134.2312311905",
+  "total_cost": "134.2312311905",
+  "total_discount": "0",
+  "total_org_cost": "134.2312311905",
+  "usage": [
+    {
+      "breakdown": [
+        {
+          "quantity": "11296128",
+          "unit": "cached_token"
+        },
+        {
+          "quantity": "1513846",
+          "unit": "input_token"
+        },
+        {
+          "quantity": "236369",
+          "unit": "output_token"
+        }
+      ],
+      "quantity": "13046343",
+      "unit": "token"
+    },
+    {
+      "quantity": "9086.323125",
+      "unit": "second"
+    }
+  ]
+}
