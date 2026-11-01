@@ -152,10 +152,10 @@ Read [dashboard-scrape.md](dashboard-scrape.md) before you enable it.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | bool | `false` | Turn the dashboard source on. With it off, `sarvam.dashboard.configured` is `false`, `spend.source` stays `ledger`, and no request is ever made. |
+| `enabled` | bool | `true` | Scraping is the default source: it is the only way to get the real credit balance. With it off, `sarvam.dashboard.configured` is `false`, `spend.source` stays `ledger`, no request is ever made and the balance is unknown. |
 | `base_url` | string | `https://indus.sarvam.ai` | Dashboard origin. Must be `https://` with a host and **no** userinfo (no `user:pass@`). This is a remote host by design, so the loopback/SSRF guard that applies to `cliproxy.base_url` does **not** apply here. `https://dashboard.sarvam.ai` `308`-redirects to `https://indus.sarvam.ai`, so use the latter. |
 | `session_file` | string | `~/.config/sarvam-meter/session.json` | Where the captured session lives. `~` is expanded. It must be mode `0600`; `sarvam-meter doctor` checks this. |
-| `poll_seconds` | int | `300` | How often the daemon re-reads the dashboard, `>= 60`. The floor is deliberate: the dashboard sits behind bot management, and a minute-by-minute poll is exactly the traffic it exists to notice. |
+| `poll_seconds` | int | `300` | How often the daemon re-reads the dashboard, **`120`..`21600`** (every 2 minutes to every 6 hours). The floor is deliberate: the dashboard sits behind bot management, and a minute-by-minute poll is exactly the traffic it exists to notice. |
 | `product` | string | `sarvam-api-platform` | Non-empty product filter sent as the `product` query parameter on both usage endpoints. |
 
 Example — enable it, poll every five minutes, and keep the session somewhere else:
@@ -231,10 +231,10 @@ change for a reader of `GET /v1/status` (the full annotated shape is in
 
 - `sarvam.spend` gains `source`: `"dashboard"` when a dashboard snapshot is
   reachable, `"ledger"` otherwise.
-- `sarvam.balance` gains a `source` field with three possible values:
-  `"dashboard"` when the balance endpoint reported the credits left,
-  `"dashboard-derived"` when only the usage windows answered and the figure is
-  `starting - window spend`, and `"ledger"` when the local meter is all there is.
+- `sarvam.balance` gains a `source` field: `"dashboard"` when the balance endpoint
+  reported the credits left, otherwise it says where the *spend* came from
+  (`"dashboard"` or `"ledger"`). The balance is never derived from local spend any
+  more — see below.
 - `sarvam.dashboard.balance` carries the reported figure:
   `{"known", "amount", "currency", "as_of", "state", "billing_model", "unit"}`.
 
@@ -271,12 +271,13 @@ is on you do not need `sarvam-meter balance set` at all**: `balance.remaining` i
 reported figure verbatim and `balance.source` is `"dashboard"`. A reported `0.00` is a
 known, exhausted balance — the widget shows it as such rather than as "unknown".
 
-Without a reported balance but with the usage windows answering and a starting
-balance set, the arithmetic applies instead: `spent_total` is the dashboard's spend
-for the window (the date part of `balance.set_at` through today) and
-`remaining = max(0, starting - spent_total)`, with `balance.source` set to
-`"dashboard-derived"` so you can tell the two apart. Without a snapshot nothing
-changes from schema 1: the ledger numbers are reported with `source: "ledger"`.
+Without a reported balance the widget shows spend only: `known` is `false`,
+`remaining`/`starting` are `null`, and `spent_total` carries the ledger's all-time
+spend with `source: "ledger"`. **The balance is never computed from locally
+measured spend** — a proxy-side estimate disagreed with the real wallet (top-ups,
+other machines, calls that bypassed the proxy), and a wrong "left" number is worse
+than none. `sarvam-meter balance set` still records a starting balance and the
+proxy still records spend, but neither produces a `remaining` figure any more.
 `spend.today` and `spend.month` likewise come from the dashboard when it is reachable
 and from the ledger otherwise.
 

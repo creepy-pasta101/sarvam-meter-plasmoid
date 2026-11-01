@@ -107,7 +107,8 @@ class DashboardStatusTestBase(unittest.TestCase):
 
 class DashboardBlockTest(DashboardStatusTestBase):
     def test_block_is_always_present_even_when_disabled(self):
-        sarvam = self.status()["sarvam"]
+        disabled = make_config(self.tmp, dashboard={"enabled": False})
+        sarvam = self.status(config=disabled)["sarvam"]
         self.assertIn("dashboard", sarvam)
         self.assertEqual(set(sarvam["dashboard"]), DASHBOARD_KEYS)
         self.assertFalse(sarvam["dashboard"]["configured"])
@@ -190,36 +191,47 @@ class DashboardBlockTest(DashboardStatusTestBase):
 
 
 class BalanceArithmeticTest(DashboardStatusTestBase):
-    def test_dashboard_window_drives_spent_total_and_remaining(self):
+    def test_dashboard_window_is_never_turned_into_a_remaining(self):
         self.ledger.set_balance(500.0, "INR")
-        # Ledger spend is irrelevant once the dashboard is reachable.
         self.ledger.record_event(
             source="proxy", api="chat", cost=1.0, ts="2026-11-15T04:00:00Z"
         )
-        balance = self.status(snapshot(), config=self.enabled)["sarvam"]["balance"]
-        self.assertTrue(balance["known"])
-        self.assertEqual(balance["starting"], 500.0)
-        self.assertEqual(balance["spent_total"], 134.23)
-        self.assertEqual(balance["remaining"], 365.77)
-        self.assertEqual(balance["source"], "dashboard-derived")
-        self.assertIsNotNone(balance["set_at"])
+        sarvam = self.status(snapshot(), config=self.enabled)["sarvam"]
+        # The window total is reported where it belongs: in the dashboard block.
+        self.assertEqual(sarvam["dashboard"]["spend"]["window"], 134.23)
+        balance = sarvam["balance"]
+        # `balance.spent_total` stays the ledger's all-time figure, and
+        # 500 - 134.23 = 365.77 is *not* reported: only the figure Sarvam itself
+        # reports may become a balance.
+        self.assertEqual(balance["spent_total"], 1.0)
+        self.assertFalse(balance["known"])
+        self.assertIsNone(balance["remaining"])
+        self.assertIsNone(balance["starting"])
+        self.assertIsNone(balance["set_at"])
+        self.assertEqual(balance["source"], "dashboard")
 
-    def test_remaining_never_goes_negative(self):
+    def test_a_starting_balance_is_never_spent_down_locally(self):
+        # A window larger than the starting balance used to clamp at 0.0; now
+        # nothing is subtracted at all, so there is nothing to clamp.
         self.ledger.set_balance(100.0, "INR")
-        balance = self.status(snapshot(window=134.2312311905), config=self.enabled)[
+        sarvam = self.status(snapshot(window=134.2312311905), config=self.enabled)[
             "sarvam"
-        ]["balance"]
-        self.assertEqual(balance["spent_total"], 134.23)
-        self.assertEqual(balance["remaining"], 0.0)
+        ]
+        self.assertEqual(sarvam["dashboard"]["spend"]["window"], 134.23)
+        self.assertFalse(sarvam["balance"]["known"])
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertIsNone(sarvam["balance"]["starting"])
 
-    def test_ledger_behaviour_is_unchanged_without_a_snapshot(self):
+    def test_ledger_only_install_reports_an_unknown_balance_and_its_spend(self):
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
             source="proxy", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
         )
         balance = self.status(config=self.enabled)["sarvam"]["balance"]
         self.assertEqual(balance["spent_total"], 12.35)
-        self.assertEqual(balance["remaining"], 487.65)
+        self.assertFalse(balance["known"])
+        self.assertIsNone(balance["remaining"])
+        self.assertIsNone(balance["starting"])
         self.assertEqual(balance["source"], "ledger")
 
     def test_reported_balance_needs_no_starting_balance(self):
@@ -243,13 +255,14 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
             sarvam["dashboard"]["balance"]["as_of"], "2026-11-01T05:55:39.713767Z"
         )
 
-    def test_reported_balance_wins_over_the_derived_one(self):
+    def test_reported_balance_wins_over_the_ledger_figures(self):
         self.ledger.set_balance(500.0, "INR")
         reported = {"known": True, "amount": 80.03533, "currency": "INR"}
         balance = self.status(snapshot(balance=reported), config=self.enabled)[
             "sarvam"
         ]["balance"]
-        # 500 - 134.23 would be 365.77; the reported number wins
+        # 500 - 134.23 would be 365.77, and the wallet is neither: Sarvam's own
+        # number is the balance, verbatim.
         self.assertEqual(balance["remaining"], 80.04)
         self.assertEqual(balance["starting"], 500.0)
         self.assertEqual(balance["spent_total"], 134.23)
@@ -274,6 +287,18 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
         # spend is still ledger-sourced, because the windows did not answer
         self.assertEqual(sarvam["spend"]["source"], "ledger")
 
+    def test_a_reported_balance_above_the_starting_balance_is_not_clamped(self):
+        # A top-up (or a balance set too low) is reported as it is: nothing is
+        # clamped, because nothing is computed.
+        self.ledger.set_balance(100.0, "INR")
+        reported = {"known": True, "amount": 134.2312311905, "currency": "INR"}
+        balance = self.status(snapshot(balance=reported), config=self.enabled)[
+            "sarvam"
+        ]["balance"]
+        self.assertTrue(balance["known"])
+        self.assertEqual(balance["remaining"], 134.23)
+        self.assertEqual(balance["starting"], 100.0)
+
     def test_an_exhausted_reported_balance_is_known_not_unknown(self):
         reported = {"known": True, "amount": 0.0, "currency": "INR"}
         balance = self.status(snapshot(balance=reported), config=self.enabled)[
@@ -282,7 +307,7 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
         self.assertTrue(balance["known"])
         self.assertEqual(balance["remaining"], 0.0)
 
-    def test_unreachable_snapshot_falls_back_to_the_ledger(self):
+    def test_unreachable_snapshot_falls_back_to_the_ledger_spend(self):
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
             source="proxy", api="chat", cost=12.345, ts="2026-11-15T04:00:00Z"
@@ -298,7 +323,10 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
         )
         sarvam = payload["sarvam"]
         self.assertEqual(sarvam["balance"]["spent_total"], 12.35)
-        self.assertEqual(sarvam["balance"]["remaining"], 487.65)
+        # The ledger's own spend is still shown; a "left" figure is not invented.
+        self.assertFalse(sarvam["balance"]["known"])
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertIsNone(sarvam["balance"]["starting"])
         self.assertEqual(sarvam["balance"]["source"], "ledger")
         self.assertEqual(sarvam["spend"]["source"], "ledger")
 
@@ -318,8 +346,16 @@ class BalanceArithmeticTest(DashboardStatusTestBase):
     def test_set_at_is_preserved_from_the_ledger(self):
         self.ledger.set_balance(500.0, "INR")
         ledger_set_at = self.ledger.get_balance()["set_at"]
-        balance = self.status(snapshot(), config=self.enabled)["sarvam"]["balance"]
+        reported = {"known": True, "amount": 365.77, "currency": "INR"}
+        balance = self.status(snapshot(balance=reported), config=self.enabled)[
+            "sarvam"
+        ]["balance"]
         self.assertEqual(balance["set_at"], ledger_set_at)
+
+    def test_set_at_is_dropped_when_no_balance_is_known(self):
+        self.ledger.set_balance(500.0, "INR")
+        balance = self.status(snapshot(), config=self.enabled)["sarvam"]["balance"]
+        self.assertIsNone(balance["set_at"])
 
 
 class SpendSourceTest(DashboardStatusTestBase):

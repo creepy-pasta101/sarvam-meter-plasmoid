@@ -9,6 +9,7 @@
 
 import QtQuick
 import QtQuick.Layouts
+import org.kde.plasma.plasmoid
 import org.kde.plasma.components as PlasmaComponents3
 import org.kde.kirigami as Kirigami
 
@@ -27,6 +28,23 @@ Item {
     // implicitWidth/implicitHeight are what the panel actually uses.
     implicitWidth: row.implicitWidth
     implicitHeight: Math.max(Kirigami.Units.iconSizes.small, row.implicitHeight)
+
+    // Opening the popup is the compact representation's job, not Plasma's: the
+    // panel item only forwards the gesture.  Every stock applet wires this up
+    // itself, and without it a click does nothing at all.
+    function toggleExpanded() {
+        if (typeof Plasmoid !== "undefined" && Plasmoid)
+            Plasmoid.expanded = !Plasmoid.expanded;
+    }
+
+    MouseArea {
+        objectName: "compactClickArea"
+        anchors.fill: parent
+        // Left button only: the context menu and middle-click still reach the
+        // panel, which is what a user expects from any other applet.
+        acceptedButtons: Qt.LeftButton
+        onClicked: compactRoot.toggleExpanded()
+    }
 
     RowLayout {
         id: row

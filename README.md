@@ -79,6 +79,9 @@ when it does not, the label reads `local meter` and nothing else changes.
 - A popup built like Plasma's own applets (`PlasmaExtras.Representation` + a
   `PlasmoidHeading` header), with a refresh button that makes the daemon
   re-poll its sources and a spinner while it does.
+- The widget's settings page configures the **daemon** too — dashboard on/off, the
+  dashboard poll interval (2 minutes to 6 hours), CLIProxyAPI on/off and its base
+  URL — over `POST /v1/config`, without editing a file by hand.
 - Plasma 6.7 and 6.8 compatible QML, compact and full representations.
 - Python standard library only, no runtime dependencies; Python 3.9+.
 - Loopback-only binds, secret redaction, and an SSRF guard on remote URLs.
@@ -157,18 +160,26 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    sarvam-meter init
    ```
 
-2. Record the balance you currently see in the Sarvam dashboard:
+2. Capture your dashboard session once, so the widget can show the real credit
+   balance (scraping is the default source):
 
    ```
-   sarvam-meter balance set 500     # optional once the dashboard source is on
+   sarvam-meter session set --cookie-file ~/.cache/sarvam-cookie.txt
    ```
 
-3. Turn the recording proxy on. In `~/.config/sarvam-meter/config.json` set
-   `"proxy": { "enabled": true }`, then start both servers:
+   A starting balance is no longer needed for that: the widget reports the figure
+   Sarvam reports. `sarvam-meter balance set <amount>` still exists but only feeds
+   the "spend only" presentation.
+
+3. Start the daemon:
 
    ```
-   sarvam-meter serve --with-proxy
+   sarvam-meter serve
    ```
+
+   The recording proxy is optional and off by default. If you want locally
+   measured spend as well, set `"proxy": { "enabled": true }` and run
+   `sarvam-meter serve --with-proxy` instead.
 
    (`systemctl --user start sarvam-meter` does the same via the packaged unit,
    which runs `sarvam-meter serve --with-proxy`.)

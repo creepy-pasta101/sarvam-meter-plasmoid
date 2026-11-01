@@ -138,20 +138,73 @@ class ShapeTest(StatusTestBase):
         self.assertFalse(payload["sarvam"]["configured"])
 
 
+def dashboard_snapshot(balance=None, reachable=True, window=134.2312311905, today=12.3):
+    """The dict ``DashboardClient.snapshot()`` would hand to ``build_status``."""
+    return {
+        "configured": True,
+        "reachable": reachable,
+        "as_of": "2026-11-15T04:30:00Z",
+        "org_id": "019f37be-0000-7000-8000-000000000000",
+        "currency": "INR",
+        "window": {"start": "2026-10-20", "end": "2026-11-15"},
+        "spend": {"window": window, "today": today},
+        "by_model": [],
+        "usage": [],
+        "balance": balance
+        if balance is not None
+        else {
+            "known": False,
+            "amount": None,
+            "currency": "INR",
+            "as_of": None,
+            "state": "",
+            "billing_model": "",
+            "unit": "",
+        },
+        "error": None,
+    }
+
+
 class BalanceTest(StatusTestBase):
-    def test_known_balance_rounds_to_two_dp(self):
+    def test_reported_balance_rounds_to_two_dp(self):
+        # The only balance there is: the figure Sarvam itself reports.
         self.ledger.set_balance(500.0, "INR")
         self.ledger.record_event(
             source="proxy", api="chat", quantity=1000.0, unit="tokens",
             cost=12.345, ts="2026-11-15T05:00:00Z",
         )
-        balance = self.status()["sarvam"]["balance"]
+        payload = build_status(
+            self.config,
+            self.ledger,
+            None,
+            NOW,
+            dashboard_snapshot=dashboard_snapshot(
+                balance={"known": True, "amount": 487.654, "currency": "INR"}
+            ),
+        )
+        balance = payload["sarvam"]["balance"]
         self.assertTrue(balance["known"])
-        self.assertEqual(balance["starting"], 500.0)
-        self.assertEqual(balance["spent_total"], 12.35)
         self.assertEqual(balance["remaining"], 487.65)
+        self.assertEqual(balance["starting"], 500.0)
+        self.assertEqual(balance["spent_total"], 134.23)
+        self.assertEqual(balance["source"], "dashboard")
         self.assertIsNotNone(balance["set_at"])
         self.assertTrue(balance["set_at"].endswith("Z"))
+
+    def test_a_starting_balance_alone_leaves_the_balance_unknown(self):
+        # `balance set` records where the ledger started; it is never turned into
+        # a "left" figure, because only Sarvam knows the wallet.
+        self.ledger.set_balance(500.0, "INR")
+        self.ledger.record_event(
+            source="proxy", api="chat", cost=12.345, ts="2026-11-15T05:00:00Z"
+        )
+        balance = self.status()["sarvam"]["balance"]
+        self.assertFalse(balance["known"])
+        self.assertIsNone(balance["remaining"])
+        self.assertIsNone(balance["starting"])
+        self.assertIsNone(balance["set_at"])
+        self.assertEqual(balance["spent_total"], 12.35)
+        self.assertEqual(balance["source"], "ledger")
 
     def test_unknown_balance_when_no_starting_balance(self):
         self.ledger.record_event(
@@ -165,7 +218,7 @@ class BalanceTest(StatusTestBase):
         self.assertIsNone(balance["set_at"])
         self.assertEqual(balance["spent_total"], 3.0)
 
-    def test_spent_total_covers_all_time(self):
+    def test_spent_total_covers_all_time_without_deriving_a_remaining(self):
         for ts, cost in (
             ("2026-11-15T05:00:00Z", 1.0),
             ("2026-11-05T05:00:00Z", 2.0),
@@ -175,7 +228,9 @@ class BalanceTest(StatusTestBase):
         self.ledger.set_balance(100.0)
         balance = self.status()["sarvam"]["balance"]
         self.assertEqual(balance["spent_total"], 7.0)
-        self.assertEqual(balance["remaining"], 93.0)
+        # 100 - 7 is deliberately *not* reported: the balance stays unknown.
+        self.assertFalse(balance["known"])
+        self.assertIsNone(balance["remaining"])
 
 
 class SpendWindowTest(StatusTestBase):

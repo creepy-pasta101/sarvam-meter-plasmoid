@@ -390,6 +390,9 @@ class ChainTestCase(unittest.TestCase):
         """Write a config document, load it, then apply ephemeral ports."""
         document = config_mod.default_config_dict()
         document["db_path"] = self.db_path
+        # The dashboard is on by default; keep its session file inside the
+        # throwaway directory so no test ever polls the real dashboard.
+        document["dashboard"]["session_file"] = os.path.join(self.tmp, "session.json")
         document["proxy"]["enabled"] = True
         document["proxy"]["upstream_base"] = self.upstream.base_url
         document["proxy"]["port"] = free_port()
@@ -498,7 +501,9 @@ class ChainTestCase(unittest.TestCase):
 
 
 class ChainTest(ChainTestCase):
-    def test_spend_calls_by_api_and_balance_reflect_proxied_calls(self):
+    def test_spend_calls_and_by_api_reflect_proxied_calls_and_no_balance_is_claimed(
+        self,
+    ):
         self.ledger.set_balance(500.0, "INR")
 
         chat_status, _headers, chat_body = self.chat()
@@ -554,14 +559,14 @@ class ChainTest(ChainTestCase):
         self.assertEqual(
             {entry["api"] for entry in sarvam["by_api"]}, {"chat", "stt", "tts"}
         )
-        self.assertIs(sarvam["balance"]["known"], True)
-        self.assertEqual(sarvam["balance"]["starting"], 500.0)
+        # The proxied calls are all in the balance block's spend total ...
         self.assertEqual(sarvam["balance"]["spent_total"], 1.55)
-        self.assertEqual(
-            sarvam["balance"]["remaining"],
-            round(500.0 - sarvam["balance"]["spent_total"], 2),
-        )
-        self.assertEqual(sarvam["balance"]["remaining"], 498.45)
+        # ... but the balance itself is unknown: nothing was reported by the
+        # dashboard, so 500 - 1.55 = 498.45 is deliberately not claimed.
+        self.assertIs(sarvam["balance"]["known"], False)
+        self.assertIsNone(sarvam["balance"]["remaining"])
+        self.assertIsNone(sarvam["balance"]["starting"])
+        self.assertEqual(sarvam["balance"]["source"], "ledger")
         self.assertEqual(sarvam["untracked_calls"], {"today": 0, "total": 0})
         self.assertIs(sarvam["quota_exhausted"], False)
         self.assertEqual(payload["errors"], [])

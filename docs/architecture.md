@@ -45,7 +45,7 @@ client --> proxy:8788 --> api.sarvam.ai
 | `sarvam_meter/cliproxy.py` | CLIProxyAPI management-API adapter: `CliproxyClient`, `normalize_account`, `normalize_quota`, `worst_fraction`, `CliproxyError`. See [cliproxyapi.md](cliproxyapi.md). |
 | `sarvam_meter/dashboard.py` | Sarvam dashboard adapter: `DashboardClient` (injectable transport, session from a `0600` file), `load_session`, `parse_summary`, `parse_timeseries`, `DashboardError`, and a `snapshot()` that never raises. See [dashboard-scrape.md](dashboard-scrape.md) and §4a below. |
 | `sarvam_meter/status.py` | `build_status(config, ledger, cliproxy_snapshot=None, dashboard_snapshot=None, now=None)` — assembles the widget contract. Never raises. |
-| `sarvam_meter/daemon.py` | `ThreadingHTTPServer` on `daemon.host:daemon.port` serving `/v1/status`, `/v1/health`, `/v1/refresh`, `/v1/config`; owns the background CLIProxyAPI refresh thread and its lock, and the dashboard snapshot's TTL cache. |
+| `sarvam_meter/daemon.py` | `ThreadingHTTPServer` on `daemon.host:daemon.port` serving `/v1/status`, `/v1/health`, `/v1/refresh`, `/v1/config` (GET and POST); owns the background CLIProxyAPI refresh thread and its lock, and the dashboard snapshot's TTL cache. |
 | `sarvam_meter/cli.py` | `argparse` front end (`init`, `serve`, `status`, `balance set/show`, `record`, `proxy`, `doctor`, `session set/show`, `dashboard`), exit codes 0/1/2, and the human-readable `status` output. |
 | `sarvam_meter/__main__.py` | `python3 -m sarvam_meter` shim into `cli.main()`. |
 
@@ -473,9 +473,14 @@ message and exit code 1.
   `authorization` or `x-management-key` is replaced with `***` before it can
   reach a log line. The proxy stores no header values at all: `meta` may contain
   only the api name, model, path and status.
-- **`/v1/config` is sanitised and read-only.** It returns the config with key
-  material blanked (`""`/`"***"`), and the daemon rejects mutating methods with
-  `405`.
+- **`/v1/config` is sanitised, and writable only through a whitelist.** `GET`
+  returns the config with key material blanked (`""`/`"***"`). `POST` accepts a
+  fixed subset of keys (`dashboard.enabled/base_url/poll_seconds/session_file`,
+  `cliproxy.enabled/base_url/api_version`, `proxy.enabled`,
+  `daemon.refresh_seconds`), validates them with the same rules `load_config`
+  uses, writes the file atomically at `0600` and reloads; anything else — notably
+  `cliproxy.management_key` — is rejected whole with a `400` that names the key
+  and leaves the file byte-identical. `PUT`/`PATCH`/`DELETE` are still `405`.
 - **The CLIProxyAPI transport does not follow redirects** and keeps TLS
   verification on, so a compromised management endpoint cannot bounce the
   management key to a third party.

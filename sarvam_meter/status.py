@@ -429,27 +429,11 @@ def _sarvam_block(
             "set_at": set_at if isinstance(set_at, str) else None,
             "source": "dashboard",
         }
-    elif starting_raw is not None:
-        if dashboard_reachable:
-            # No reported balance, but the dashboard is authoritative for the
-            # window that started when the starting balance was set.
-            dashboard_spend = dashboard_block.get("spend") or {}
-            measured = _as_float(dashboard_spend.get("window")) or 0.0
-            remaining = max(0.0, starting_raw - measured)
-            balance_source = "dashboard-derived"
-        else:
-            measured = spend_total
-            remaining = starting_raw - measured
-            balance_source = source
-        balance_block = {
-            "known": True,
-            "remaining": money(remaining),
-            "starting": money(starting_raw),
-            "spent_total": money(measured),
-            "set_at": set_at if isinstance(set_at, str) else None,
-            "source": balance_source,
-        }
     else:
+        # The balance is *only* ever the figure Sarvam reports.  It is never
+        # derived from locally measured spend any more: a proxy-side estimate
+        # silently disagreed with the real wallet (top-ups, other machines,
+        # non-proxied calls), and a wrong "left" number is worse than none.
         balance_block = {
             "known": False,
             "remaining": None,

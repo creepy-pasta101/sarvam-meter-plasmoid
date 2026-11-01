@@ -880,6 +880,10 @@ request is made (`bad_request`, no transport call).
 }
 ```
 
+`enabled` defaults to `true`: scraping is the default source, because it is the
+only one that reports the real credit balance. `poll_seconds` is bounded to
+`120..21600` (every 2 minutes to every 6 hours).
+
 Validation: `base_url` must be `https://` with a host and **no** userinfo (this is
 a remote host by design, so the loopback guard does **not** apply). A plain
 `http://` URL is accepted for a **loopback** host only, so the source can be
@@ -910,17 +914,48 @@ Rules:
 
 - `spend.source` is `"dashboard"` when the dashboard snapshot is reachable, else
   `"ledger"`.
-- `balance.source` is `"dashboard"` when the balance endpoint reported a number
-  (**no starting balance is needed**), `"dashboard-derived"` when only the usage
-  windows answered (`remaining = max(0, starting - dashboard.spend.window)`, window
-  start = the date part of `balance.set_at`), and `"ledger"` otherwise.
-- `balance.remaining` is the reported figure verbatim when it is known; a reported
-  `0.0` is a known, exhausted balance, not an unknown one.
-- Without a dashboard snapshot: the existing ledger behaviour, `source = "ledger"`.
+- `balance.source` is `"dashboard"` when the balance endpoint reported a number,
+  otherwise it describes where the *spend* came from (`"dashboard"` or `"ledger"`).
+  The value `"dashboard-derived"` no longer exists.
+- `balance.remaining` is **only ever** the figure Sarvam reports. It is never
+  derived from locally measured spend: a proxy-side estimate silently disagreed
+  with the real wallet (top-ups, other machines, calls that bypassed the proxy),
+  and a wrong "left" number is worse than none. `sarvam-meter balance set` still
+  records a starting balance and the ledger still records spend, but neither
+  affects `remaining`.
+- Without a reported balance: `known: false`, `remaining`/`starting`/`set_at` are
+  `null`, and `spent_total` carries the ledger's all-time spend.
 - `spend.today` and `spend.month` come from the dashboard when reachable, else
   from the ledger.
 - `sarvam.dashboard` is always present; `configured: false` when disabled.
 - `build_status` gains the keyword argument `dashboard_snapshot=None`.
+
+## 17.6a Writing the backend settings from the widget
+
+`POST /v1/config` lets the plasmoid's settings page change the daemon's own
+configuration without hand-editing a file. The body is a JSON object holding any
+subset of:
+
+```
+dashboard.{enabled, base_url, poll_seconds, session_file}
+cliproxy.{enabled, base_url, api_version}
+proxy.{enabled}
+daemon.{refresh_seconds}
+```
+
+Anything else — an unknown section, an unknown key, `cliproxy.management_key`,
+`sarvam.starting_balance` — is rejected whole with `400` and
+`{"error": {"message": "<section>.<key> is not writable", "code": "invalid_config"}}`.
+Values are validated by the same rules `load_config` applies; a rejected request
+leaves the file byte-identical. On success the file is written atomically at
+`0600`, the daemon reloads its in-memory config, drops the cached dashboard
+snapshot, and returns the same sanitised document `GET /v1/config` returns.
+`PUT`/`PATCH`/`DELETE` stay `405`.
+
+The settings page keeps two stores apart: the five widget settings stay in
+KConfigXT (`cfg_*`), the backend settings go only through this endpoint. Applying
+the dialog never writes daemon settings, and the Save button never writes widget
+settings.
 
 ## 17.6 CLI and daemon
 

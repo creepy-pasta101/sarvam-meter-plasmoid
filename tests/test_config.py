@@ -51,7 +51,7 @@ EXPECTED_DEFAULT = {
         "allow_remote": False,
     },
     "dashboard": {
-        "enabled": False,
+        "enabled": True,
         "base_url": "https://indus.sarvam.ai",
         "session_file": "~/.config/sarvam-meter/session.json",
         "poll_seconds": 300,
@@ -160,7 +160,8 @@ class WriteDefaultConfigTests(ConfigTestBase):
         self.assertEqual(config.sarvam.currency, "INR")
         self.assertIsNone(config.sarvam.starting_balance)
         self.assertEqual(config.cliproxy.api_version, "v8")
-        self.assertFalse(config.dashboard.enabled)
+        # Scraping is the default source: a fresh config has the dashboard on.
+        self.assertTrue(config.dashboard.enabled)
         self.assertEqual(config.dashboard.base_url, "https://indus.sarvam.ai")
         self.assertEqual(config.dashboard.poll_seconds, 300)
         self.assertEqual(config.dashboard.product, "sarvam-api-platform")
@@ -370,7 +371,8 @@ class DashboardSectionTests(ConfigTestBase):
 
     def test_defaults(self):
         dashboard = self.load_document({}).dashboard
-        self.assertFalse(dashboard.enabled)
+        # The dashboard is the default source, not an opt-in extra.
+        self.assertTrue(dashboard.enabled)
         self.assertEqual(dashboard.base_url, "https://indus.sarvam.ai")
         self.assertEqual(dashboard.poll_seconds, 300)
         self.assertEqual(dashboard.product, "sarvam-api-platform")
@@ -412,13 +414,28 @@ class DashboardSectionTests(ConfigTestBase):
             "https://127.0.0.1:9443",
         )
 
-    def test_poll_seconds_minimum(self):
-        self.assert_config_error({"dashboard": {"poll_seconds": 59}}, "dashboard.poll_seconds")
+    def test_poll_seconds_bounds(self):
+        # Bounded to 120..21600 seconds: the floor keeps the poll bot-management
+        # friendly, the ceiling keeps a slow setting from looking broken.
+        for too_small in (0, 59, 119):
+            self.assert_config_error(
+                {"dashboard": {"poll_seconds": too_small}}, "dashboard.poll_seconds"
+            )
+        for too_large in (21601, 86400):
+            self.assert_config_error(
+                {"dashboard": {"poll_seconds": too_large}}, "dashboard.poll_seconds"
+            )
         self.assertEqual(
             self.load_document(
-                {"dashboard": {"poll_seconds": 60}}
+                {"dashboard": {"poll_seconds": 120}}
             ).dashboard.poll_seconds,
-            60,
+            120,
+        )
+        self.assertEqual(
+            self.load_document(
+                {"dashboard": {"poll_seconds": 21600}}
+            ).dashboard.poll_seconds,
+            21600,
         )
         self.assert_config_error({"dashboard": {"poll_seconds": "300"}}, "dashboard.poll_seconds")
 
@@ -466,7 +483,7 @@ class PackagedExampleTests(unittest.TestCase):
 
     def test_example_loads_as_a_valid_config(self):
         config = load_config(self.path)
-        self.assertFalse(config.dashboard.enabled)
+        self.assertTrue(config.dashboard.enabled)
         self.assertEqual(config.dashboard.base_url, "https://indus.sarvam.ai")
 
 
