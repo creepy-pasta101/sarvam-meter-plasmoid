@@ -161,7 +161,11 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    ```
 
 2. Capture your dashboard session once, so the widget can show the real credit
-   balance (scraping is the default source):
+   balance (scraping is the default source). The easiest way is in the widget:
+   **right-click the panel item > Configure Sarvam Meter > Capture session…**,
+   which opens the Sarvam sign-in page in a webview and hands the cookies to the
+   daemon (needs `qt6-qtwebengine`; without it the page tells you and falls back).
+   From a terminal, the same thing is:
 
    ```
    sarvam-meter session set --cookie-file ~/.cache/sarvam-cookie.txt
@@ -171,11 +175,23 @@ it by hand, install the package (`python3 -m pip install .`, which provides the
    Sarvam reports. `sarvam-meter balance set <amount>` still exists but only feeds
    the "spend only" presentation.
 
-3. Start the daemon:
+3. Start the daemon — by hand, or as a systemd user service:
 
    ```
    sarvam-meter serve
    ```
+
+   The RPM ships a user unit, so a packaged install is:
+
+   ```
+   systemctl --user daemon-reload
+   systemctl --user enable --now sarvam-meter.service
+   journalctl --user -u sarvam-meter.service -f
+   ```
+
+   (`loginctl enable-linger "$USER"` keeps it running while you are logged out.)
+   The unit runs `sarvam-meter serve`; whether the recording proxy also starts is
+   decided by `proxy.enabled` in the config, not by the unit.
 
    The recording proxy is optional and off by default. If you want locally
    measured spend as well, set `"proxy": { "enabled": true }` and run

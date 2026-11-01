@@ -32,6 +32,11 @@ BuildArch:      noarch
 
 Requires:       python3 >= 3.9
 Requires:       plasma-workspace >= 6.0
+Requires:       systemd
+# Optional: the settings page can sign in to the Sarvam dashboard in a webview.
+# Without it the page falls back to the CLI, which is why this is not a hard
+# dependency.
+Recommends:     qt6-qtwebengine
 %{?systemd_requires}
 
 # --- Minimal build-host fallbacks -------------------------------------------
@@ -96,6 +101,17 @@ python3 -m unittest discover -s tests -v
 
 %post
 %systemd_user_post %{name}.service
+# A user unit is never enabled by a package: it would start a daemon for every
+# account on the machine.  Say exactly what to run instead.
+cat <<'EOM'
+sarvam-meter: the daemon ships as a systemd user unit. To start it for yourself:
+  systemctl --user daemon-reload
+  systemctl --user enable --now sarvam-meter.service
+  journalctl --user -u sarvam-meter.service -f
+To keep it running while logged out: loginctl enable-linger "$USER"
+Then capture a dashboard session (Settings > Configure Sarvam Meter, or
+  sarvam-meter session set --cookie-file PATH) so the balance can be shown.
+EOM
 
 %postun
 %systemd_user_postun %{name}.service

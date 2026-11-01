@@ -11,13 +11,27 @@ GET          /v1/health      ``{"ok": true, "version": ..., "uptime_seconds": N}
 POST         /v1/refresh     force a cliproxy *and* dashboard re-poll
 GET          /v1/config      sanitised config, secrets redacted
 POST         /v1/config      rewrite the *writable* subset of the config
+GET          /v1/session     whether a dashboard session is stored (names only)
+POST         /v1/session     store a captured dashboard ``Cookie``/``Authorization``
 anything     anything else   ``404`` ``not_found`` / ``405`` ``method_not_allowed``
 ===========  ==============  ==============================================
 
-``POST /v1/config`` is the one mutating route: it is what the plasmoid's
-settings page calls.  Only the keys listed in :data:`WRITABLE_SECTIONS` may be
+The two mutating routes are ``POST /v1/config`` -- what the plasmoid's settings
+page calls -- and ``POST /v1/session`` -- what the plasmoid's sign-in webview
+calls once the user has signed in to the Sarvam dashboard.
+
+``POST /v1/config``: only the keys listed in :data:`WRITABLE_SECTIONS` may be
 changed, values are validated by the same rules :func:`config.load_config`
 uses, and the file is replaced atomically at mode ``0600``.
+
+``POST /v1/session``: the body carries the raw ``Cookie`` and/or
+``Authorization`` header value the webview captured.  Both are bounded
+(:data:`SESSION_FIELD_LIMITS`), rejected if they could inject a header
+(CR/LF/NUL), and written to ``dashboard.session_file`` atomically at mode
+``0600`` under the canonical key names :func:`dashboard.load_session` reads
+(``{"Cookie": ..., "Authorization": ...}``).  A stored value is never echoed
+back, never logged and never appears in an error message: ``GET /v1/session``
+reports only the header *names*, the path and the file mode.
 
 Both source snapshots (CLIProxyAPI and the Sarvam dashboard) are refreshed on
 background threads behind locks; a slow or unreachable source never delays
@@ -31,6 +45,7 @@ import copy
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -58,6 +73,7 @@ STATUS_PATH = "/v1/status"
 HEALTH_PATH = "/v1/health"
 REFRESH_PATH = "/v1/refresh"
 CONFIG_PATH = "/v1/config"
+SESSION_PATH = "/v1/session"
 
 #: path -> the methods it accepts
 ROUTES = {
@@ -65,6 +81,7 @@ ROUTES = {
     HEALTH_PATH: ("GET",),
     REFRESH_PATH: ("POST",),
     CONFIG_PATH: ("GET", "POST"),
+    SESSION_PATH: ("GET", "POST"),
 }
 
 #: Sections and keys ``POST /v1/config`` may change.  Everything else in the
@@ -87,6 +104,30 @@ CONTENT_TYPE = "application/json; charset=utf-8"
 MAX_DRAIN_BYTES = 1 * 1024 * 1024
 #: Upper bound on a ``POST /v1/config`` body (a settings document is tiny).
 MAX_CONFIG_BODY_BYTES = 64 * 1024
+#: Upper bound on a ``POST /v1/session`` body (16 KiB cookie + 8 KiB bearer).
+MAX_SESSION_BODY_BYTES = 64 * 1024
+
+#: The only keys ``POST /v1/session`` accepts, and how long each value may be.
+SESSION_FIELD_LIMITS: Dict[str, int] = {
+    "cookie": 16 * 1024,
+    "authorization": 8 * 1024,
+}
+#: Canonical order (and spelling) of the header names a session file holds.
+#: Mirrors ``dashboard.SESSION_HEADERS``; the *file* keys are capitalised, the
+#: keys of a request body and of ``load_session()`` are lower case.
+SESSION_HEADER_NAMES: Tuple[str, ...] = ("cookie", "authorization")
+#: request-body key -> the key the session file (and ``load_session``) uses.
+SESSION_FILE_KEYS: Dict[str, str] = {
+    "cookie": "Cookie",
+    "authorization": "Authorization",
+}
+#: Mode the session file is written with, as reported by both routes.
+SESSION_FILE_MODE = "0600"
+#: Reported mode when there is no session file (no permissions exist to report).
+SESSION_NO_FILE_MODE = "0000"
+#: Characters that would let a captured value inject a header or truncate a
+#: value; a request carrying one is rejected before anything is written.
+SESSION_FORBIDDEN_CHARS = "\r\n\x00"
 
 _SECRET_KEYS = frozenset(
     [
@@ -134,6 +175,25 @@ class ConfigUpdateError(Exception):
 def _invalid_config(message: str) -> dict:
     """The ``400`` body shape for a rejected config update."""
     return {"error": {"message": message, "code": "invalid_config"}}
+
+
+class SessionUpdateError(Exception):
+    """A ``POST /v1/session`` request was rejected and **nothing** was written.
+
+    The message names the offending *field* (``cookie``/``authorization``) or
+    the path -- never a value, not even a prefix of one.
+    """
+
+    code = "invalid_session"
+
+    def __init__(self, message: str, code: str = "invalid_session") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _invalid_session(message: str) -> dict:
+    """The ``400`` body shape for a rejected session capture."""
+    return {"error": {"message": message, "code": "invalid_session"}}
 
 
 def resolve_config_path(path: Optional[str] = None) -> str:
@@ -308,6 +368,179 @@ def write_config_atomic(path: str, document: dict) -> None:
         except OSError:  # pragma: no cover
             pass
         raise
+
+
+# --------------------------------------------------------------------------
+# the dashboard session (GET/POST /v1/session)
+# --------------------------------------------------------------------------
+
+
+def decode_session_request(request: Any) -> dict:
+    """Decode a request body (``dict``, ``bytes`` or ``str``) to a dict.
+
+    Every failure message is fixed: the body is never echoed back, so a value
+    the caller sent can never bounce out of an error response.
+    """
+    if isinstance(request, dict):
+        return request
+    if isinstance(request, (bytes, bytearray)):
+        try:
+            request = bytes(request).decode("utf-8")
+        except UnicodeDecodeError:
+            raise SessionUpdateError(
+                "request body must be UTF-8 encoded JSON"
+            ) from None
+    if isinstance(request, str):
+        if not request.strip():
+            raise SessionUpdateError("request body must be a JSON object")
+        try:
+            request = json.loads(request)
+        except ValueError:
+            raise SessionUpdateError("request body is not valid JSON") from None
+    if not isinstance(request, dict):
+        raise SessionUpdateError("request body must be a JSON object")
+    return request
+
+
+def check_session_request(request: Any) -> Dict[str, str]:
+    """Validate a session capture and return ``{lower-name: value}``.
+
+    Only ``cookie`` and ``authorization`` may appear; any other key rejects the
+    whole request (nothing is ever stored partially).  Each value is bounded by
+    :data:`SESSION_FIELD_LIMITS`, must be a string, must not contain CR, LF or
+    NUL, and is stripped the way :func:`dashboard.load_session` strips it, so
+    what is written is exactly what the poller will send.  An empty value counts
+    as *not supplied*; at least one header must remain.
+
+    Raises :class:`SessionUpdateError`; no message ever carries a value.
+    """
+    document = decode_session_request(request)
+    for key in sorted(document, key=lambda item: str(item)):
+        if not isinstance(key, str) or key not in SESSION_FIELD_LIMITS:
+            raise SessionUpdateError("%s is not a session field" % (key,))
+
+    session: Dict[str, str] = {}
+    for name in SESSION_HEADER_NAMES:
+        if name not in document:
+            continue
+        value = document[name]
+        if not isinstance(value, str):
+            raise SessionUpdateError("%s: must be a string" % (name,))
+        for char in SESSION_FORBIDDEN_CHARS:
+            if char in value:
+                raise SessionUpdateError(
+                    "%s: must not contain CR, LF or NUL" % (name,)
+                )
+        limit = SESSION_FIELD_LIMITS[name]
+        if len(value.encode("utf-8")) > limit:
+            raise SessionUpdateError("%s: must be at most %d bytes" % (name, limit))
+        stripped = value.strip()
+        if stripped:
+            session[name] = stripped
+
+    if not session:
+        raise SessionUpdateError(
+            "at least one of cookie or authorization is required"
+        )
+    return session
+
+
+def write_session_atomic(path: str, session: Dict[str, str]) -> None:
+    """Write a captured *session* to *path* atomically, with mode ``0600``.
+
+    The document uses the canonical key names :func:`dashboard.load_session`
+    reads (``{"Cookie": ..., "Authorization": ...}``) and omits a header that
+    was not supplied.  The temporary file lives in the target's own directory so
+    the final step is a rename, is chmodded to ``0600`` before a single byte is
+    written, and is fsynced before the rename; the parent directory is created
+    at ``0700`` when missing.  A crash mid-write therefore leaves either the old
+    session or the new one, never a truncated or world-readable one.
+    """
+    expanded = os.path.expanduser(str(path))
+    directory = os.path.dirname(os.path.abspath(expanded)) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = dict(
+        (SESSION_FILE_KEYS[name], session[name])
+        for name in SESSION_HEADER_NAMES
+        if name in session
+    )
+    payload = json.dumps(document, indent=2) + "\n"
+    handle_fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".session-", suffix=".tmp"
+    )
+    try:
+        os.fchmod(handle_fd, 0o600)
+        handle = os.fdopen(handle_fd, "w", encoding="utf-8")
+    except BaseException:
+        try:
+            os.close(handle_fd)
+        except OSError:  # pragma: no cover
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # pragma: no cover
+            pass
+        raise
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, expanded)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # pragma: no cover
+            pass
+        raise
+
+
+def _session_header_names() -> Tuple[str, ...]:
+    """The header names a session file may carry (``dashboard.SESSION_HEADERS``)."""
+    try:
+        from .dashboard import SESSION_HEADERS
+    except Exception:  # noqa: BLE001 - dashboard.py may legitimately be absent
+        return SESSION_HEADER_NAMES
+    names = tuple(str(name).strip().lower() for name in SESSION_HEADERS)
+    return names or SESSION_HEADER_NAMES
+
+
+def read_session_header_names(path: str) -> List[str]:
+    """The header *names* stored in a session file, never a value.
+
+    Read through :func:`dashboard.load_session` when the module is importable,
+    so this agrees exactly with what the next poll will send; otherwise the file
+    is parsed with the same rules (a non-empty string under an accepted name).
+    Any unreadable or malformed file simply has no usable headers.
+    """
+    names = _session_header_names()
+    expanded = os.path.expanduser(str(path))
+    try:
+        from .dashboard import load_session
+    except Exception:  # noqa: BLE001 - dashboard.py may legitimately be absent
+        load_session = None  # type: ignore[assignment]
+    if load_session is not None:
+        try:
+            session = load_session(expanded)
+        except Exception:  # noqa: BLE001 - a bad file holds no header names
+            return []
+        if not isinstance(session, dict):  # pragma: no cover - defensive
+            return []
+        return [name for name in names if session.get(name)]
+    try:
+        with open(expanded, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(document, dict):
+        return []
+    present = set()
+    for key, value in document.items():
+        name = str(key).strip().lower()
+        if name in names and isinstance(value, str) and value.strip():
+            present.add(name)
+    return [name for name in names if name in present]
 
 
 def validate_config_document(document: dict) -> Any:
@@ -660,6 +893,10 @@ class _Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 return self._config_update(body)
             return 200, self.daemon.config_payload()
+        if path == SESSION_PATH:
+            if method == "POST":
+                return self._session_update(body)
+            return 200, self.daemon.session_payload()
         return 404, {"error": {"message": "not found", "code": "not_found"}}  # pragma: no cover
 
     def _config_update(self, body: bytes) -> Tuple[int, dict]:
@@ -674,6 +911,21 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             payload = self.daemon.apply_config(body)
         except ConfigUpdateError as exc:
+            return 400, {"error": {"message": str(exc), "code": exc.code}}
+        return 200, payload
+
+    def _session_update(self, body: bytes) -> Tuple[int, dict]:
+        """``POST /v1/session``: store the captured session, return what was stored.
+
+        A rejection is a ``400`` naming the offending field and changes nothing
+        on disk; a success is ``{"stored": [...], "path": ..., "mode": ...}``.
+        The request body is never echoed back and no value is ever returned.
+        """
+        if len(body) > MAX_SESSION_BODY_BYTES:
+            return 400, _invalid_session("request body is too large")
+        try:
+            payload = self.daemon.apply_session(body)
+        except SessionUpdateError as exc:
             return 400, {"error": {"message": str(exc), "code": exc.code}}
         return 200, payload
 
@@ -701,6 +953,8 @@ class Daemon:
         self._dashboard_lock = threading.Lock()
         #: Held across the whole read-modify-write of a config update.
         self._config_lock = threading.Lock()
+        #: Held across the atomic write of a session file (``POST /v1/session``).
+        self._session_lock = threading.Lock()
         #: Bumped on every config swap; a fetch that straddles a swap is dropped.
         self._config_generation = 0
         self._stop = threading.Event()
@@ -938,6 +1192,86 @@ class Daemon:
     def config_payload(self) -> dict:
         """Read-only, sanitised config."""
         return sanitized_config(self.config)
+
+    # -- dashboard session (the plasmoid's sign-in webview) ---------------
+    def session_path(self) -> str:
+        """The session file the poller reads (``dashboard.session_file``)."""
+        section = getattr(self.config, "dashboard", None)
+        return str(getattr(section, "session_file", "") or "").strip()
+
+    def session_payload(self) -> dict:
+        """``GET /v1/session``: configured?, path, file mode, header *names*.
+
+        Never reads a value out: the header names come from
+        :func:`read_session_header_names`, which keeps only the keys.  ``mode``
+        is the file's actual mode when it exists and :data:`SESSION_NO_FILE_MODE`
+        (``"0000"``) when there is nothing to stat.
+        """
+        path = self.session_path()
+        expanded = os.path.expanduser(path) if path else ""
+        payload: Dict[str, Any] = {
+            "configured": False,
+            "path": expanded,
+            "mode": SESSION_NO_FILE_MODE,
+            "headers": [],
+        }
+        if not expanded:
+            return payload
+        try:
+            info = os.stat(expanded)
+        except OSError:
+            return payload
+        if not stat.S_ISREG(info.st_mode):
+            return payload
+        payload["configured"] = True
+        payload["mode"] = "%04o" % stat.S_IMODE(info.st_mode)
+        payload["headers"] = read_session_header_names(expanded)
+        return payload
+
+    def apply_session(self, request: Any) -> dict:
+        """Validate and persist a captured dashboard session.
+
+        *request* is the request body: a ``dict``, or its raw ``bytes``/``str``
+        JSON.  Only ``cookie`` and ``authorization`` may appear, both are
+        bounded and checked for CR/LF/NUL, and the file is replaced atomically
+        at mode ``0600`` with the canonical key names the dashboard client reads.
+
+        On success the cached dashboard snapshot is dropped -- under the same
+        lock a poll holds, so a snapshot fetched with the *old* session can never
+        be re-cached after this returns -- and the summary of what was stored is
+        returned.  No restart is needed for the new file to be used: the poller
+        calls :func:`dashboard.load_session` on every tick, so the next TTL tick
+        of a running-but-failing dashboard thread picks the new session up.
+
+        Raises :class:`SessionUpdateError` for any rejection -- in which case the
+        session file is left byte-identical and nothing in memory changes.
+        """
+        session = check_session_request(request)
+        path = self.session_path()
+        if not path:
+            raise SessionUpdateError("dashboard.session_file is not set")
+        expanded = os.path.expanduser(path)
+        with self._session_lock:
+            try:
+                write_session_atomic(expanded, session)
+            except OSError as exc:
+                raise SessionUpdateError(
+                    "cannot write dashboard session file %s (%s)"
+                    % (expanded, type(exc).__name__)
+                ) from None
+        self._drop_dashboard_snapshot()
+        stored = [name for name in SESSION_HEADER_NAMES if name in session]
+        self._emit(
+            "sarvam-meter: dashboard session stored (%s) in %s"
+            % (", ".join(stored), expanded)
+        )
+        return {"stored": stored, "path": expanded, "mode": SESSION_FILE_MODE}
+
+    def _drop_dashboard_snapshot(self) -> None:
+        """Forget the cached dashboard snapshot (it was fetched with old inputs)."""
+        with self._dashboard_lock:
+            self._dashboard_snapshot = None
+            self._dashboard_at = None
 
     # -- config writes (the plasmoid's settings page) ---------------------
     def _read_config_document(self) -> dict:

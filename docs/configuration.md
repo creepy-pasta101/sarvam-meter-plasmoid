@@ -238,6 +238,22 @@ change for a reader of `GET /v1/status` (the full annotated shape is in
 - `sarvam.dashboard.balance` carries the reported figure:
   `{"known", "amount", "currency", "as_of", "state", "billing_model", "unit"}`.
 
+### Capturing the session
+
+The settings page has a **Capture session…** button: it opens
+`https://indus.sarvam.ai/login` in a `WebEngineView`, waits for you to sign in,
+reads the `sarvam.ai` cookies out of the web engine's cookie store (the session
+cookie is HttpOnly, so `document.cookie` cannot see it) and POSTs them to the
+daemon's `POST /v1/session`. Nothing but the cookie header leaves the page, and
+no value is ever displayed or logged.
+
+QtWebEngine is not installed on most KDE systems. It is a *Recommends* of the
+RPM, not a requirement: the sheet is loaded through a `Loader` whose error path
+names the package (`qt6-qtwebengine` on Fedora) and the CLI fallback, so the
+settings page keeps working without it. The CLI equivalent is
+`sarvam-meter session set --cookie-file PATH`, and `GET /v1/session` reports
+whether a session is captured without ever returning a value.
+
 `as_of` is worth looking at: it is `balance_updated_at` from the balance endpoint,
 which is when the *balance value* last changed, not when the widget last asked.
 Sarvam updates it lazily, so a reading can be an hour old while the widget polled a
