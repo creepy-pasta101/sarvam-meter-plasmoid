@@ -94,6 +94,14 @@ class MainQmlSafetyTest(unittest.TestCase):
         destruction = self.code[self.code.index("Component.onDestruction"):]
         self.assertIn("abortRequest", destruction)
 
+    def test_the_clock_timer_is_slow_and_gated(self):
+        # A timer that repaints text must not be cheap enough to burn the GUI
+        # thread, and it must stop when there is nothing to age.
+        match = re.search(r"id: clockTimer\s*\n\s*interval:\s*(\d+)", self.code)
+        self.assertIsNotNone(match, "clockTimer must have a literal interval")
+        self.assertGreaterEqual(int(match.group(1)), 10000)
+        self.assertRegex(self.code, r"id: clockTimer[\s\S]{0,200}running:\s*root\.balanceAsOf")
+
     def test_no_unbounded_loops_over_payload_data(self):
         self.assertNotIn("while (true)", self.code)
         self.assertNotIn("while(true)", self.code)
