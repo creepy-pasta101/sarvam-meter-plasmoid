@@ -184,12 +184,15 @@ PlasmaExtras.Representation {
                 opacity: fullRoot.sarvamConfigured ? 1.0 : 0.6
             }
 
-            // The same empty/error presentation the stock applets use.
+            // The same empty/error presentation the stock applets use.  No icon:
+            // `icon.name` is not on every PlasmaExtras.PlaceholderMessage build,
+            // and assigning to a property a type does not have fails the whole
+            // component ("Cannot assign to non-existent property"), which took
+            // FullRepresentation -- and with it the popup -- down. Text and
+            // explanation are the two properties the type certainly has.
             PlasmaExtras.PlaceholderMessage {
                 Layout.fillWidth: true
-                Layout.topMargin: Kirigami.Units.gridUnit
                 visible: !fullRoot.hasData
-                icon.name: fullRoot.offline ? "network-disconnect" : "view-refresh"
                 text: fullRoot.offline
                     ? "Cannot reach the sarvam-meter daemon"
                     : "Waiting for the daemon"

@@ -485,6 +485,40 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertRegex(self.code, r"(?m)^KCM\.SimpleKCM\s*\{")
         self.assertIn("import org.kde.kcmutils", self.page)
 
+class PlaceholderMessageTest(unittest.TestCase):
+    """A stub that accepts more than the real type is worse than no stub.
+
+    `PlasmaExtras.PlaceholderMessage` does not expose an `icon` group on every
+    Plasma build. Our stub was a `Button`, which *does* have one, so
+    `icon.name: ...` on a PlaceholderMessage passed the harness and then failed in
+    Plasma with "Cannot assign to non-existent property icon" -- and a failing
+    assignment takes the whole component down, which is why FullRepresentation
+    (and the popup) vanished.
+    """
+
+    def setUp(self):
+        self.popup = read(os.path.join(PLASMOID, "ui", "FullRepresentation.qml"))
+
+    def test_the_popup_does_not_assign_an_icon_on_the_message(self):
+        for block in re.findall(
+                r"PlasmaExtras\.PlaceholderMessage\s*\{(.*?)\n\s*\}",
+                self.popup, re.S):
+            self.assertNotRegex(block, r"\bicon(\.name)?\s*:",
+                                "PlaceholderMessage has no icon group to assign to")
+
+    def test_the_stub_is_not_more_permissive_than_the_real_type(self):
+        stub = read(os.path.join(STUB_DIR, "org", "kde", "plasma", "extras",
+                                 "PlaceholderMessage.qml"))
+        code = code_of(stub)
+        # A Button (or any Control) drags in `icon`, `text`, `enabled`, ... and
+        # silently widens what the harness will accept.
+        self.assertNotRegex(code, r"^\s*Button\s*\{", )
+        self.assertNotIn("Control {", code)
+        self.assertNotRegex(code, r"property\s+\w+\s+icon\b")
+        self.assertIn("property string text", code)
+        self.assertIn("property string explanation", code)
+
+
 class QmlStubTest(unittest.TestCase):
     """The harness needs a plasma5support stand-in to load the widget at all."""
 
