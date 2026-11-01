@@ -56,6 +56,9 @@ Item {
     readonly property var dashboardModels: hasMeter ? meter.topModels : []
     readonly property real dashboardMaxCost: hasMeter ? meter.topModelMaxCost : 0
     readonly property string dashboardErrorLine: hasMeter ? meter.dashboardErrorLine : ""
+    // How old the reported credit balance is (SPEC 17.5); empty when unknown.
+    readonly property string balanceFreshness: hasMeter ? meter.balanceFreshnessLine : ""
+    readonly property bool balanceFreshnessOld: hasMeter ? meter.balanceAgeOld : false
 
     readonly property bool hasData: hasMeter ? meter.hasPayload : false
     readonly property bool offline: hasMeter ? meter.offline : false
@@ -595,6 +598,20 @@ Item {
                 opacity: 0.7
                 wrapMode: Text.WordWrap
                 color: (fullRoot.offline || fullRoot.stale)
+                    ? Kirigami.Theme.neutralTextColor
+                    : Kirigami.Theme.textColor
+            }
+
+            // The balance's own age: Sarvam updates balance_updated_at lazily, so
+            // a fresh poll can still carry an old number.
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: fullRoot.balanceFreshness.length > 0
+                text: fullRoot.balanceFreshness
+                font: Kirigami.Theme.smallFont
+                opacity: 0.7
+                elide: Text.ElideRight
+                color: fullRoot.balanceFreshnessOld
                     ? Kirigami.Theme.neutralTextColor
                     : Kirigami.Theme.textColor
             }

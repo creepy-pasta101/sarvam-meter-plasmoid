@@ -101,3 +101,6 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | The widget is removed while a request is in flight | `main.qml` `Component.onDestruction` | the request is aborted and no callback outlives the widget |
 | The settings dialog is closed mid-Test | `configGeneral.qml` `Component.onDestruction` | the probe is aborted; the dialog cannot be left waiting on a socket |
 | The user clicks Test twice quickly | `configGeneral.qml` `testConnection()` | the first request is aborted, so its callbacks cannot clobber the second result |
+| The reported balance has not been refreshed for a while | `main.qml` `balanceFreshnessLine` + `clockTimer` | the footer says `balance 2h ago · not refreshed`, so a stale figure cannot be mistaken for a live one |
+| `balance_updated_at` is missing, unparsable, or in the future | `main.qml` `balanceAsOf` / `balanceAgeMs` | the freshness line is simply absent (or reads `just now` for a small negative age); nothing renders as `undefined` or `NaN` |
+| The daemon serves schema 1 (no dashboard block) | `main.qml` `balanceAsOf` guard | no freshness line at all |
