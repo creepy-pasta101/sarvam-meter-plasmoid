@@ -135,7 +135,7 @@ Default JSON document (`packaging/config.example.json` must match it exactly):
 {
   "version": 1,
   "db_path": "~/.local/share/sarvam-meter/usage.db",
-  "daemon": { "host": "127.0.0.1", "port": 8787, "refresh_seconds": 60, "request_timeout_seconds": 10 },
+  "daemon": { "socket_path": null, "refresh_seconds": 60, "request_timeout_seconds": 10 },
   "sarvam": { "enabled": true, "currency": "INR", "starting_balance": null,
               "rate_overrides": {} },
   "cliproxy": { "enabled": false, "base_url": "http://127.0.0.1:8317",
@@ -457,14 +457,23 @@ still fills it from manual entries.
 
 ## 11. Daemon (`sarvam_meter/daemon.py`)
 
-`ThreadingHTTPServer`, bound to `daemon.host:daemon.port`.
+`SocketServer`, bound to `client.socket_path(config)` — a Unix domain socket at
+`$XDG_RUNTIME_DIR/sarvam-meter/daemon.sock` (directory `0700`, socket `0600`), or
+`~/.cache/sarvam-meter/daemon.sock` without a runtime dir, or `daemon.socket_path`
+when the config sets one. `$SARVAM_METER_SOCKET` overrides all of it. There is no
+TCP listener anywhere in the project.
 
 | method | path | behaviour |
 | --- | --- | --- |
-| GET | `/v1/status` | `build_status(...)`, `200`, `application/json; charset=utf-8`, `Cache-Control: no-store` |
-| GET | `/v1/health` | `{"ok":true,"version":"0.1.0","uptime_seconds":N}`, `200` |
-| POST | `/v1/refresh` | forces a cliproxy re-poll, returns the new status |
-| GET | `/v1/config` | sanitised config (keys redacted to `""`/`"***"`), read-only |
+One JSON object per line each way. Request `{"op": "<name>", ...args}`; reply
+`{"ok": true, "result": <json>}` or `{"ok": false, "error": {"code", "message"}}`.
+
+| op | result |
+| --- | --- |
+| `status` | `build_status(...)` |
+| `health` | `{"ok":true,"version":"0.1.0","uptime_seconds":N}` |
+| `refresh` | forces a cliproxy re-poll, returns the new status |
+| `config.get` | sanitised config (keys redacted to `""`/`"***"`), read-only |
 | anything else | — | `404` `{"error":{"message":"not found","code":"not_found"}}` |
 
 ```python
@@ -474,11 +483,11 @@ class Daemon:
     def serve_forever(self) -> None
     def shutdown(self) -> None
     def refresh_cliproxy(self) -> dict
-def make_server(config, ledger=None) -> tuple            # (ThreadingHTTPServer, Daemon)
+def make_server(config, ledger=None) -> tuple            # (SocketServer, Daemon)
 ```
 
 Requirements: background thread re-polls cliproxy every
-`cliproxy.quota_fetch_interval_seconds` when enabled, guarded by a lock; `/v1/status`
+`cliproxy.quota_fetch_interval_seconds` when enabled, guarded by a lock; `status`
 serves the cached snapshot and never blocks on a slow cliproxy. Requests must not be
 able to mutate anything (no PUT/PATCH/DELETE → `405`). `SO_REUSEADDR` on, `daemon_threads`
 on. Log to stderr, one line per request, no secrets.
@@ -545,8 +554,8 @@ QML rules (Plasma **6.7 and 6.8 compatible**; 6.8 removes nothing we use, but do
 - **Never** use `PlasmaComponents2`, `plasmoid.*` lowercase, `Item { }` as root.
 - Root is `PlasmoidItem` with `compactRepresentation` and `fullRepresentation`.
 - **No custom contextual actions in v1** (they are the most migration-fragile part).
-- Data: `XMLHttpRequest` (GET) against `Plasmoid.configuration.daemonUrl` +
-  `/v1/status`, driven by a `Timer` with `interval = Plasmoid.configuration.refreshSeconds * 1000`,
+- Data: `Plasma5Support.DataSource` (`engine: "executable"`) running
+  `<command> query status`, driven by a `Timer` with `interval = Plasmoid.configuration.refreshSeconds * 1000`,
   `repeat: true`, `running: true`, plus one immediate `refresh()` on `Component.onCompleted`.
   On error keep the previous payload, set `offline = true`, and back off (double the
   interval up to 10x, reset on success).
@@ -570,16 +579,16 @@ QML rules (Plasma **6.7 and 6.8 compatible**; 6.8 removes nothing we use, but do
   (0..1), `property color fillColor`, indeterminate look when `fraction < 0`,
   `Layout.fillWidth: true`, height `Math.max(4, Kirigami.Units.smallSpacing)`.
   No `org.kde.plasma.core` gauge, no QtQuick.Shapes.
-- Config keys read in QML: `daemonUrl` (string), `refreshSeconds` (int),
+- Config keys read in QML: `command` (string), `refreshSeconds` (int),
   `compactMode` (string: `sarvam` | `cliproxy`), `warnBelowPercent` (int),
   `showApiBreakdown` (bool). All must exist in `main.xml` with defaults
-  `http://127.0.0.1:8787`, `60`, `sarvam`, `20`, `true`.
+  `sarvam-meter`, `60`, `sarvam`, `20`, `true`.
 
 `config/main.xml` is KConfigXT: `<group name="General">` with those five entries and
 `<default>` values, plus a second group `Advanced` if needed. `config.qml` is a
 `Kirigami.ScrollablePage`/`ColumnLayout` with `ConfigCategory` (KCM.SimpleKCM) wiring,
 and `configGeneral.qml` holds the controls: `TextField` for the daemon URL with a
-"Test" button that does an async XHR to `<url>/v1/health` and shows OK/FAIL,
+"Test" button that runs `<command> query health` and shows OK/FAIL,
 `SpinBox` for refresh, `ComboBox` for compact mode, `Slider`/`SpinBox` for the warning
 threshold, `Switch` for the API breakdown. Configuration pages must validate: reject a
 URL that is not `http://`/`https://` and show an inline error rather than saving.
@@ -648,7 +657,7 @@ integration-test unit must test as many as it can without network:
 3. Config missing → `init` writes defaults; daemon refuses to start with a clear
    message rather than crashing with a traceback.
 4. Config unreadable JSON → exit code 2, message names the file and the reason.
-5. DB path unwritable → daemon still serves `/v1/status` with a `ledger` error entry.
+5. DB path unwritable → daemon still answers `status` with a `ledger` error entry.
 6. Port already in use → `OSError`/clear message, exit 1.
 7. `starting_balance` unset → `balance.known == false`, spend still shown.
 8. 402/429 from upstream → **retired** with the recording proxy (§8): the payload
@@ -666,7 +675,7 @@ integration-test unit must test as many as it can without network:
 15. Never poll CLIProxyAPI's destructive usage-queue endpoint (assert in tests).
 16. Concurrent writers on one database → WAL, no `database is locked` under load
     (a test with 20 parallel `record_event` calls must pass).
-17. Secrets never appear in logs, `meta`, `/v1/config`, or `status`.
+17. Secrets never appear in logs, `meta`, `config.get`, or `status`.
 18. Non-loopback cliproxy `base_url` refused unless `allow_remote`.
 19. Widget with two instances → both poll; daemon is threaded and idempotent.
 20. Large upload streamed, `max_body_bytes` enforced → **retired** with the proxy:
@@ -760,7 +769,7 @@ non-numeric string is an error, never a silent 0. `currency` arrives lowercase
 ```
 
 Only these two keys are accepted (case-insensitive match). Values are never
-logged, never returned by `/v1/config` (rendered `"***"`), never written into the
+logged, never returned by `config.get` (rendered `"***"`), never written into the
 status payload or an error message. A missing or unreadable file is
 `DashboardError(code="no_session")`.
 
@@ -893,7 +902,7 @@ Rules:
 
 ## 17.6a Writing the backend settings from the widget
 
-`POST /v1/config` lets the plasmoid's settings page change the daemon's own
+`config.set` lets the plasmoid's settings page change the daemon's own
 configuration without hand-editing a file. The body is a JSON object holding any
 subset of:
 
@@ -909,7 +918,7 @@ Anything else — an unknown section, an unknown key, `cliproxy.management_key`,
 Values are validated by the same rules `load_config` applies; a rejected request
 leaves the file byte-identical. On success the file is written atomically at
 `0600`, the daemon reloads its in-memory config, drops the cached dashboard
-snapshot, and returns the same sanitised document `GET /v1/config` returns.
+snapshot, and returns the same sanitised document `config.get` returns.
 `PUT`/`PATCH`/`DELETE` stay `405`.
 
 The settings page keeps two stores apart: the five widget settings stay in
@@ -926,8 +935,8 @@ settings.
 - `doctor` gains `dashboard session` (file exists, mode `0600`, only allowed keys)
   and, when enabled, `dashboard reachable`.
 - `Daemon` keeps a dashboard snapshot with a TTL of `dashboard.poll_seconds`,
-  refreshed by the same background thread pattern as cliproxy; `/v1/status` never
-  blocks on it and `/v1/refresh` refreshes both sources.
+  refreshed by the same background thread pattern as cliproxy; `status` never
+  blocks on it and `refresh` refreshes both sources.
 
 ## 17.7 Widget
 

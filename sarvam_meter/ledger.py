@@ -370,6 +370,21 @@ class Ledger:
             except sqlite3.Error:  # pragma: no cover
                 pass
 
+    def __del__(self) -> None:
+        """Last-resort close, so a dropped ledger never leaks a connection.
+
+        SQLite emits ``ResourceWarning: unclosed database`` when a connection is
+        finalised without being closed (Python 3.13 and later).  Every caller is
+        expected to ``close()`` -- the CLI does, in a ``finally`` -- but a caller
+        that forgets would otherwise turn a leaked handle into noise at some
+        arbitrary later moment, which is exactly what broke the RPM's %check.
+        Best effort, and never raises: ``__del__`` runs during shutdown too.
+        """
+        try:
+            self.close_all()
+        except Exception:  # noqa: BLE001 - finaliser: nothing useful to do
+            pass
+
     def __enter__(self) -> "Ledger":
         return self
 

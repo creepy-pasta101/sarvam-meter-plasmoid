@@ -188,7 +188,7 @@ class ConfigRouteTest(DaemonTestCase):
         text = json.dumps(payload)
         self.assertNotIn(SECRET, text)
         self.assertEqual(payload["cliproxy"]["management_key"], "***")
-        self.assertEqual(payload["daemon"]["port"], self.config.daemon.port)
+        self.assertEqual(payload["daemon"]["socket_path"], self.config.daemon.socket_path)
         self.assertEqual(payload["sarvam"]["currency"], "INR")
 
     def test_config_set_accepts_an_empty_document(self):

@@ -38,7 +38,7 @@ This is exactly what `sarvam-meter init` writes, and what
 {
   "version": 1,
   "db_path": "~/.local/share/sarvam-meter/usage.db",
-  "daemon": { "host": "127.0.0.1", "port": 8787, "refresh_seconds": 60, "request_timeout_seconds": 10 },
+  "daemon": { "socket_path": null, "refresh_seconds": 60, "request_timeout_seconds": 10 },
   "sarvam": { "enabled": true, "currency": "INR", "starting_balance": null,
               "rate_overrides": {} },
   "cliproxy": { "enabled": false, "base_url": "http://127.0.0.1:8317",
@@ -72,18 +72,20 @@ over the default.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host` | string | `127.0.0.1` | Bind address for the daemon's local socket. Keep it on loopback; the status API has no authentication. |
-| `port` | int | `8787` | Bind port of that socket, `1..65535`. This is what the widget reads. It is the daemon's own endpoint only: nothing of yours is relayed through it. |
+| `socket_path` | string or `null` | `null` | The daemon's Unix socket. `null` means "resolve it": `$XDG_RUNTIME_DIR/sarvam-meter/daemon.sock`, or `~/.cache/sarvam-meter/daemon.sock` when there is no runtime dir. `$SARVAM_METER_SOCKET` overrides this key, which is how a second instance or a test points somewhere else. There is no TCP listener and no port any more. |
 | `refresh_seconds` | int | `60` | Refresh cadence in seconds, `>= 5`. The widget's own poll interval is a separate setting (`refreshSeconds`, below). |
 | `request_timeout_seconds` | int | `10` | Timeout for outbound requests the daemon makes (the CLIProxyAPI calls), `>= 1`. |
 
-Example — move the daemon because 8787 is taken:
+Example — put the socket somewhere of your own choosing (the default under
+`$XDG_RUNTIME_DIR` is already private to you: `0700` directory, `0600` socket):
 
 ```json
-"daemon": { "host": "127.0.0.1", "port": 18787, "refresh_seconds": 30, "request_timeout_seconds": 10 }
+"daemon": { "socket_path": "/run/user/1000/sarvam-meter/meter.sock", "refresh_seconds": 30, "request_timeout_seconds": 10 }
 ```
 
-Then set the widget's daemon URL to match.
+Nothing else needs to know: the widget runs `sarvam-meter query …`, and the CLI
+resolves the same path from the same config. There is no host or port to keep in
+sync any more.
 
 There is no `proxy` section. It was removed with the recording reverse proxy: this
 project relays no API traffic, so it has no upstream to forward to and no port for
@@ -180,7 +182,7 @@ API expects:
 - **The file must be mode `0600`.** `sarvam-meter session set` writes it that way;
   if you create it by hand, `chmod 600` it. `sarvam-meter doctor` reports the mode.
 - **Values are never shown.** They are never logged, never returned by
-  `GET /v1/config` (rendered `"***"`), never written into the status payload and
+  `config.get` (rendered `"***"`), never written into the status payload and
   never into an error message. `sarvam-meter session show` prints the path, the
   file mode and *which* headers are present — never a value.
 - **A missing or unreadable file is not fatal.** The snapshot comes back with
@@ -212,7 +214,7 @@ it expires the daemon gets `401`/`403`, records `unauthorized`, and you repeat s
 #### Schema 2 in the status payload
 
 The dashboard source is why the status payload moved to `schema: 2`. Three things
-change for a reader of `GET /v1/status` (the full annotated shape is in
+change for a reader of `status` (the full annotated shape is in
 [architecture.md](architecture.md#4-status-json-contract)):
 
 - `sarvam.spend` gains `source`: `"dashboard"` when a dashboard snapshot is
@@ -230,14 +232,14 @@ The settings page has a **Capture session…** button: it opens
 `https://indus.sarvam.ai/login` in a `WebEngineView`, waits for you to sign in,
 reads the `sarvam.ai` cookies out of the web engine's cookie store (the session
 cookie is HttpOnly, so `document.cookie` cannot see it) and POSTs them to the
-daemon's `POST /v1/session`. Nothing but the cookie header leaves the page, and
+daemon's `session.set`. Nothing but the cookie header leaves the page, and
 no value is ever displayed or logged.
 
 QtWebEngine is not installed on most KDE systems. It is a *Recommends* of the
 RPM, not a requirement: the sheet is loaded through a `Loader` whose error path
 names the package (`qt6-qtwebengine` on Fedora) and the CLI fallback, so the
 settings page keeps working without it. The CLI equivalent is
-`sarvam-meter session set --cookie-file PATH`, and `GET /v1/session` reports
+`sarvam-meter session set --cookie-file PATH`, and `session.get` reports
 whether a session is captured without ever returning a value.
 
 `as_of` is worth looking at: it is `balance_updated_at` from the balance endpoint,
@@ -296,7 +298,7 @@ the offending key, so you can fix it without reading source.
 | Rule | Failure |
 | --- | --- |
 | `version` must be `1` | `ConfigError` naming `version` |
-| `daemon.port` in `1..65535` | `ConfigError` naming `daemon.port` |
+| `daemon.socket_path` is `null` or a non-empty string | `ConfigError` naming `daemon.socket_path` |
 | `daemon.refresh_seconds >= 5` | `ConfigError` naming the key |
 | `daemon.request_timeout_seconds >= 1` | `ConfigError` naming the key |
 | `cliproxy.api_version` in `{"v8","v0"}` | `ConfigError` naming the key |
@@ -320,14 +322,14 @@ What the user actually sees, per entry point:
   a daemon started without a config gets a clear "no config, run `sarvam-meter
   init`" message rather than a stack trace.
 - **Database path unwritable** — the daemon still starts and still serves
-  `/v1/status`, but the payload carries a `ledger` error entry and zeroed numbers.
+  `status`, but the payload carries a `ledger` error entry and zeroed numbers.
 - **Port already in use** — `OSError` surfaced as a clear message, exit `1`.
 
 Two rules worth spelling out because they are easy to trip over:
 
 - **Unknown keys are ignored, missing keys are defaulted.** A typo such as
   `"startin_balance"` will not error — it is silently ignored and the default
-  (`null`) is used. Run `sarvam-meter doctor` or `GET /v1/config` to see the
+  (`null`) is used. Run `sarvam-meter doctor` or `config.get` to see the
   effective configuration.
 - **`allow_remote` is per section, and only `cliproxy` has it.** `cliproxy.base_url`
   is the only configurable remote URL left, so it is the only one the guard
@@ -396,14 +398,14 @@ The plasmoid has five settings of its own, independent of the daemon config
 
 | Setting | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `daemonUrl` | string | `http://127.0.0.1:8787` | Base URL of the daemon. Must be `http://` or `https://`; the settings page rejects anything else inline instead of saving it. |
+| `command` | string | `sarvam-meter` | The program the widget runs to reach the daemon (`<command> query status`). A bare program name or an absolute path only: no spaces, quotes or shell metacharacters, because it is executed. |
 | `refreshSeconds` | int | `60` | Widget poll interval. On error the interval doubles, up to 10x, and resets on success. |
 | `compactMode` | string | `sarvam` | What the compact representation shows: `sarvam` (remaining balance) or `cliproxy` (worst remaining fraction). |
 | `warnBelowPercent` | int | `20` | Below this percentage the compact value turns red. |
 | `showApiBreakdown` | bool | `true` | Whether the full representation draws a bar per top-3 `by_api` entry. |
 
 The settings page has a **Test** button that issues an asynchronous
-`GET <daemonUrl>/v1/health` and reports OK or FAIL, so a wrong URL is caught
+`<command> query health` and reports OK or FAIL, so a wrong URL is caught
 before it becomes an offline widget.
 
 The dashboard source adds **no** widget setting. The widget reads

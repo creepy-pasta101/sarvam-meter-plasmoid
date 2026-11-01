@@ -68,7 +68,7 @@ front of your API traffic any more.
   re-poll its sources and a spinner while it does.
 - The widget's settings page configures the **daemon** too — dashboard on/off, the
   dashboard poll interval (2 minutes to 6 hours), CLIProxyAPI on/off and its base
-  URL — over `POST /v1/config`, without editing a file by hand.
+  URL — over `config.set`, without editing a file by hand.
 - Plasma 6.7 and 6.8 compatible QML, compact and full representations.
 - Python standard library only, no runtime dependencies; Python 3.9+.
 - Loopback-only binds, secret redaction, and an SSRF guard on remote URLs.

@@ -2,8 +2,7 @@
   "version": 1,
   "db_path": "~/.local/share/sarvam-meter/usage.db",
   "daemon": {
-    "host": "127.0.0.1",
-    "port": 8787,
+    "socket_path": null,
     "refresh_seconds": 60,
     "request_timeout_seconds": 10
   },

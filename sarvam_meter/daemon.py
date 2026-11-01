@@ -237,7 +237,7 @@ def sanitized_config(config: Any) -> dict:
         "db_path": getattr(config, "db_path", ""),
         "daemon": _section(
             getattr(config, "daemon", None),
-            ["host", "port", "refresh_seconds", "request_timeout_seconds"],
+            ["socket_path", "refresh_seconds", "request_timeout_seconds"],
         ),
         "sarvam": _section(
             getattr(config, "sarvam", None),
@@ -1341,6 +1341,17 @@ class Daemon:
         self._thread = None
         self._refresh_thread = None
         self._dashboard_thread = None
+        # Last, so no in-flight op can be using it.  A Ledger that is never
+        # closed leaves SQLite to emit "ResourceWarning: unclosed database" at
+        # some arbitrary later moment (Python 3.13+); in a test suite that noise
+        # lands inside whichever test happens to be asserting on stderr next.
+        ledger = getattr(self, "ledger", None)
+        close_all = getattr(ledger, "close_all", None)
+        if callable(close_all):
+            try:
+                close_all()
+            except Exception:  # noqa: BLE001 - shutting down regardless
+                pass
 
     # -- the optional D-Bus service ---------------------------------------
     def _start_dbus_service(self) -> None:

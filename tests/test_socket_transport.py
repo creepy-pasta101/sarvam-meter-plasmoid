@@ -164,6 +164,53 @@ class SocketTransportTestCase(unittest.TestCase):
         return error
 
 
+class ConfigSocketPathTest(SocketTransportTestCase):
+    """`daemon.socket_path` must actually decide where the daemon binds.
+
+    A config key that is validated but ignored is worse than no key: it reads as
+    a setting and behaves as a no-op.  This pins the whole chain -- config key ->
+    client.socket_path() -> the socket the daemon binds -> a call that answers.
+    """
+
+    def test_the_config_key_decides_where_the_daemon_binds(self):
+        from sarvam_meter.config import load_config, write_default_config
+
+        target = os.path.join(self.tmp, "custom", "meter.sock")
+        config_path = write_default_config(os.path.join(self.tmp, "config.json"))
+        with open(config_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["daemon"]["socket_path"] = target
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        config = load_config(config_path)
+
+        self.assertEqual(client.socket_path(config), target)
+
+        daemon = Daemon(config, logger=self.logs.append, config_path=config_path)
+        daemon.start()
+        self.addCleanup(daemon.shutdown)
+        self.assertEqual(daemon.socket_path, target)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(target).st_mode))
+        self.assertTrue(client.call("health", socket_path=target)["ok"])
+
+    def test_the_environment_beats_the_config_key(self):
+        from sarvam_meter.config import load_config, write_default_config
+
+        config_path = write_default_config(os.path.join(self.tmp, "config.json"))
+        with open(config_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["daemon"]["socket_path"] = os.path.join(self.tmp, "from-config.sock")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        config = load_config(config_path)
+
+        override = os.path.join(self.tmp, "from-env.sock")
+        os.environ["SARVAM_METER_SOCKET"] = override
+        self.addCleanup(os.environ.pop, "SARVAM_METER_SOCKET", None)
+
+        self.assertEqual(client.socket_path(config), override)
+
+
 class RoundTripTest(SocketTransportTestCase):
     """Every op answers with the payload its HTTP route used to serve."""
 

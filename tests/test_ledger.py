@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Tests for sarvam_meter.ledger (SPEC section 6)."""
 
+import gc
 import json
 import os
 import shutil
@@ -126,6 +127,87 @@ class SchemaTests(LedgerTestBase):
     def test_rejects_empty_path(self):
         with self.assertRaises(ValueError):
             Ledger("")
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_in_memory_ledger_works_across_threads(self):
+        ledger = Ledger(":memory:")
+        self.addCleanup(ledger.close)
+        errors = []
+
+        def worker():
+            try:
+                ledger.record_event(source="manual", api="chat", cost=1.0)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(ledger.calls_since(EPOCH_ISO), 5)
+
+    def test_close_is_idempotent(self):
+        tmpdir = tempfile.mkdtemp(prefix="sarvam-ledger-")
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        ledger = Ledger(os.path.join(tmpdir, "usage.db"))
+        ledger.close()
+        ledger.close()
+
+    def test_context_manager_closes(self):
+        tmpdir = tempfile.mkdtemp(prefix="sarvam-ledger-")
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        with Ledger(os.path.join(tmpdir, "usage.db")) as ledger:
+            ledger.record_event(source="manual", api="chat")
+        self.assertEqual(ledger.calls_since(EPOCH_ISO), 1)
+
+
+class LedgerDisposalTests(LedgerTestBase):
+    """A dropped ledger must close its connections, not leave them to the GC.
+
+    Python 3.13+ emits ``ResourceWarning: unclosed database`` when a sqlite3
+    connection is finalised unclosed.  One of those surfacing at GC time inside
+    another test's stderr assertion is what failed the RPM's %check on Fedora 43.
+    """
+
+    def test_close_all_is_idempotent(self):
+        self.ledger.record_event(source="manual", api="chat", cost=1.0)
+        self.ledger.close_all()
+        self.ledger.close_all()  # a second shutdown must not raise
+
+    def test_a_dropped_ledger_closes_its_connections(self):
+        ledger = Ledger(os.path.join(self.tmpdir, "dropped.db"))
+        ledger.record_event(source="manual", api="chat", cost=1.0)
+        connection = ledger._conn()
+
+        del ledger
+        gc.collect()
+
+        # A closed connection refuses to be used, which proves the finaliser ran
+        # rather than the warning merely being suppressed.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+    def test_the_daemon_closes_its_ledger_on_shutdown(self):
+        from sarvam_meter.config import load_config, write_default_config
+        from sarvam_meter.daemon import Daemon
+
+        config_path = write_default_config(os.path.join(self.tmpdir, "config.json"))
+        config = load_config(config_path)
+        daemon = Daemon(
+            config,
+            logger=lambda line: None,
+            socket_path=os.path.join(self.tmpdir, "daemon.sock"),
+            ledger=Ledger(os.path.join(self.tmpdir, "daemon.db")),
+        )
+        connection = daemon.ledger._conn()
+
+        daemon.shutdown()
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
 
 class RecordEventTests(LedgerTestBase):

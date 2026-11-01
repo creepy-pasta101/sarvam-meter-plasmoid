@@ -211,7 +211,7 @@ class InitTest(CliTestCase):
 
         loaded = config_mod.load_config(target)
         self.assertEqual(loaded.version, 1)
-        self.assertEqual(loaded.daemon.port, 8787)
+        self.assertIsNone(loaded.daemon.socket_path)
         self.assertEqual(loaded.dashboard.poll_seconds, 300)
         self.assertEqual(loaded.sarvam.currency, "INR")
         # The recording proxy is gone: a config must not carry a proxy section
@@ -496,9 +496,9 @@ class ExitCodeTest(CliTestCase):
         self.assertIn(self.config_path, err)
 
     def test_invalid_config_value_is_a_config_error(self):
-        self.write_config(daemon={"port": 70000})
+        self.write_config(daemon={"refresh_seconds": 0})
         _out, err = self.assert_exit(["status"], EXIT_CONFIG)
-        self.assertIn("daemon.port", err)
+        self.assertIn("refresh_seconds", err)
 
     def test_unknown_option_is_a_usage_error(self):
         self.write_config()

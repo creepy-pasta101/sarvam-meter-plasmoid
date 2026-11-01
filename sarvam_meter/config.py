@@ -73,8 +73,11 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class DaemonConfig:
-    host: str = "127.0.0.1"
-    port: int = 8787
+    #: Where the daemon listens.  ``None`` means "resolve it": ``$XDG_RUNTIME_DIR/
+    #: sarvam-meter/daemon.sock``, or ``~/.cache/sarvam-meter/daemon.sock`` when
+    #: there is no runtime dir.  ``$SARVAM_METER_SOCKET`` overrides both, which is
+    #: how the tests and a second instance point at their own socket.
+    socket_path: Optional[str] = None
     refresh_seconds: int = 60
     request_timeout_seconds: int = 10
 
@@ -132,8 +135,7 @@ def default_config_dict() -> dict:
         "version": 1,
         "db_path": "~/.local/share/sarvam-meter/usage.db",
         "daemon": {
-            "host": "127.0.0.1",
-            "port": 8787,
+            "socket_path": None,
             "refresh_seconds": 60,
             "request_timeout_seconds": 10,
         },
@@ -207,6 +209,15 @@ def _require_str(value: Any, key: str, allow_empty: bool = False) -> str:
     if not allow_empty and not value.strip():
         raise ConfigError("%s: must not be empty" % key)
     return value
+
+
+def _optional_str(value: Any, key: str) -> Optional[str]:
+    """``None`` or a non-empty string, ``~`` expanded.  For keys whose absence is
+    meaningful (an unset socket path means "resolve it")."""
+    if value is None:
+        return None
+    text = _require_str(value, key)
+    return os.path.expanduser(text.strip())
 
 
 def _require_bool(value: Any, key: str) -> bool:
@@ -395,8 +406,7 @@ def _build_config(document: dict) -> Config:
 
     daemon_raw = _require_dict(document.get("daemon"), "daemon")
     daemon = DaemonConfig(
-        host=_require_str(daemon_raw.get("host"), "daemon.host"),
-        port=_require_int(daemon_raw.get("port"), "daemon.port", 1, 65535),
+        socket_path=_optional_str(daemon_raw.get("socket_path"), "daemon.socket_path"),
         refresh_seconds=_require_int(
             daemon_raw.get("refresh_seconds"), "daemon.refresh_seconds", 5
         ),

@@ -22,8 +22,7 @@ EXPECTED_DEFAULT = {
     "version": 1,
     "db_path": "~/.local/share/sarvam-meter/usage.db",
     "daemon": {
-        "host": "127.0.0.1",
-        "port": 8787,
+        "socket_path": None,
         "refresh_seconds": 60,
         "request_timeout_seconds": 10,
     },
@@ -110,10 +109,10 @@ class DefaultDocumentTests(ConfigTestBase):
 
     def test_default_config_dict_returns_independent_copies(self):
         first = default_config_dict()
-        first["daemon"]["port"] = 1
+        first["daemon"]["refresh_seconds"] = 1
         first["sarvam"]["rate_overrides"]["chat"] = {"default": {}}
         second = default_config_dict()
-        self.assertEqual(second["daemon"]["port"], 8787)
+        self.assertEqual(second["daemon"]["refresh_seconds"], 60)
         self.assertEqual(second["sarvam"]["rate_overrides"], {})
 
     def test_default_config_path_is_home_based(self):
@@ -147,7 +146,7 @@ class WriteDefaultConfigTests(ConfigTestBase):
         config = load_config(target)
         self.assertIsInstance(config, Config)
         self.assertEqual(config.version, 1)
-        self.assertEqual(config.daemon.port, 8787)
+        self.assertIsNone(config.daemon.socket_path)
         self.assertEqual(config.sarvam.currency, "INR")
         self.assertIsNone(config.sarvam.starting_balance)
         self.assertEqual(config.cliproxy.api_version, "v8")
@@ -164,7 +163,7 @@ class WriteDefaultConfigTests(ConfigTestBase):
         with open(target, "w", encoding="utf-8") as handle:
             handle.write("{}")
         write_default_config(target)
-        self.assertEqual(load_config(target).daemon.port, 8787)
+        self.assertIsNone(load_config(target).daemon.socket_path)
 
 
 class LoadConfigTests(ConfigTestBase):
@@ -188,13 +187,14 @@ class LoadConfigTests(ConfigTestBase):
 
     def test_empty_document_yields_defaults(self):
         config = self.load_document({})
-        self.assertEqual(config.daemon.port, 8787)
+        # An unset socket path means "resolve it from the environment", not "no
+        # socket": the daemon still has exactly one endpoint.
+        self.assertIsNone(config.daemon.socket_path)
         self.assertIsNone(config.sarvam.starting_balance)
 
     def test_deep_merge_keeps_sibling_defaults(self):
-        config = self.load_document({"daemon": {"port": 9000}})
-        self.assertEqual(config.daemon.port, 9000)
-        self.assertEqual(config.daemon.host, "127.0.0.1")
+        config = self.load_document({"daemon": {"socket_path": "/run/me/meter.sock"}})
+        self.assertEqual(config.daemon.socket_path, "/run/me/meter.sock")
         self.assertEqual(config.daemon.refresh_seconds, 60)
 
     def test_unknown_top_level_keys_are_ignored(self):
@@ -202,15 +202,15 @@ class LoadConfigTests(ConfigTestBase):
         self.assertEqual(config.version, 1)
 
     def test_env_path_used_when_argument_missing(self):
-        path = self.write_document({"daemon": {"port": 9100}})
+        path = self.write_document({"daemon": {"socket_path": "/run/env.sock"}})
         os.environ["SARVAM_METER_CONFIG"] = path
-        self.assertEqual(load_config().daemon.port, 9100)
+        self.assertEqual(load_config().daemon.socket_path, "/run/env.sock")
 
     def test_explicit_path_beats_env(self):
-        env_path = self.write_document({"daemon": {"port": 9100}}, "env.json")
-        arg_path = self.write_document({"daemon": {"port": 9200}}, "arg.json")
+        env_path = self.write_document({"daemon": {"socket_path": "/run/env.sock"}}, "env.json")
+        arg_path = self.write_document({"daemon": {"socket_path": "/run/arg.sock"}}, "arg.json")
         os.environ["SARVAM_METER_CONFIG"] = env_path
-        self.assertEqual(load_config(arg_path).daemon.port, 9200)
+        self.assertEqual(load_config(arg_path).daemon.socket_path, "/run/arg.sock")
 
     def test_db_path_tilde_is_expanded(self):
         config = self.load_document({"db_path": "~/sarvam/usage.db"})
@@ -230,16 +230,23 @@ class VersionAndNumberValidationTests(ConfigTestBase):
     def test_version_must_be_integer(self):
         self.assert_config_error({"version": "1"}, "version")
 
-    def test_daemon_port_range(self):
-        self.assert_config_error({"daemon": {"port": 0}}, "daemon.port")
-        self.assert_config_error({"daemon": {"port": 65536}}, "daemon.port")
+    def test_socket_path_accepts_null_or_a_path(self):
+        # The daemon has no TCP port any more; `host`/`port` are gone, and a
+        # document that still carries them is not silently honoured.
+        self.assertIsNone(self.load_document({"daemon": {"socket_path": None}}).daemon.socket_path)
         self.assertEqual(
-            self.load_document({"daemon": {"port": 65535}}).daemon.port, 65535
+            self.load_document({"daemon": {"socket_path": "/run/me/meter.sock"}}).daemon.socket_path,
+            "/run/me/meter.sock",
         )
-        self.assertEqual(self.load_document({"daemon": {"port": 1}}).daemon.port, 1)
+        self.assertEqual(
+            self.load_document({"daemon": {"socket_path": "~/meter.sock"}}).daemon.socket_path,
+            os.path.expanduser("~/meter.sock"),
+        )
 
-    def test_port_must_be_integer(self):
-        self.assert_config_error({"daemon": {"port": "8787"}}, "daemon.port")
+    def test_socket_path_must_be_a_non_empty_string(self):
+        self.assert_config_error({"daemon": {"socket_path": ""}}, "daemon.socket_path")
+        self.assert_config_error({"daemon": {"socket_path": 5}}, "daemon.socket_path")
+        self.assert_config_error({"daemon": {"socket_path": "   "}}, "daemon.socket_path")
 
     def test_refresh_seconds_minimum(self):
         self.assert_config_error({"daemon": {"refresh_seconds": 4}}, "refresh_seconds")
