@@ -36,6 +36,9 @@ SECRET = "mgmt-key-do-not-leak-1234"
 def make_config(directory, **sections):
     document = config_mod.default_config_dict()
     document["db_path"] = os.path.join(directory, "usage.db")
+    # The dashboard is on by default; keep its session file (and therefore any
+    # poll) inside the throwaway directory instead of ~/.config.
+    document["dashboard"]["session_file"] = os.path.join(directory, "session.json")
     for section, values in sections.items():
         document[section].update(values)
     path = os.path.join(directory, "config.json")
@@ -57,20 +60,35 @@ def ephemeral_port(config):
 
 class DaemonTestCase(unittest.TestCase):
     sections = {}
+    #: True when the daemon must rewrite the fixture config file (rather than
+    #: resolve the user's real one) for ``POST /v1/config``.
+    writes_config = False
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sarvam-daemon-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.config = ephemeral_port(make_config(self.tmp, **self.sections))
         self.logs = []
-        self.daemon = Daemon(self.config, logger=self.logs.append)
+        self.daemon = Daemon(
+            self.config,
+            logger=self.logs.append,
+            config_path=os.path.join(self.tmp, "config.json")
+            if self.writes_config
+            else None,
+        )
         self.port = self.daemon.start()
         self.addCleanup(self.daemon.shutdown)
 
-    def request(self, method, path):
+    def request(self, method, path, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
-            connection.request(method, path)
+            headers = {}
+            if body is not None:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                }
+            connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             body = response.read()
             headers = {key.lower(): value for key, value in response.getheaders()}
@@ -107,11 +125,14 @@ class StatusRouteTest(DaemonTestCase):
             {"schema", "generated_at", "stale", "errors", "sarvam", "cliproxy"},
         )
         self.assertIn("dashboard", payload["sarvam"])
-        self.assertFalse(payload["sarvam"]["dashboard"]["configured"])
+        # The dashboard source is on by default, so the block is configured even
+        # before the first poll; nothing has been fetched yet.
+        self.assertTrue(payload["sarvam"]["dashboard"]["configured"])
+        self.assertFalse(payload["sarvam"]["dashboard"]["reachable"])
         self.assertFalse(payload["stale"])
         self.assertEqual(payload["errors"], [])
 
-    def test_status_reflects_ledger(self):
+    def test_status_reflects_ledger_spend_without_claiming_a_balance(self):
         ledger = Ledger(self.config.db_path)
         try:
             ledger.set_balance(500.0, "INR")
@@ -120,7 +141,14 @@ class StatusRouteTest(DaemonTestCase):
             ledger.close()
         status, _headers, payload = self.json_body("GET", "/v1/status")
         self.assertEqual(status, 200)
-        self.assertTrue(payload["sarvam"]["balance"]["known"])
+        balance = payload["sarvam"]["balance"]
+        # No dashboard balance has been reported, so there is no "left" figure --
+        # but the ledger's spend is still there, and 500 - 12.3 is not invented.
+        self.assertFalse(balance["known"])
+        self.assertIsNone(balance["remaining"])
+        self.assertIsNone(balance["starting"])
+        self.assertEqual(balance["spent_total"], 12.3)
+        self.assertEqual(balance["source"], "ledger")
 
     def test_status_accepts_trailing_slash(self):
         status, _headers, payload = self.json_body("GET", "/v1/status/")
@@ -196,6 +224,7 @@ class RefreshRouteTest(DaemonTestCase):
 
 class ConfigRouteTest(DaemonTestCase):
     sections = {"cliproxy": {"enabled": True, "management_key": SECRET}}
+    writes_config = True
 
     def test_config_is_redacted(self):
         status, headers, body = self.request("GET", "/v1/config")
@@ -208,9 +237,27 @@ class ConfigRouteTest(DaemonTestCase):
         self.assertEqual(payload["sarvam"]["currency"], "INR")
         self.assertEqual(headers["cache-control"], "no-store")
 
-    def test_config_is_read_only(self):
-        status, _headers, _body = self.request("POST", "/v1/config")
-        self.assertEqual(status, 405)
+    def test_config_accepts_post_and_rejects_every_other_mutation(self):
+        # `POST /v1/config` is the one writable route (the plasmoid's settings
+        # page uses it); an empty document is a valid no-op update.
+        status, headers, body = self.request("POST", "/v1/config", b"{}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(headers["cache-control"], "no-store")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["cliproxy"]["management_key"], "***")
+        self.assertEqual(
+            set(payload),
+            {"version", "db_path", "daemon", "proxy", "sarvam", "cliproxy", "dashboard"},
+        )
+        # Everything else is still refused.
+        for method in ("PUT", "PATCH", "DELETE"):
+            status, _headers, body = self.request(method, "/v1/config")
+            self.assertEqual(status, 405, "%s must not be allowed: %r" % (method, body))
+            self.assertEqual(
+                json.loads(body.decode("utf-8")),
+                {"error": {"message": "method not allowed", "code": "method_not_allowed"}},
+            )
 
     def test_sanitized_config_helper_redacts_empty_key(self):
         config = make_config(self.tmp)
@@ -416,7 +463,7 @@ class DashboardCacheTest(unittest.TestCase):
                 self.tmp,
                 dashboard={
                     "enabled": True,
-                    "poll_seconds": 60,
+                    "poll_seconds": 300,
                     "session_file": os.path.join(self.tmp, "session.json"),
                 },
             )
@@ -425,11 +472,16 @@ class DashboardCacheTest(unittest.TestCase):
         self.addCleanup(self.daemon.shutdown)
 
     def test_ttl_follows_poll_seconds(self):
-        self.assertEqual(self.daemon.dashboard_ttl, 60)
+        self.assertEqual(self.daemon.dashboard_ttl, 300)
         other = make_config(
             self.tmp, dashboard={"enabled": True, "poll_seconds": 900}
         )
         self.assertEqual(Daemon(other, logger=lambda _line: None).dashboard_ttl, 900)
+        # The floor of the accepted range is honoured too (120 s minimum).
+        floor = make_config(
+            self.tmp, dashboard={"enabled": True, "poll_seconds": 120}
+        )
+        self.assertEqual(Daemon(floor, logger=lambda _line: None).dashboard_ttl, 120)
 
     def test_nothing_is_cached_before_the_first_refresh(self):
         self.assertIsNone(self.daemon.dashboard_snapshot)
@@ -466,7 +518,7 @@ class DashboardCacheTest(unittest.TestCase):
         self.assertEqual(payload["sarvam"]["dashboard"]["by_model"][0]["cost"], 74.05)
 
     def test_disabled_dashboard_starts_no_thread(self):
-        config = ephemeral_port(make_config(self.tmp))
+        config = ephemeral_port(make_config(self.tmp, dashboard={"enabled": False}))
         daemon = Daemon(config, logger=lambda _line: None)
         self.addCleanup(daemon.shutdown)
         daemon.start()
@@ -501,7 +553,7 @@ class DashboardCacheTest(unittest.TestCase):
             {"enabled", "base_url", "session_file", "poll_seconds", "product"},
         )
         self.assertTrue(document["dashboard"]["enabled"])
-        self.assertEqual(document["dashboard"]["poll_seconds"], 60)
+        self.assertEqual(document["dashboard"]["poll_seconds"], 300)
 
 
 class DashboardFetchTest(unittest.TestCase):
@@ -510,7 +562,7 @@ class DashboardFetchTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def test_disabled_source_returns_a_configured_false_snapshot(self):
-        config = make_config(self.tmp)
+        config = make_config(self.tmp, dashboard={"enabled": False})
         snapshot = fetch_dashboard_snapshot(config, None)
         self.assertFalse(snapshot["configured"])
         self.assertFalse(snapshot["reachable"])

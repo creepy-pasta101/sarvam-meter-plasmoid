@@ -172,6 +172,53 @@ class PlasmoidUiTest(unittest.TestCase):
         self.assertEqual(self.main.count("new XMLHttpRequest()"), 1)
 
 
+class CompactRepresentationTest(unittest.TestCase):
+    """Clicking the panel item must open the popup."""
+
+    def setUp(self):
+        self.compact = read(os.path.join(PLASMOID, "ui", "CompactRepresentation.qml"))
+
+    def test_the_panel_item_handles_the_click_itself(self):
+        # Plasma does not expand the popup for us: without this the widget is
+        # completely inert in the panel, which is exactly what happened.
+        self.assertRegex(self.compact, r"MouseArea\s*\{")
+        self.assertRegex(self.compact, r"onClicked:\s*compactRoot\.toggleExpanded\(\)")
+        self.assertRegex(
+            self.compact,
+            r"function toggleExpanded\(\)\s*\{[\s\S]{0,200}Plasmoid\.expanded = !Plasmoid\.expanded",
+        )
+        self.assertIn("import org.kde.plasma.plasmoid", self.compact)
+
+    def test_only_the_left_button_is_taken(self):
+        # Right-click must still reach the panel for the context menu.
+        self.assertRegex(self.compact, r"acceptedButtons:\s*Qt\.LeftButton")
+
+
+class BackendSettingsPageTest(unittest.TestCase):
+    """The settings page can configure the daemon, not just the widget."""
+
+    def setUp(self):
+        self.page = read(CONFIG_QML)
+
+    def test_the_poll_interval_is_bounded_to_two_minutes_and_six_hours(self):
+        self.assertRegex(self.page, r"from:\s*120")
+        self.assertRegex(self.page, r"to:\s*21600")
+        self.assertIn("/v1/config", self.page)
+
+    def test_the_backend_is_written_with_a_post_and_read_with_a_get(self):
+        # One helper owns the request lifecycle; both verbs go through it, and
+        # the open() call itself is asynchronous.
+        self.assertIn('sendBackendRequest("GET"', self.page)
+        self.assertIn('sendBackendRequest("POST"', self.page)
+        self.assertRegex(self.page, r"request\.open\(\s*method\s*,\s*url\s*,\s*true\s*\)")
+
+    def test_backend_values_are_not_widget_config_keys(self):
+        # Backend settings must never be persisted into plasma's appletsrc: no
+        # cfg_ property may carry one.
+        for name in ("cfg_pollSeconds", "cfg_dashboardEnabled", "cfg_cliproxyUrl"):
+            self.assertNotIn(name, self.page)
+
+
 class ConfigPageSafetyTest(unittest.TestCase):
     def setUp(self):
         self.code = re.sub(r"//[^\n]*", "", read(CONFIG_QML))

@@ -107,3 +107,7 @@ following. Each has a regression test in `tests/test_regressions.py`.
 | Refresh is pressed while a request is already in flight | `main.qml` `startRequest()` single-flight guard | the click is ignored and the button is disabled while busy; nothing queues up |
 | The daemon refuses `/v1/refresh` (or is slow to re-poll) | `main.qml` `forceRefresh()` fallback | the widget falls back to one `GET /v1/status`, so the spinner stops and the last known numbers stay on screen |
 | No status has arrived yet | `FullRepresentation.qml` `PlasmaExtras.PlaceholderMessage` | the standard Plasma empty state: an icon, "Waiting for the daemon", and the reason |
+| The panel item is clicked | `CompactRepresentation.qml` `MouseArea` → `Plasmoid.expanded` | the popup opens. Plasma does not expand it for you, so without this the widget is inert in the panel |
+| The dashboard is enabled but no session has been captured | `cli._dashboard_session_check`, `cli._dashboard_reachable` | `doctor` prints `OK dashboard session: not configured (run: sarvam-meter session set ...)` and exits 0 — a setup step, not a fault. A session file with loose permissions is still a FAIL |
+| The settings page sends a key the daemon will not accept | `daemon` `POST /v1/config` | `400` naming the key (`cliproxy.management_key is not writable`); the config file is left byte-identical |
+| The settings page sends an out-of-range poll interval | `config.py` bounds + `configGeneral.qml` clamp | `400` from the daemon, and the page clamps to 120..21600 before sending |

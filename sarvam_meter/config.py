@@ -52,7 +52,11 @@ DEFAULT_SESSION_FILE = "~/.config/sarvam-meter/session.json"
 DEFAULT_DASHBOARD_PRODUCT = "sarvam-api-platform"
 
 #: Minimum dashboard poll interval: bot-management friendly (SPEC 17.4).
-MIN_DASHBOARD_POLL_SECONDS = 60
+#: The dashboard is re-polled between every 2 minutes and every 6 hours.  The
+#: floor is deliberate (the dashboard sits behind bot management); the ceiling
+#: keeps a slow setting from looking broken.
+MIN_DASHBOARD_POLL_SECONDS = 120
+MAX_DASHBOARD_POLL_SECONDS = 21600
 
 #: Accepted CLIProxyAPI management API versions.
 API_VERSIONS = ("v8", "v0")
@@ -108,7 +112,8 @@ class CliproxyConfig:
 class DashboardConfig:
     """The Sarvam dashboard source (SPEC 17.4)."""
 
-    enabled: bool = False
+    #: Scraping is the default source: it reports the real credit balance.
+    enabled: bool = True
     base_url: str = DEFAULT_DASHBOARD_BASE_URL
     session_file: str = DEFAULT_SESSION_FILE
     poll_seconds: int = 300
@@ -166,7 +171,7 @@ def default_config_dict() -> dict:
             "allow_remote": False,
         },
         "dashboard": {
-            "enabled": False,
+            "enabled": True,
             "base_url": "https://indus.sarvam.ai",
             "session_file": "~/.config/sarvam-meter/session.json",
             "poll_seconds": 300,
@@ -482,6 +487,7 @@ def _build_config(document: dict) -> Config:
             dashboard_raw.get("poll_seconds"),
             "dashboard.poll_seconds",
             MIN_DASHBOARD_POLL_SECONDS,
+            MAX_DASHBOARD_POLL_SECONDS,
         ),
         product=_require_str(dashboard_raw.get("product"), "dashboard.product"),
     )
@@ -570,6 +576,7 @@ __all__ = [
     "DaemonConfig",
     "DashboardConfig",
     "MIN_DASHBOARD_POLL_SECONDS",
+    "MAX_DASHBOARD_POLL_SECONDS",
     "ENV_CLIPROXY_KEY",
     "ENV_CONFIG_PATH",
     "ProxyConfig",

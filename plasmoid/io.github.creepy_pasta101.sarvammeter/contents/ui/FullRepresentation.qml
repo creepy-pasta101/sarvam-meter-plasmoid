@@ -68,10 +68,6 @@ PlasmaExtras.Representation {
                     if (fullRoot.hasMeter)
                         fullRoot.meter.forceRefresh();
                 }
-
-                PlasmaComponents3.ToolTip {
-                    text: "Refresh now"
-                }
             }
         }
     }
