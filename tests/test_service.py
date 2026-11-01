@@ -99,6 +99,96 @@ class SpecTest(unittest.TestCase):
         self.assertNotRegex(self.spec, r"(?m)^Requires:\s+qt6-qtwebengine")
 
 
+class ReleaseMustChangeTest(unittest.TestCase):
+    """A rebuilt RPM must be installable over the previous one.
+
+    With a fixed Version-Release every CI build produces the same NEVRA, so
+    `dnf install ./new.rpm` reports "already installed" and replaces nothing --
+    the user reinstalls and sees the old files, which is exactly how a fixed
+    settings page kept failing to appear.
+    """
+
+    def setUp(self):
+        self.spec = read(SPEC)
+        self.ci = read(os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml"))
+
+    def test_the_release_is_a_parameter_with_a_default(self):
+        self.assertRegex(self.spec, r"(?m)^%\{!\?sarvam_release:%global sarvam_release ")
+        self.assertRegex(self.spec, r"(?m)^Release:\s+%\{sarvam_release\}%\{\?dist\}$")
+        # No hardcoded release that would defeat the parameter.
+        self.assertNotRegex(self.spec, r"(?m)^Release:\s+\d")
+
+    def test_ci_passes_a_release_that_changes_per_build(self):
+        self.assertIn('--define "sarvam_release ${RELEASE}"', self.ci)
+        self.assertRegex(self.ci, r'RELEASE="1\.\$\(date -u \+%Y%m%d%H%M%S\)')
+        # ... and it must sort above the installed 1.fc<N>, or dnf treats it as a
+        # downgrade and refuses.
+        self.assertIn('RELEASE="1.', self.ci)
+
+
+class ConfigPageCheckTest(unittest.TestCase):
+    """`doctor` must be able to say which config page Plasma will load.
+
+    A stale page is invisible: the dialog opens, every control shows its fallback
+    and the only clue is console noise naming properties. This check turns that
+    into one line of output naming the directory that won.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.env = dict(os.environ)
+        self.env["XDG_DATA_HOME"] = self.home
+        self.env["XDG_DATA_DIRS"] = "/nonexistent"
+
+    def install(self, source_name, contents):
+        from sarvam_meter.cli import PLASMOID_ID
+
+        target = os.path.join(self.home, "plasma", "plasmoids", PLASMOID_ID,
+                              "contents", "config")
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, source_name), "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        return target
+
+    def run_check(self):
+        code = (
+            "import os, sys;"
+            "from sarvam_meter.cli import _config_page_check;"
+            "ok, detail = _config_page_check();"
+            "print(int(ok), detail)"
+        )
+        return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
+                              capture_output=True, text=True, env=self.env)
+
+    def test_a_missing_install_is_not_a_failure(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("1 "), result.stdout)
+        self.assertIn("not installed", result.stdout)
+
+    def test_a_current_page_passes_and_names_the_directory(self):
+        self.install("main.xml", '<entry name="command"/><entry name="refreshSeconds"/>')
+        self.install("configGeneral.qml",
+                     "property string cfg_command: \"sarvam-meter\"\n"
+                     "property string cfg_commandDefault: \"sarvam-meter\"\n"
+                     "property alias cfg_refreshSeconds: spin.value\n"
+                     "property int cfg_refreshSecondsDefault: 60\n")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("1 "), result.stdout)
+        self.assertIn("plasmoids", result.stdout)
+
+    def test_a_page_without_the_defaults_fails_and_names_the_property(self):
+        self.install("main.xml", '<entry name="command"/>')
+        self.install("configGeneral.qml", 'property string cfg_command: "sarvam-meter"\n')
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("0 "), result.stdout)
+        self.assertIn("cfg_commandDefault", result.stdout)
+        self.assertIn("kpackagetool6", result.stdout)
+
+
 class InitIfMissingTest(unittest.TestCase):
     """`init --if-missing` is what ExecStartPre runs on every start."""
 

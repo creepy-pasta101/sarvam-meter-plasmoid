@@ -10,7 +10,8 @@
 #       -o "${NAME}-${VERSION}.tar.gz" HEAD
 #   rpmbuild -ba packaging/plasma-applet-sarvam-meter.spec \
 #       --define "_topdir $PWD/rpmbuild" \
-#       --define "_sourcedir $PWD/rpmbuild/SOURCES"
+#       --define "_sourcedir $PWD/rpmbuild/SOURCES" \
+#       --define "sarvam_release 1.$(date -u +%Y%m%d%H%M%S).git$(git rev-parse --short HEAD)"
 #
 # The tarball's single top-level directory is %{name}-%{version}/, which is
 # exactly what the %setup below expects.
@@ -21,7 +22,12 @@
 
 Name:           plasma-applet-sarvam-meter
 Version:        0.1.0
-Release:        1%{?dist}
+# The Release must change whenever the contents do, or `dnf`/`rpm -U` see an
+# identical NEVRA and refuse to replace an installed copy -- which is how a
+# rebuilt RPM can be "reinstalled" while every file on disk stays old.  CI passes
+# --define "sarvam_release 1.<timestamp>.git<sha>"; a hand build gets 1.
+%{!?sarvam_release:%global sarvam_release 1}
+Release:        %{sarvam_release}%{?dist}
 Summary:        KDE Plasma 6 applet and local daemon that meter Sarvam AI credit usage
 
 License:        MIT

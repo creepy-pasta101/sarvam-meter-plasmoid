@@ -39,6 +39,7 @@ DOCTOR_CHECKS = (
     "config loads",
     "data dir writable",
     "db opens",
+    "plasmoid config page",
     "daemon socket free",
     "dashboard session",
     "dashboard reachable",
@@ -609,7 +610,10 @@ class DoctorTest(CliTestCase):
 
         lines = [line for line in out.splitlines() if line.strip()]
         # "config loads" plus the six checks it could not run.
-        self.assertEqual(len(lines), 7, out)
+        # "config loads" plus the seven checks it then reports as "not checked
+        # (no config)" -- which includes "cliproxy reachable", a check the healthy
+        # path only runs when cliproxy is enabled, so it is not in DOCTOR_CHECKS.
+        self.assertEqual(len(lines), 8, out)
         for line in lines:
             self.assertTrue(line.startswith("FAIL "), line)
         self.assertIn("FAIL config loads", out)

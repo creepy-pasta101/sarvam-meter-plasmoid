@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import socket
 import stat
@@ -869,6 +870,69 @@ def _dashboard_reachable(config: Any) -> Tuple[bool, str]:
     return False, "unreachable"
 
 
+#: The applet id, and the two files that carry the settings contract.
+PLASMOID_ID = "io.github.creepy_pasta101.sarvammeter"
+
+
+def _plasmoid_dirs() -> List[str]:
+    """Every directory a plasmoid package could be loaded from, best first.
+
+    A user-installed copy wins over the packaged one, which is exactly the thing
+    that makes a stale page impossible to explain from the package alone.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    roots: List[str] = []
+    if data_home:
+        roots.append(os.path.expanduser(data_home))
+    else:
+        roots.append(os.path.join(os.path.expanduser("~"), ".local", "share"))
+    for entry in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if entry.strip():
+            roots.append(os.path.expanduser(entry.strip()))
+    return [os.path.join(root, "plasma", "plasmoids", PLASMOID_ID) for root in roots]
+
+
+def _config_page_check() -> tuple:
+    """Is the installed settings page the one this version expects?
+
+    Plasma sets two initial properties per KConfigXT key, `cfg_<key>` and
+    `cfg_<key>Default`. A page missing either one never receives its values, and
+    the only symptom is console noise plus a dialog full of fallbacks -- so
+    compare what is installed against what is declared, and say which file won.
+    """
+    installed = next((path for path in _plasmoid_dirs() if os.path.isdir(path)), None)
+    if installed is None:
+        return True, "not installed (running from a checkout?)"
+    page_path = os.path.join(installed, "contents", "config", "configGeneral.qml")
+    xml_path = os.path.join(installed, "contents", "config", "main.xml")
+    if not os.path.isfile(page_path) or not os.path.isfile(xml_path):
+        return False, "no config page under %s" % (installed,)
+    try:
+        with open(xml_path, "r", encoding="utf-8") as handle:
+            xml_text = handle.read()
+        with open(page_path, "r", encoding="utf-8") as handle:
+            page_text = handle.read()
+    except OSError as exc:
+        return False, "cannot read %s (%s)" % (installed, exc.strerror or exc)
+
+    entries = []
+    for match in re.finditer(r'<entry\s+name="([^"]+)"', xml_text):
+        entries.append(match.group(1))
+    if not entries:
+        return False, "%s declares no keys" % (xml_path,)
+
+    missing: List[str] = []
+    for name in entries:
+        if not re.search(r"property\s+\w+\s+cfg_%s\b" % re.escape(name), page_text):
+            missing.append("cfg_" + name)
+        if not re.search(r"property\s+\w+\s+cfg_%sDefault\b" % re.escape(name), page_text):
+            missing.append("cfg_" + name + "Default")
+    if missing:
+        return False, "%s is stale: no %s (reinstall, or kpackagetool6 --upgrade)" % (
+            installed, ", ".join(missing))
+    return True, installed
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     results: List[bool] = []
 
@@ -879,6 +943,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for name in (
             "data dir writable",
             "db opens",
+            "plasmoid config page",
             "daemon socket free",
             "cliproxy reachable",
             "dashboard session",
@@ -907,6 +972,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     finally:
         if ledger is not None:
             _close_ledger(ledger)
+
+    try:
+        ok, detail = _config_page_check()
+    except Exception as exc:  # noqa: BLE001 - a check must never traceback
+        ok, detail = False, str(exc) or exc.__class__.__name__
+    results.append(_check("plasmoid config page", ok, detail)[1])
 
     ok, detail = _socket_is_free(client_module.socket_path(config))
     results.append(_check("daemon socket free", ok, detail)[1])

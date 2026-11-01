@@ -170,9 +170,15 @@ jobs:
           git archive --format=tar.gz --prefix="${SPEC_NAME}-${VERSION}/" \
               -o "rpmbuild/SOURCES/${SPEC_NAME}-${VERSION}.tar.gz" HEAD
           cp "packaging/${SPEC_NAME}.spec" rpmbuild/SPECS/
+          # A rebuilt RPM with an unchanged Version-Release is one dnf refuses to
+          # install over the previous one ("already installed"), so a user who
+          # reinstalls keeps the old files and reports that nothing changed.
+          RELEASE="1.$(date -u +%Y%m%d%H%M%S).git$(git rev-parse --short HEAD)"
+          echo "Release ${RELEASE}"
           rpmbuild -ba "rpmbuild/SPECS/${SPEC_NAME}.spec" \
               --define "_topdir $PWD/rpmbuild" \
-              --define "_sourcedir $PWD/rpmbuild/SOURCES"
+              --define "_sourcedir $PWD/rpmbuild/SOURCES" \
+              --define "sarvam_release ${RELEASE}"
           echo "--- produced packages ---"
           ls -l rpmbuild/RPMS/noarch/ rpmbuild/SRPMS/ || true
           shopt -s nullglob

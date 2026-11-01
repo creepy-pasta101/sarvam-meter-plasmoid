@@ -32,9 +32,14 @@ jobs:
           git archive --format=tar.gz --prefix="${SPEC_NAME}-${VERSION}/" \
               -o "rpmbuild/SOURCES/${SPEC_NAME}-${VERSION}.tar.gz" HEAD
           cp "packaging/${SPEC_NAME}.spec" rpmbuild/SPECS/
+          # A release build gets a release-specific Release so it sorts above any
+          # CI snapshot (`1.<timestamp>.git<sha>`); dnf refuses to replace an
+          # identical NEVRA, which silently leaves old files on disk.
+          RELEASE="1.$(date -u +%Y%m%d%H%M%S).git$(git rev-parse --short HEAD)"
           rpmbuild -ba "rpmbuild/SPECS/${SPEC_NAME}.spec" \
               --define "_topdir $PWD/rpmbuild" \
-              --define "_sourcedir $PWD/rpmbuild/SOURCES"
+              --define "_sourcedir $PWD/rpmbuild/SOURCES" \
+              --define "sarvam_release ${RELEASE}"
           echo "--- produced packages ---"
           ls -l rpmbuild/RPMS/noarch/ rpmbuild/SRPMS/ || true
           shopt -s nullglob
