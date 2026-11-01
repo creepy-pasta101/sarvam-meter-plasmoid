@@ -9,11 +9,13 @@ PlasmoidItem becomes Item, Plasmoid.configuration becomes a local object and the
 two representation blocks are commented out), then drives it against a daemon
 that misbehaves in each of the ways a real one can:
 
-  hung      accepts the connection and never answers
-  huge      answers with a body far larger than the cap
-  garbage   answers with something that is not JSON
-  good      answers with a valid status payload
-  destroy   the widget is removed while a request is in flight
+  hung           accepts the connection and never answers
+  huge           answers with a body far larger than the cap
+  garbage        answers with something that is not JSON
+  good           answers with a valid status payload
+  fresh-balance  a valid payload whose balance was updated 10 minutes ago
+  old-balance    a valid payload whose balance was updated 2 hours ago
+  destroy        the widget is removed while a request is in flight
 
 For every scenario it asserts that the GUI thread kept running (an independent
 QTimer keeps ticking), that the widget settles into a defined state instead of
@@ -172,6 +174,15 @@ class HostileServer:
                 continue
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
+    def _payload(self):
+        document = json.loads(json.dumps(GOOD_PAYLOAD))
+        minutes = {"fresh-balance": 10, "old-balance": 120}.get(self.mode)
+        if minutes is not None:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                  time.gmtime(time.time() - minutes * 60))
+            document["sarvam"]["dashboard"]["balance"]["as_of"] = stamp
+        return document
+
     def _handle(self, conn):
         try:
             conn.settimeout(30)
@@ -195,7 +206,7 @@ class HostileServer:
                         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
                 conn.sendall(head + body)
                 return
-            body = json.dumps(GOOD_PAYLOAD).encode()
+            body = json.dumps(self._payload()).encode()
             head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                     b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
             conn.sendall(head + body)
@@ -283,6 +294,17 @@ def run_scenario(mode: str, repo: str, verbose: bool) -> tuple:
                 document = payload
             ok = (offline is False and document.get("schema") == 2 and error == "")
             return ok, "payload accepted, offline=%s error=%r" % (offline, error), samples
+        if mode in ("fresh-balance", "old-balance"):
+            freshness = root.property("balanceFreshnessLine") or ""
+            old = root.property("balanceAgeOld")
+            if mode == "fresh-balance":
+                # "balance 10m ago", and not flagged as old
+                ok = bool(re.match(r"^balance (10|11)m ago$", freshness)) and not old
+            else:
+                # "balance 2h ago <middle dot> not refreshed", flagged as old
+                ok = (bool(re.match(r"^balance (2|3)h ago", freshness))
+                      and freshness.endswith("not refreshed") and bool(old))
+            return ok, "freshness line %r (old=%s)" % (freshness, old), samples
         if mode == "huge":
             ok = offline is True and "too large" in error
             return ok, "huge body rejected: error=%r" % error, samples
@@ -305,7 +327,8 @@ def main(argv=None) -> int:
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     failures = 0
-    for mode in ("good", "garbage", "huge", "hung", "destroy"):
+    modes = ("good", "garbage", "huge", "hung", "fresh-balance", "old-balance", "destroy")
+    for mode in modes:
         ok, detail, samples = run_scenario(mode, args.repo, args.verbose)
         print("%-8s %s  %s" % (mode, "PASS" if ok else "FAIL", detail))
         if args.verbose and samples:
@@ -313,7 +336,7 @@ def main(argv=None) -> int:
         if not ok:
             failures += 1
     print("")
-    print("%d of 5 scenarios passed" % (5 - failures))
+    print("%d of %d scenarios passed" % (len(modes) - failures, len(modes)))
     return 0 if failures == 0 else 1
 
 
